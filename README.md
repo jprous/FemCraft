@@ -1,7 +1,8 @@
 # FemCraft
 
-A 3D structural modelling workspace written in Rust, aimed at building finite-element models
-(nodes, members, surfaces, loads) and handing them to analysis software such as RFEM 6.
+A 3D structural modelling workspace written in Rust: build finite-element models (nodes,
+members, surfaces, loads), open and save RFEM 6 files, solve with Salome-Meca / code_aster and
+view the results, all in one application.
 
 Built with [egui](https://github.com/emilk/egui) for the interface and
 [wgpu](https://wgpu.rs) for the GPU-rendered 3D viewport.
@@ -51,11 +52,16 @@ src/
 
 ## Roadmap
 
-- Depth buffer and shaded surfaces
-- Model objects: nodes, lines, members, surfaces, supports
-- Materials, sections and thicknesses
-- Load cases and combinations
-- Export to RFEM 6 through the Dlubal API
+The full implementation strategy is in [docs/ROADMAP.md](docs/ROADMAP.md). In short:
+
+- **M0** Foundations: crate workspace, current egui / wgpu, CI
+- **M1** Read RFEM 6 `.rf6` / `.rfc` files and show them (read-only viewer)
+- **M2** Save files RFEM accepts
+- **M3** Object model with undo / redo and change tracking
+- **M4** Application layout: dockable navigator and tables, ribbon and toolbars, view cube
+- **M5** Drawing, picking, right-click menus, visibility
+- **M6** Solving with Salome-Meca / code_aster
+- **M7** Post-processing: deformations, contours, member diagrams, result tables
 
 ## Licence
 

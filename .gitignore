@@ -1,1 +1,6 @@
 /target
+
+# Real project models (client data) - never commit
+/testdata/private/
+*.rf6
+*.rfc
