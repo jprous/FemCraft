@@ -164,6 +164,64 @@ M6 solver → M7 results.
 M2 decides whether the project is viable: if RFEM rejects edited files we learn it early,
 before everything else is built around it.
 
+## Credit budget (Claude Code)
+
+Budget: **one third of the weekly Claude Pro limit** (about 33% of the weekly bar).
+
+### Unit of work
+
+Work is planned in **sessions**: one fresh Claude Code session per task, ending in a commit.
+A focused session (one feature, short conversation) is estimated at **3-6% of the weekly
+limit**. That leaves room for **about 6-8 sessions per week**.
+
+The estimate is rough: usage depends on the model, conversation length and how much code is
+read. It is corrected by measuring (see the tracking table below).
+
+### Estimate per milestone
+
+| Milestone | Sessions | % of a weekly limit | Weeks at 33% / week | Suggested model |
+|---|---|---|---|---|
+| M0 Foundations | 2-3 | 8-15% | 0.5 | Sonnet |
+| M1 File research + read-only viewer | 6-9 | 25-45% | 1-1.5 | Opus (format research), Sonnet (viewer) |
+| M2 Saving RFEM accepts | 5-8 | 20-40% | 1-1.5 | Opus |
+| M3 Object model, undo, change log | 4-6 | 15-30% | 0.5-1 | Opus (design), Sonnet (object types) |
+| M4 Application layout | 7-10 | 25-50% | 1-1.5 | Sonnet |
+| M5 Drawing, picking, editing tools | 8-12 | 30-60% | 1-2 | Sonnet, Opus for picking / renderer |
+| M6 Salome-Meca / code_aster | 9-14 | 35-70% | 1-2 | Opus |
+| M7 Post-processing | 6-9 | 25-45% | 1-1.5 | Sonnet |
+| **Total** | **47-71** | **185-355%** | **6-11 weeks** | |
+
+**First usable result:** the read-only viewer (end of M1), after roughly 2 weeks.
+**Go / no-go point:** M2. If RFEM rejects edited files, stop and reconsider (for example
+exporting through the Dlubal API or SAF instead) before spending the remaining ~70% of the
+budget.
+
+### Rules for spending credits sparingly
+
+1. **One fresh session per task.** Long conversations are the biggest cost: every message
+   re-sends the whole history. Start a new session for each task and close it after the commit.
+2. **Use Sonnet by default**, and Opus only where the table says so (format reverse
+   engineering, solver mapping, architecture). Keep reasoning effort at low / medium for
+   routine work.
+3. **`CLAUDE.md` holds the project context**, so sessions do not re-research the project,
+   the RFEM format or the reference repos.
+4. **Small, precise tasks** ("add the view cube in `femcraft-render`, clicking faces sets the
+   view") rather than open-ended ones ("improve the UI").
+5. **Run builds and the app yourself** and paste only the error lines. Avoid asking for
+   screenshots, web research or reading whole reference repositories; point to the exact file.
+6. **Batch small fixes** into one session instead of one session each.
+7. **Stop at the milestone boundary**, check the weekly bar, and re-plan if a milestone ran
+   over its estimate.
+
+### Tracking
+
+Record the weekly-limit percentage before and after each session, so the estimates can be
+corrected after M0 and M1.
+
+| Date | Milestone / task | Model | Weekly % before | Weekly % after | Used |
+|---|---|---|---|---|---|
+| 2026-11-02 | Setup, first viewport, licence, roadmap (one long session) | Opus | - | 25% (whole week so far) | not measured separately |
+
 ## Candidate crates
 
 | Purpose | Crate |
