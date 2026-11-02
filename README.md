@@ -1,7 +1,7 @@
 # FemCraft
 
 A 3D structural modelling workspace written in Rust: build finite-element models (nodes,
-members, surfaces, loads), open and save RFEM 6 files, solve with Salome-Meca / code_aster and
+members, surfaces, loads), open and save FEM files, solve with Salome-Meca / code_aster and
 view the results, all in one application.
 
 Built with [egui](https://github.com/emilk/egui) for the interface and
