@@ -1,0 +1,11 @@
+[package]
+name = "femcraft-model"
+description = "FemCraft domain objects and edit commands (no UI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+

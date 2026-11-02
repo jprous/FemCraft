@@ -1,0 +1,13 @@
+[package]
+name = "femcraft"
+description = "FemCraft - a 3D structural modelling workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+eframe.workspace = true
+femcraft-ui.workspace = true
+femcraft-render.workspace = true

@@ -6,9 +6,9 @@ use eframe::egui::{self, Color32, Pos2, Stroke};
 use eframe::egui_wgpu;
 use glam::Vec3;
 
-use crate::camera::{self, OrbitCamera, Projection, StandardView};
-use crate::grid::{GridPlane, GridSettings};
-use crate::viewport::{self, LineVertex, LinesCallback};
+use femcraft_render::camera::{self, OrbitCamera, Projection, StandardView};
+use femcraft_render::grid::{GridPlane, GridSettings};
+use femcraft_render::viewport::{self, LineVertex, LinesCallback};
 
 const AXIS_X: [f32; 4] = [0.92, 0.30, 0.30, 1.0];
 const AXIS_Y: [f32; 4] = [0.40, 0.82, 0.35, 1.0];

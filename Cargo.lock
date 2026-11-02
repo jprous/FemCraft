@@ -1052,8 +1052,52 @@ dependencies = [
 name = "femcraft"
 version = "0.1.0"
 dependencies = [
+ "eframe",
+ "femcraft-render",
+ "femcraft-ui",
+]
+
+[[package]]
+name = "femcraft-aster"
+version = "0.1.0"
+dependencies = [
+ "femcraft-model",
+]
+
+[[package]]
+name = "femcraft-model"
+version = "0.1.0"
+
+[[package]]
+name = "femcraft-render"
+version = "0.1.0"
+dependencies = [
  "bytemuck",
  "eframe",
+ "glam",
+]
+
+[[package]]
+name = "femcraft-results"
+version = "0.1.0"
+dependencies = [
+ "femcraft-model",
+]
+
+[[package]]
+name = "femcraft-rfdb"
+version = "0.1.0"
+dependencies = [
+ "femcraft-model",
+]
+
+[[package]]
+name = "femcraft-ui"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "femcraft-model",
+ "femcraft-render",
  "glam",
 ]
 
