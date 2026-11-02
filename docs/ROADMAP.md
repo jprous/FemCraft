@@ -44,7 +44,7 @@ interface on top of a working file layer rather than ahead of it.
 
 ## Milestones
 
-### M0 - Foundations
+### M0 - Foundations (done)
 
 - Upgrade to the current egui / eframe / wgpu to stay level with SolidCraft and BIMCraft.
 - Split into a crate workspace:

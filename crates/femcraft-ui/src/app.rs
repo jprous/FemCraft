@@ -89,9 +89,10 @@ impl FemCraftApp {
         self.camera.set_view(view);
     }
 
-    fn menu_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        egui::Panel::top("menu").show(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Exit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -106,24 +107,24 @@ impl FemCraftApp {
                     ] {
                         if ui.button(label).clicked() {
                             self.set_view(view);
-                            ui.close_menu();
+                            ui.close();
                         }
                     }
                     ui.separator();
                     if ui.button("Zoom to grid").clicked() {
                         self.zoom_to_grid();
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             });
         });
     }
 
-    fn settings_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("settings")
+    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("settings")
             .resizable(true)
-            .default_width(250.0)
-            .show(ctx, |ui| {
+            .default_size(250.0)
+            .show(ui, |ui| {
                 ui.add_space(4.0);
                 ui.heading("Grid");
                 ui.checkbox(&mut self.grid.visible, "Show grid");
@@ -223,8 +224,8 @@ impl FemCraftApp {
             });
     }
 
-    fn status_bar(&self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 match self.cursor {
                     Some(p) => ui.monospace(format!(
@@ -314,14 +315,14 @@ impl FemCraftApp {
 }
 
 impl eframe::App for FemCraftApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.menu_bar(ctx);
-        self.settings_panel(ctx);
-        self.status_bar(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.menu_bar(ui);
+        self.settings_panel(ui);
+        self.status_bar(ui);
         self.refresh_lines();
         egui::CentralPanel::default()
-            .frame(egui::Frame::none())
-            .show(ctx, |ui| self.viewport_ui(ui));
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| self.viewport_ui(ui));
     }
 }
 

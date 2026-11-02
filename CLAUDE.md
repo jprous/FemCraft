@@ -13,14 +13,17 @@ Plan and milestone status: `docs/ROADMAP.md`.
 
 - Windows, Rust stable, GNU toolchain (`x86_64-pc-windows-gnu`); MinGW binutils (WinLibs) on
   PATH provide `dlltool`.
-- `cargo build`, `cargo test`, `cargo run`.
+- `cargo build`, `cargo test --workspace`, `cargo run` (default member is `apps/femcraft`).
 - Stack: eframe / egui with the wgpu renderer, `glam` maths, WGSL shaders in `src/shaders/`.
 
-## Code layout (before the M0 workspace split)
+## Code layout (Cargo workspace)
 
-- `src/main.rs` window setup, `src/app.rs` UI and viewport interaction,
-  `src/camera.rs` orbit camera (Z up), `src/grid.rs` grid and snapping,
-  `src/viewport.rs` wgpu line renderer (egui paint callback).
+- `apps/femcraft` executable (window setup only).
+- `crates/femcraft-ui` panels and viewport interaction (`app.rs`).
+- `crates/femcraft-render` orbit camera (Z up), grid and snapping, wgpu line renderer, `shaders/`.
+- `crates/femcraft-model`, `-rfdb`, `-aster`, `-results` placeholders, filled from M1 on.
+- egui / eframe 0.37 (panels are `egui::Panel`, `App::ui` instead of `update`).
+- CI: `.github/workflows/ci.yml` (Windows build + test).
 
 ## RFEM `.rf6` facts
 

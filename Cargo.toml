@@ -11,7 +11,7 @@ repository = "https://github.com/jprous/FemCraft"
 publish = false
 
 [workspace.dependencies]
-eframe = { version = "0.29", features = ["wgpu"] }
+eframe = { version = "0.37", features = ["wgpu"] }
 glam = { version = "0.29", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 femcraft-model = { path = "crates/femcraft-model" }
