@@ -20,6 +20,7 @@ interface on top of a working file layer rather than ahead of it.
 | [CadCraft](https://github.com/getcadcraft/cadcraft) | JavaScript | Apache-2.0 | UX patterns: ribbon controls, panes, command line, undo, property panel |
 | [Lapin](https://github.com/Ciuntuc-BIM-Studio/lapin) | C# / TypeScript | MIT | UX patterns: classic modeller layout and interaction |
 | [Stabileo](https://github.com/lambdaclass/stabileo) | TypeScript + Rust engine | **AGPL-3.0** | **Study only - never copy code.** Visual conventions for supports, hinges, loads and result diagrams |
+| Dlubal RFEM 6 API | Dlubal's published API (client libraries, documentation) | Dlubal terms - check | Interface design only: object/attribute naming and operation vocabulary for `femcraft-api`. No copying of Dlubal code or docs |
 
 ### Ground rules
 
@@ -42,6 +43,66 @@ interface on top of a working file layer rather than ahead of it.
   owns child lists (`*_items`, `*_keys` / `*_values`, rows with `owner_id`).
 - Still to confirm: what `.rfc` is exactly, and where calculated results are stored.
 
+## Command API and MCP server (cross-cutting, from M0)
+
+Goal: let an AI assistant (Claude, DeepSeek, any MCP client) drive FemCraft the same way
+scripts drive RFEM 6, so existing Dlubal API knowledge, scripts and examples transfer with as
+few changes as possible.
+
+### Design
+
+- **One API, many front-ends.** All model changes and queries go through `femcraft-api`. The
+  GUI, the MCP server, and later a scripting/remote interface are thin layers over it. The GUI
+  must not have a private path to the model that the API lacks; this keeps the API complete
+  and testable.
+- **Dlubal compatibility.** Mirror the RFEM 6 API's concepts and names: the application /
+  model split, object types and their attribute names (`Node`, `Line`, `Member`, `Surface`,
+  `Material`, `Section`, `LoadCase`, ...), numbered objects, and the operation vocabulary
+  (get / set / delete object, get object list, begin/finish modification for batching,
+  calculate, get results). Use the same attribute names and units so payloads are largely
+  interchangeable. Where RFEM semantics are unclear or not supported, return an explicit
+  "not supported" error rather than silently differing.
+- **Same command layer as editing.** API write operations are the M3 edit commands (apply /
+  undo, grouped). One API batch = one undo step, and it feeds the same change log, so "results
+  out of date" and saving behave identically for GUI and AI edits.
+- **Transport.** Core is transport-neutral. The MCP server (`femcraft-mcp`) speaks MCP over
+  stdio first (works with Claude Desktop / Claude Code and DeepSeek-capable MCP clients), with
+  local HTTP/SSE later. A Dlubal-style remote endpoint (gRPC or SOAP, whichever the current
+  RFEM 6 API uses) is optional and comes after MCP.
+- **MCP tools.** Generic, schema-driven tools rather than hundreds of hand-written ones:
+  `list_object_types`, `get_object_schema`, `get_objects`, `set_objects`, `delete_objects`,
+  `begin_modification` / `finish_modification`, `open_model` / `save_model`, `calculate`,
+  `get_results`, plus view helpers (screenshot, select, isolate). Schemas are generated from
+  the same field descriptions used for the edit dialogs (M4) and the typed objects (M3).
+- **Safety.** AI edits go through the undo stack; destructive operations (delete, overwrite on
+  save) can require confirmation in the GUI; a read-only mode exposes queries only; the server
+  binds to localhost and needs no network access.
+
+### Open questions (resolve in M1, before committing to names)
+
+- Confirm the current RFEM 6 API: which protocol it uses (gRPC vs. the older SOAP web
+  services), its exact object/attribute naming, and its licence terms. Check Dlubal's
+  documentation and licence for reusing names and structures, as with the `.rf6` format
+  ("Ground rules"). Do not copy Dlubal's proprietary client libraries or documentation text;
+  reimplement from observed behaviour and published interface descriptions.
+- Whether Dlubal already ships an MCP server or AI integration whose tool naming we should
+  align with.
+- How far attribute names in the `.rf6` database (table columns) match API attribute names; if
+  they match closely, schemas can be derived from the catalogue tool (M1).
+
+### Milestone touchpoints
+
+| Milestone | API / MCP work |
+|---|---|
+| M0 | `femcraft-api` + `femcraft-mcp` crates, stdio server, info/ping tools, CI test |
+| M1 | Read-only tools: open model, list object types, get objects; compare naming to Dlubal API; schema derived from catalogue |
+| M2 | `save_model`; "RFEM accepts the file" tests also run via the API |
+| M3 | Write tools mapped onto edit commands; batching; undo; validation errors in Dlubal style |
+| M4 | UI indicator for connected MCP clients, activity log, confirm/read-only toggles |
+| M5 | View tools: screenshot, select, isolate, zoom |
+| M6 | `calculate` tool, solver progress, errors |
+| M7 | `get_results` tools, result tables as JSON |
+
 ## Milestones
 
 ### M0 - Foundations
@@ -54,8 +115,14 @@ interface on top of a working file layer rather than ahead of it.
   - `femcraft-ui` - panels, ribbon, tables, dialogs
   - `femcraft-aster` - solver connection
   - `femcraft-results` - results storage and display
+  - `femcraft-api` - the command API (Dlubal-compatible object model and operations), no UI
+  - `femcraft-mcp` - MCP server exposing `femcraft-api` to Claude, DeepSeek and other clients
   - `apps/femcraft` - the executable
 - GitHub Actions CI building and testing on Windows.
+- API/MCP skeleton from day one (see "Command API and MCP server"): an empty `femcraft-api`
+  trait with `get_application_info`, `get_model_info` and `ping`-style calls, and a
+  `femcraft-mcp` stdio server that lists them as tools. Every later milestone adds its
+  operations to this API as it adds the feature.
 
 ### M1 - File format research and read-only viewer
 
@@ -161,6 +228,9 @@ interface on top of a working file layer rather than ahead of it.
 M0 → **M1 read-only viewer** → M4 layout (in parallel) → M2 saving → M3 + M5 editing →
 M6 solver → M7 results.
 
+The command API and MCP server start in M0 and grow with every milestone (see "Command API
+and MCP server"); they are not a separate late milestone.
+
 M2 decides whether the project is viable: if RFEM rejects edited files we learn it early,
 before everything else is built around it.
 
@@ -181,15 +251,15 @@ read. It is corrected by measuring (see the tracking table below).
 
 | Milestone | Sessions | % of a weekly limit | Weeks at 33% / week | Suggested model |
 |---|---|---|---|---|
-| M0 Foundations | 2-3 | 8-15% | 0.5 | Sonnet |
-| M1 File research + read-only viewer | 6-9 | 25-45% | 1-1.5 | Opus (format research), Sonnet (viewer) |
+| M0 Foundations (incl. API / MCP skeleton) | 3-4 | 12-20% | 0.5-1 | Sonnet |
+| M1 File research + read-only viewer (+ read-only MCP tools) | 7-10 | 30-50% | 1-1.5 | Opus (format research, API naming), Sonnet (viewer) |
 | M2 Saving RFEM accepts | 5-8 | 20-40% | 1-1.5 | Opus |
-| M3 Object model, undo, change log | 4-6 | 15-30% | 0.5-1 | Opus (design), Sonnet (object types) |
+| M3 Object model, undo, change log (+ MCP write tools) | 5-8 | 20-40% | 0.5-1.5 | Opus (design), Sonnet (object types) |
 | M4 Application layout | 7-10 | 25-50% | 1-1.5 | Sonnet |
 | M5 Drawing, picking, editing tools | 8-12 | 30-60% | 1-2 | Sonnet, Opus for picking / renderer |
 | M6 Salome-Meca / code_aster | 9-14 | 35-70% | 1-2 | Opus |
 | M7 Post-processing | 6-9 | 25-45% | 1-1.5 | Sonnet |
-| **Total** | **47-71** | **185-355%** | **6-11 weeks** | |
+| **Total** | **51-77** | **200-380%** | **6-12 weeks** | |
 
 **First usable result:** the read-only viewer (end of M1), after roughly 2 weeks.
 **Go / no-go point:** M2. If RFEM rejects edited files, stop and reconsider (for example
@@ -234,3 +304,6 @@ corrected after M0 and M1.
 | Object storage | `slotmap` |
 | Spatial index | `rstar` |
 | Maths | `glam`, `faer` (for any in-house solving) |
+| MCP server | `rmcp` (official Rust MCP SDK; verify current status) |
+| API schemas / serialisation | `serde`, `serde_json`, `schemars` |
+| Async / transport | `tokio` (MCP stdio / HTTP), `tonic` + `prost` if a gRPC endpoint is added |
