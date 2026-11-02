@@ -54,7 +54,7 @@ src/
 
 The full implementation strategy is in [docs/ROADMAP.md](docs/ROADMAP.md). In short:
 
-- **M0** Foundations: crate workspace, current egui / wgpu, CI
+- **M0** Foundations: crate workspace, current egui / wgpu, CI, command API / MCP skeleton
 - **M1** Read RFEM 6 `.rf6` / `.rfc` files and show them (read-only viewer)
 - **M2** Save files RFEM accepts
 - **M3** Object model with undo / redo and change tracking
@@ -62,6 +62,15 @@ The full implementation strategy is in [docs/ROADMAP.md](docs/ROADMAP.md). In sh
 - **M5** Drawing, picking, right-click menus, visibility
 - **M6** Solving with Salome-Meca / code_aster
 - **M7** Post-processing: deformations, contours, member diagrams, result tables
+
+### AI integration (planned)
+
+FemCraft will include an [MCP](https://modelcontextprotocol.io) server from the start, so AI
+assistants such as Claude or DeepSeek can inspect and edit models. It sits on a single command
+API, shared with the GUI, that follows the concepts and naming of the RFEM 6 API so that
+payloads and scripts stay largely compatible. AI edits go through the normal undo stack. The
+API grows with every milestone; see "Command API and MCP server" in
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Licence
 
