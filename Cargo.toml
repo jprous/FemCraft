@@ -1,0 +1,15 @@
+[package]
+name = "femcraft"
+version = "0.1.0"
+edition = "2024"
+description = "FemCraft - a 3D structural modelling workspace"
+publish = false
+
+[dependencies]
+eframe = { version = "0.29", features = ["wgpu"] }
+glam = { version = "0.29", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.dev.package."*"]
+# Optimise dependencies even in debug builds so the viewport stays smooth.
+opt-level = 2
