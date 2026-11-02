@@ -56,3 +56,19 @@ src/
 - Materials, sections and thicknesses
 - Load cases and combinations
 - Export to RFEM 6 through the Dlubal API
+
+## Licence
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+in FemCraft by you, as defined in the Apache-2.0 licence, shall be dual licensed as above,
+without any additional terms or conditions.
+
+FemCraft is independent and is not affiliated with, sponsored by or endorsed by Dlubal Software.
+RFEM is a trademark of its owner, named only to describe compatibility.

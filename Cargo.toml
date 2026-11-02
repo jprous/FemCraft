@@ -3,6 +3,8 @@ name = "femcraft"
 version = "0.1.0"
 edition = "2024"
 description = "FemCraft - a 3D structural modelling workspace"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jprous/FemCraft"
 publish = false
 
 [dependencies]
