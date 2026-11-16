@@ -92,10 +92,10 @@ fn get<'a>(row: &'a Row, name: &str) -> Option<&'a Sql> {
         .map(|(_, v)| v)
 }
 
-fn find<'a>(row: &'a Row, cands: &[&str]) -> Option<(&'a str, &'a Sql)> {
+fn find<'a, S: AsRef<str>>(row: &'a Row, cands: &[S]) -> Option<(&'a str, &'a Sql)> {
     cands.iter().find_map(|c| {
         row.iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(c))
+            .find(|(n, _)| n.eq_ignore_ascii_case(c.as_ref()))
             .map(|(n, v)| (n.as_str(), v))
     })
 }

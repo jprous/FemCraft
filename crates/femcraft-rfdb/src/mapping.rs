@@ -1,18 +1,21 @@
 //! Where each FemCraft field lives in RFEM's `model.db`.
 //!
-//! **All names here are best guesses until confirmed against a real file** with the
-//! `rf6-catalog` tool. The loader tries each candidate in order (case-insensitive), first on the
-//! main table and then on the impl (detail) table, and reports fields it could not find.
-//! A field's own key is always tried first, so only alternative names need listing.
+//! Confirmed on RFEM 6.16 (`rf6-catalog` load report): main tables use camelCase columns, the
+//! object number is `userID`, references are `<name>_id` (plus `<name>_table` when the target
+//! table varies) holding database ids, and loads point to their load case via `parent_id`.
+//! Names marked "guess" below are still unconfirmed.
+//!
+//! For each field the loader tries (case-insensitive, main table then impl table): the field key,
+//! its camelCase form, camelCase + `_id`, then the overrides below.
 
 use femcraft_model::ObjectKind;
 
 /// Columns holding the object number shown to the user.
-pub const NUMBER_COLUMNS: &[&str] = &["no", "number", "object_no", "nr"];
+pub const NUMBER_COLUMNS: &[&str] = &["userID", "no", "number"];
 /// Primary-key column (falls back to SQLite `rowid`).
 pub const ID_COLUMNS: &[&str] = &["id"];
 /// Load-case reference on load tables.
-pub const LOAD_CASE_COLUMNS: &[&str] = &["load_case", "load_case_id", "load_case_no"];
+pub const LOAD_CASE_COLUMNS: &[&str] = &["parent_id", "loadCase_id", "load_case"];
 /// Columns that are bookkeeping, not data, in child list tables.
 pub const CHILD_META_COLUMNS: &[&str] = &["id", "owner_id", "row", "row_index", "index", "order"];
 pub const CHILD_ORDER_COLUMNS: &[&str] = &["row", "row_index", "index", "order", "position"];
@@ -52,9 +55,24 @@ pub fn tables(kind: ObjectKind) -> &'static [&'static str] {
 fn overrides(kind: ObjectKind, key: &str) -> &'static [&'static str] {
     use ObjectKind::*;
     match (kind, key) {
-        (Node, "coordinate_1") => &["x", "coordinate_x", "global_coordinate_1"],
-        (Node, "coordinate_2") => &["y", "coordinate_y", "global_coordinate_2"],
-        (Node, "coordinate_3") => &["z", "coordinate_z", "global_coordinate_3"],
+        (Node, "coordinate_1") => &["coordinates_x"],
+        (Node, "coordinate_2") => &["coordinates_y"],
+        (Node, "coordinate_3") => &["coordinates_z"],
+        (Member, "rotation_angle") => &["angle"],
+        (LoadCase, "action_category") => &["actionCategoryId"],
+        (LoadCase, "self_weight_factor_x") => &["selfWeightFactors_x"],
+        (LoadCase, "self_weight_factor_y") => &["selfWeightFactors_y"],
+        (LoadCase, "self_weight_factor_z") => &["selfWeightFactors_z"],
+        (MemberLoad | LineLoad, "distance_a") => &["distanceADefinition_distance"],
+        (MemberLoad | LineLoad, "distance_a_is_relative") => &["distanceADefinition_isRelative"],
+        (MemberLoad | LineLoad, "distance_b") => &["distanceBDefinition_distance"],
+        (MemberLoad | LineLoad, "distance_b_is_relative") => &["distanceBDefinition_isRelative"],
+        // guess: order of the five surface support constants
+        (SurfaceSupport, "translation_x") => &["springConstant_0"],
+        (SurfaceSupport, "translation_y") => &["springConstant_1"],
+        (SurfaceSupport, "translation_z") => &["springConstant_2"],
+        (SurfaceSupport, "shear_xz") => &["springConstant_3"],
+        (SurfaceSupport, "shear_yz") => &["springConstant_4"],
         (Line, "definition_nodes") => &["nodes", "items", "node"],
         (Surface, "boundary_lines") => &["lines", "items", "line"],
         (Solid, "boundary_surfaces") => &["surfaces", "items", "surface"],
@@ -72,8 +90,23 @@ fn overrides(kind: ObjectKind, key: &str) -> &'static [&'static str] {
     }
 }
 
-pub fn column_candidates(kind: ObjectKind, key: &'static str) -> Vec<&'static str> {
-    let mut v = vec![key];
-    v.extend_from_slice(overrides(kind, key));
+pub fn column_candidates(kind: ObjectKind, key: &'static str) -> Vec<String> {
+    let camel = camel_case(key);
+    let mut v = vec![key.to_owned(), format!("{camel}_id"), camel];
+    v.extend(overrides(kind, key).iter().map(|s| s.to_string()));
     v
+}
+
+/// `self_weight_active` -> `selfWeightActive`; single-letter parts such as `I_y` stay as they are.
+pub fn camel_case(key: &str) -> String {
+    let mut parts = key.split('_');
+    let mut out = parts.next().unwrap_or("").to_owned();
+    for p in parts {
+        let mut c = p.chars();
+        if let Some(first) = c.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(c.as_str());
+        }
+    }
+    out
 }

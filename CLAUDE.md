@@ -36,7 +36,8 @@ Plan and milestone status: `docs/ROADMAP.md`.
   numbers, reports missing fields / unmapped columns; `save` writes only changed scalar fields.
   Not yet: editing list fields held in child tables, changing type, adding / deleting objects.
 - `rf6-catalog` research tool: `cargo run -p femcraft-rfdb --bin rf6-catalog -- file.rf6`
-  (load report), `--tables [FILTER..]`, `--rows TABLE [N]`.
+  (load report), `--kinds [KIND..]` (impl / related tables with samples), `--tables [FILTER..]`,
+  `--rows TABLE [N]`.
 
 ## RFEM `.rf6` facts
 
@@ -45,6 +46,11 @@ Plan and milestone status: `docs/ROADMAP.md`.
 - About 5,900 tables. Pattern: main table (`Node`, `Line`, `Member`, ...) with
   `impl_id` / `impl_table` -> detail table (`NodeImplStandard`, `LineImplPolyline`,
   `MemberImplBeam`, ...) -> child rows (`*_items`, `*_keys` / `*_values`, `owner_id`).
+- Confirmed on RFEM 6.16: main-table columns are camelCase; object number is `userID`
+  (`id` is the db key); references are `<name>_id` (+ `<name>_table` if the target varies);
+  loads point to their load case via `parent_id`. Section / material properties and support
+  springs (`springConstants_id`) live in other tables. Solver data and results are under
+  `!solver/` in the ZIP (`Data.RFemX`, per-combination `RN_*` folders).
 - Saving strategy: start from a database RFEM saved, change only edited rows, keep all
   unknown tables and sidecars byte-identical.
 

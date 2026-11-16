@@ -205,6 +205,7 @@ static SOLID: &[FieldSpec] = &[
 
 static NODAL_SUPPORT: &[FieldSpec] = &[
     NAME,
+    TYPE,
     f("nodes", "Nodes", RefList(K::Node)),
     f("spring_x", "Spring uX", Float(N_M)),
     f("spring_y", "Spring uY", Float(N_M)),
@@ -217,6 +218,7 @@ static NODAL_SUPPORT: &[FieldSpec] = &[
 
 static LINE_SUPPORT: &[FieldSpec] = &[
     NAME,
+    TYPE,
     f("lines", "Lines", RefList(K::Line)),
     f("spring_x", "Spring uX", Float(N_M2)),
     f("spring_y", "Spring uY", Float(N_M2)),
@@ -229,6 +231,7 @@ static LINE_SUPPORT: &[FieldSpec] = &[
 
 static MEMBER_SUPPORT: &[FieldSpec] = &[
     NAME,
+    TYPE,
     f("members", "Members", RefList(K::Member)),
     f("spring_translation_x", "Spring Cu,x", Float(N_M2)),
     f("spring_translation_y", "Spring Cu,y", Float(N_M2)),
@@ -242,6 +245,7 @@ static MEMBER_SUPPORT: &[FieldSpec] = &[
 
 static SURFACE_SUPPORT: &[FieldSpec] = &[
     NAME,
+    TYPE,
     f("surfaces", "Surfaces", RefList(K::Surface)),
     f("translation_x", "Spring uX", Float("N/m³")),
     f("translation_y", "Spring uY", Float("N/m³")),
@@ -289,12 +293,18 @@ macro_rules! linear_load {
             f("magnitude", "Magnitude p", Float(N_M)),
             f("magnitude_1", "Magnitude p1", Float(N_M)),
             f("magnitude_2", "Magnitude p2", Float(N_M)),
-            f("distance_a_absolute", "Distance A", Float("m")),
-            f("distance_b_absolute", "Distance B", Float("m")),
-            f("distance_a_relative", "Distance A (relative)", Float("")),
-            f("distance_b_relative", "Distance B (relative)", Float("")),
-            f("distance_a_is_defined_as_relative", "A is relative", Bool),
-            f("distance_b_is_defined_as_relative", "B is relative", Bool),
+            f(
+                "distance_a",
+                "Distance A (m, or fraction if relative)",
+                Float(""),
+            ),
+            f("distance_a_is_relative", "A is relative", Bool),
+            f(
+                "distance_b",
+                "Distance B (m, or fraction if relative)",
+                Float(""),
+            ),
+            f("distance_b_is_relative", "B is relative", Bool),
             COMMENT,
         ]
     };

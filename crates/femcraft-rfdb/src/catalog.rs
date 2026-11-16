@@ -124,6 +124,6 @@ pub fn dump_rows(conn: &Connection, table: &str, limit: usize) -> Result<String,
     Ok(out)
 }
 
-pub(crate) fn quote(ident: &str) -> String {
+pub fn quote(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
