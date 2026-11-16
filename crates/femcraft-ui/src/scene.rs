@@ -9,7 +9,7 @@ use femcraft_model::{Model, Object, ObjectId, ObjectKind as K, Value};
 use femcraft_render::viewport::LineVertex;
 use glam::Vec3;
 
-pub const NODE: [f32; 4] = [0.92, 0.92, 0.95, 1.0];
+pub const NODE: [f32; 4] = [0.95, 0.20, 0.20, 1.0];
 const LINE: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
 const MEMBER: [f32; 4] = [0.45, 0.72, 1.0, 1.0];
 const SURFACE_FILL: [f32; 4] = [0.30, 0.62, 0.70, 0.28];
@@ -18,6 +18,7 @@ pub const SUPPORT: [f32; 4] = [0.35, 0.85, 0.40, 1.0];
 pub const NODAL_LOAD: [f32; 4] = [1.0, 0.35, 0.30, 1.0];
 pub const LINE_LOAD: [f32; 4] = [1.0, 0.62, 0.20, 1.0];
 pub const SURFACE_LOAD: [f32; 4] = [0.98, 0.86, 0.30, 1.0];
+const SURFACE_LOAD_FILL: [f32; 4] = [0.98, 0.86, 0.30, 0.18];
 
 /// Above this many load labels in one load case, values are not drawn.
 const MAX_LOAD_LABELS: usize = 60;
@@ -586,11 +587,7 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
             };
             let dw = dir_world(d * mag.signum() as f32);
             let c = poly.iter().copied().sum::<Vec3>() / poly.len() as f32;
-            let mut pts = vec![c];
-            pts.extend(poly.iter().map(|p| c + (*p - c) * 0.6));
-            for p in &pts {
-                s.arrow(*p, dw, len, SURFACE_LOAD);
-            }
+            surface_load_block(s, poly, dw, len);
             s.labels.push(Label {
                 pos: c - dw * len * 1.25,
                 text: kn(mag.abs(), "kN/m²"),
@@ -613,6 +610,27 @@ pub fn first_loaded_case(model: &Model) -> Option<u32> {
         .flat_map(|k| model.iter_kind(*k).map(|(id, _)| id.load_case))
         .filter(|lc| *lc > 0)
         .min()
+}
+
+/// Uniform surface load drawn as RFEM does: a translucent block of height `h` standing on
+/// the surface on the load side (`dir` points towards the surface), with outlined edges and
+/// one arrow showing the direction.
+fn surface_load_block(s: &mut Scene, poly: &[Vec3], dir: Vec3, h: f32) {
+    let top: Vec<Vec3> = poly.iter().map(|p| *p - dir * h).collect();
+    for [a, b, c] in triangulate(&top) {
+        s.tri(a, b, c, SURFACE_LOAD_FILL);
+    }
+    let n = poly.len();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (a, b, ta, tb) = (poly[i], poly[j], top[i], top[j]);
+        s.tri(a, b, tb, SURFACE_LOAD_FILL);
+        s.tri(a, tb, ta, SURFACE_LOAD_FILL);
+        s.line(ta, tb, SURFACE_LOAD);
+        s.line(a, ta, SURFACE_LOAD);
+    }
+    let c = poly.iter().copied().sum::<Vec3>() / n as f32;
+    s.arrow(c, dir, h * 0.9, SURFACE_LOAD);
 }
 
 /// Load cases for the selector: (number, name).
