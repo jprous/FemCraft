@@ -768,7 +768,7 @@ pub fn placeholder_previews(doc: &mut RfDocument) -> Result<(), Error> {
     let mut json =
         br#"{"asset":{"version":"2.0","generator":"FemCraft"},"scene":0,"scenes":[{"nodes":[]}]}"#
             .to_vec();
-    while json.len() % 4 != 0 {
+    while !json.len().is_multiple_of(4) {
         json.push(b' ');
     }
     let total = 12 + 8 + json.len() as u32;
