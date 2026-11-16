@@ -44,7 +44,7 @@ interface on top of a working file layer rather than ahead of it.
 
 ## Milestones
 
-### M0 - Foundations
+### M0 - Foundations (done)
 
 - Upgrade to the current egui / eframe / wgpu to stay level with SolidCraft and BIMCraft.
 - Split into a crate workspace:
@@ -66,7 +66,25 @@ interface on top of a working file layer rather than ahead of it.
    2 nodes, 1 member, ...) - ideally through the Dlubal API - and diff the databases to see
    exactly which rows change.
 4. Confirm what `.rfc` is by saving a model as `.rfc` from RFEM.
-5. Goal: open a real model and show nodes, lines, members and surfaces in the viewport, with a
+5. Done: `femcraft-model` object kinds and editable model, `femcraft-rfdb` loader / saver
+   driven by `mapping.rs`, and the `rf6-catalog` tool. Verified on a real RFEM 6.16 model
+   (Prokon import: materials, sections, nodes, lines, members, nodal / line / surface supports,
+   load cases, member loads): all fields load; unchanged save gives a byte-identical
+   `model.db`; edits to impl and part columns reload correctly.
+   A second model (reservoir) confirmed thicknesses, surfaces, member supports and nodal, line,
+   surface, free rectangular and free polygon loads.
+   A third model confirmed solids (boundary surfaces, material) and surfaces without
+   thickness. Still unseen: solid loads, free concentrated / line loads, imposed deformations.
+
+**M2 early result (2026-11): RFEM 6.16 opened FemCraft-edited files cleanly** - a node
+coordinate (impl column) and a surface load magnitude (part table) - with the new values.
+The approach of editing rows in place is viable. List fields are now editable too.
+
+**New models: confirmed.** `rf6-build` creates a portal frame and a 3 x 3 x 3 m pit from an
+emptied template plus cloned prototype objects (see `docs/rfem-tables.md`); RFEM 6.16 opens
+all of them. Lessons: concrete surfaces need a `ConcreteExposureCondition` and a
+`ReinforcementDirection`; owned key / value maps (`addonProperties`) must be cloned intact.
+6. Goal: open a real model and show nodes, lines, members and surfaces in the viewport, with a
    read-only navigator tree and tables.
 
 ### M2 - Saving that RFEM accepts

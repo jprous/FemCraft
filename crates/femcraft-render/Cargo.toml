@@ -1,0 +1,13 @@
+[package]
+name = "femcraft-render"
+description = "FemCraft 3D drawing (wgpu)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+eframe.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
