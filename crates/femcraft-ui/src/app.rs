@@ -340,8 +340,9 @@ impl FemCraftApp {
                     }
                 });
         });
+        let warn = ui.visuals().error_fg_color;
         for note in m.warnings.iter().chain(&self.scene.notes) {
-            ui.colored_label(Color32::YELLOW, note);
+            ui.colored_label(warn, note);
         }
         ui.separator();
     }
@@ -416,7 +417,7 @@ impl FemCraftApp {
                 });
                 if g.is_clamped() {
                     ui.colored_label(
-                        Color32::YELLOW,
+                        ui.visuals().error_fg_color,
                         "Too many lines for this spacing - grid is drawn smaller than the extent.",
                     );
                 }
