@@ -46,8 +46,8 @@ pub const EXTRA_PURGE_TABLES: &[&str] = &[
     "ResultCombination",
     "MemberRepresentative",
     "ShrinkWrapping",
-    "ReinforcementDirection",
-    "ConcreteExposureCondition",
+    // Kept: `ReinforcementDirection`, `ConcreteExposureCondition` - standalone objects that
+    // concrete surfaces must refer to (RFEM crashed on surfaces without them).
     "MemberSet",
     "LineSet",
     "SurfaceSet",
@@ -126,6 +126,27 @@ pub struct Proto {
     pub kind: ObjectKind,
     rows: Vec<(String, Row)>,
     lists: Vec<(String, Row)>,
+}
+
+impl Proto {
+    /// One line per row: table and its non-null columns (research aid).
+    pub fn describe(&self) -> String {
+        let mut out = String::new();
+        for (t, row) in self.rows.iter().chain(&self.lists) {
+            let cols: Vec<String> = row
+                .iter()
+                .filter(|(_, v)| !matches!(v, Sql::Null))
+                .map(|(c, v)| match v {
+                    Sql::Integer(i) => format!("{c}={i}"),
+                    Sql::Real(r) => format!("{c}={r}"),
+                    Sql::Text(s) => format!("{c}={}", s.chars().take(30).collect::<String>()),
+                    _ => format!("{c}=<blob>"),
+                })
+                .collect();
+            out.push_str(&format!("{t}: {}\n", cols.join(" ")));
+        }
+        out
+    }
 }
 
 fn select_rows(conn: &Connection, sql: &str, id: i64) -> Result<Vec<Row>, Error> {
@@ -546,6 +567,53 @@ impl Builder {
              stiffness_id = ?1 WHERE id = ?2",
             rusqlite::params![new, part],
         )?;
+        // Concrete surfaces refer to a durability and a reinforcement direction (one entry
+        // per surface side), as in models saved by RFEM.
+        for (list, target) in [
+            (
+                "SurfaceSpecificImplPart_concreteDurabilities",
+                "ConcreteExposureCondition",
+            ),
+            (
+                "SurfaceSpecificImplPart_reinforcementDirections",
+                "ReinforcementDirection",
+            ),
+        ] {
+            if !self.schema.columns.contains_key(list) || !self.schema.columns.contains_key(target)
+            {
+                continue;
+            }
+            let first: Option<i64> = self.conn.query_row(
+                &format!("SELECT MIN(id) FROM {}", quote(target)),
+                [],
+                |r| r.get(0),
+            )?;
+            let Some(first) = first else { continue };
+            let rows: i64 = self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM {} WHERE id = ?1", quote(list)),
+                [part],
+                |r| r.get(0),
+            )?;
+            if rows == 0 {
+                for order in 0..2 {
+                    self.conn.execute(
+                        &format!(
+                            "INSERT INTO {} (id, container_order, value_id) VALUES (?1, ?2, ?3)",
+                            quote(list)
+                        ),
+                        rusqlite::params![part, order, first],
+                    )?;
+                }
+            } else {
+                self.conn.execute(
+                    &format!(
+                        "UPDATE {} SET value_id = ?1 WHERE id = ?2 AND value_id IS NULL",
+                        quote(list)
+                    ),
+                    rusqlite::params![first, part],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -575,9 +643,10 @@ impl Builder {
                 ))?
                 .query_map([fkid], |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
+            let is_list = self.schema.has_column(&table, "container_order");
             for c in cols {
-                if c == "owner_id" {
-                    // An orphaned part row: remove it.
+                if c == "owner_id" || is_list {
+                    // An orphaned part row or a list entry to a missing object: remove it.
                     self.conn.execute(
                         &format!("DELETE FROM {} WHERE rowid = ?1", quote(&table)),
                         [rowid],
@@ -669,6 +738,56 @@ pub fn update_general_data(doc: &mut RfDocument) -> Result<(), Error> {
     doc.archive
         .replace
         .push(("general_data.xml".into(), xml.into_bytes()));
+    Ok(())
+}
+
+/// Replaces the template's preview images (a picture of another model) with a question mark
+/// and its 3D preview with an empty glTF scene.
+pub fn placeholder_previews(doc: &mut RfDocument) -> Result<(), Error> {
+    let (w, h) = (1200u16, 900u16);
+    let (cx, cy) = (600.0f32, 330.0f32);
+    let mut px = Vec::with_capacity(w as usize * h as usize * 3);
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = (x as f32 - cx, y as f32 - cy);
+            let r = (dx * dx + dy * dy).sqrt();
+            let ang = dy.atan2(dx).to_degrees(); // y down: 90 = straight down
+            let hook = (125.0..175.0).contains(&r) && !(90.0..160.0).contains(&ang);
+            let stem = (575.0..625.0).contains(&(x as f32)) && (455.0..600.0).contains(&(y as f32));
+            let (ex, ey) = (x as f32 - 600.0, y as f32 - 690.0);
+            let dot = ex * ex + ey * ey < 35.0 * 35.0;
+            let v = if hook || stem || dot { 90u8 } else { 232u8 };
+            px.extend_from_slice(&[v, v, v]);
+        }
+    }
+    let mut jpg = Vec::new();
+    jpeg_encoder::Encoder::new(&mut jpg, 85)
+        .encode(&px, w, h, jpeg_encoder::ColorType::Rgb)
+        .map_err(|e| Error::Format(format!("preview image: {e}")))?;
+
+    let mut json =
+        br#"{"asset":{"version":"2.0","generator":"FemCraft"},"scene":0,"scenes":[{"nodes":[]}]}"#
+            .to_vec();
+    while json.len() % 4 != 0 {
+        json.push(b' ');
+    }
+    let total = 12 + 8 + json.len() as u32;
+    let mut glb = Vec::new();
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2u32.to_le_bytes());
+    glb.extend_from_slice(&total.to_le_bytes());
+    glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json);
+
+    for name in ["preview.jpg", "preview_dark.jpg"] {
+        if doc.archive.entries.iter().any(|e| e == name) {
+            doc.archive.replace.push((name.into(), jpg.clone()));
+        }
+    }
+    if doc.archive.entries.iter().any(|e| e == "preview.glb") {
+        doc.archive.replace.push(("preview.glb".into(), glb));
+    }
     Ok(())
 }
 

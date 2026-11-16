@@ -136,6 +136,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{} {}{lc}: {}", kind.name(), id.no, fields.join(" "));
             }
         }
+        Some("--proto") => {
+            // --proto KIND NO[@LC]: the row tree an object is made of.
+            let (Some(kind_name), Some(no)) = (args.get(2), args.get(3)) else {
+                return Err("usage: --proto KIND NO[@LOADCASE]".into());
+            };
+            let kind = ObjectKind::ALL
+                .iter()
+                .copied()
+                .find(|k| k.name().eq_ignore_ascii_case(kind_name))
+                .ok_or("unknown kind")?;
+            let (no, lc): (u32, u32) = match no.split_once('@') {
+                Some((n, lc)) => (n.parse()?, lc.parse()?),
+                None => (no.parse()?, 0),
+            };
+            let doc = RfDocument::open(path)?;
+            let id = femcraft_model::ObjectId::load(kind, lc, no);
+            let (table, key) = doc.db_key(id).ok_or("no such object")?;
+            let conn = Connection::open_with_flags(
+                doc.archive.db_path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let schema = femcraft_rfdb::build::Schema::read(&conn)?;
+            let proto = femcraft_rfdb::build::capture(&conn, &schema, kind, table, key)?;
+            print!("{}", proto.describe());
+        }
         Some("--fk") => {
             let archive = Archive::open(path)?;
             let conn = Connection::open_with_flags(

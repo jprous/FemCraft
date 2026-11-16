@@ -16,7 +16,7 @@ use std::path::Path;
 
 use femcraft_model::{ObjectId, ObjectKind as K, Value};
 use femcraft_rfdb::RfDocument;
-use femcraft_rfdb::build::{Builder, Proto, find_proto, update_general_data};
+use femcraft_rfdb::build::{Builder, Proto, find_proto, placeholder_previews, update_general_data};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -79,9 +79,15 @@ fn run() -> Res<()> {
     let portal = out.join("FemCraft portal frame.rf6");
     portal_frame(template, &p, &portal)?;
     println!("wrote {}", portal.display());
-    let pit = out.join("FemCraft pit.rf6");
-    pit_model(template, &p, &pit)?;
-    println!("wrote {}", pit.display());
+    for (stage, name) in [
+        (1, "FemCraft pit 1 geometry.rf6"),
+        (2, "FemCraft pit 2 support.rf6"),
+        (3, "FemCraft pit 3 loads.rf6"),
+    ] {
+        let pit = out.join(name);
+        pit_model(template, &p, &pit, stage)?;
+        println!("wrote {}", pit.display());
+    }
     Ok(())
 }
 
@@ -162,6 +168,7 @@ fn report_fk(b: &Builder) -> Res<()> {
 
 fn save(mut doc: RfDocument, path: &Path) -> Res<()> {
     update_general_data(&mut doc)?;
+    placeholder_previews(&mut doc)?;
     doc.save(path)?;
     if !doc.report.warnings.is_empty() {
         eprintln!("{}", doc.report.warnings.join("\n"));
@@ -240,7 +247,8 @@ fn portal_frame(template: &Path, p: &Protos, path: &Path) -> Res<()> {
 
 /// 3 x 3 x 3 m open pit: base slab and four walls, 200 mm concrete (material 1). Base on a
 /// surface support; load case 2: 5 kN/m2 on the base, 10 kN/m2 inward on the walls.
-fn pit_model(template: &Path, p: &Protos, path: &Path) -> Res<()> {
+/// `stage` 1 = geometry and load cases only, 2 = + surface support, 3 = + surface loads.
+fn pit_model(template: &Path, p: &Protos, path: &Path, stage: u8) -> Res<()> {
     let mut b = Builder::from_template(template)?;
     nodes(&mut b, p, 8)?;
     for no in 1..=12 {
@@ -251,10 +259,14 @@ fn pit_model(template: &Path, p: &Protos, path: &Path) -> Res<()> {
         let s = b.add(&p.surface, no, None)?;
         b.make_surface_standard(s)?;
     }
-    b.add(&p.surface_support, 1, None)?;
+    if stage >= 2 {
+        b.add(&p.surface_support, 1, None)?;
+    }
     let [_, lc2] = load_cases(&mut b, p)?;
-    for no in 1..=5 {
-        b.add(&p.surface_load, no, Some(lc2))?;
+    if stage >= 3 {
+        for no in 1..=5 {
+            b.add(&p.surface_load, no, Some(lc2))?;
+        }
     }
     report_fk(&b)?;
     let mut doc = b.finish()?;
@@ -317,18 +329,23 @@ fn pit_model(template: &Path, p: &Protos, path: &Path) -> Res<()> {
             ],
         )?;
     }
-    set(
-        &mut doc,
-        ObjectId::new(K::SurfaceSupport, 1),
-        &[
-            ("name", text("Subgrade")),
-            ("surfaces", Value::RefList(vec![1])),
-            ("translation_x", Value::Float(f64::INFINITY)),
-            ("translation_y", Value::Float(f64::INFINITY)),
-            ("translation_z", Value::Float(50e6)), // 50 MN/m3
-        ],
-    )?;
+    if stage >= 2 {
+        set(
+            &mut doc,
+            ObjectId::new(K::SurfaceSupport, 1),
+            &[
+                ("name", text("Subgrade")),
+                ("surfaces", Value::RefList(vec![1])),
+                ("translation_x", Value::Float(f64::INFINITY)),
+                ("translation_y", Value::Float(f64::INFINITY)),
+                ("translation_z", Value::Float(50e6)), // 50 MN/m3
+            ],
+        )?;
+    }
     set_load_cases(&mut doc)?;
+    if stage < 3 {
+        return save(doc, path);
+    }
     // (surface, direction code, magnitude): 13 = global Z (down), 11 / 12 = global X / Y.
     let loads = [
         (1, 13, 5_000.0),
