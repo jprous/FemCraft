@@ -1,0 +1,16 @@
+[package]
+name = "femcraft-rfdb"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+femcraft-model = { version = "0.1.0", path = "../femcraft-model" }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+tempfile = "3.27.0"
+zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+zip = { version = "9.6.0", default-features = false, features = ["deflate"] }

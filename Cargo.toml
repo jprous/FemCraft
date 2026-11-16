@@ -7,6 +7,9 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/jprous/FemCraft"
 publish = false
 
+[workspace]
+members = ["crates/*"]
+
 [dependencies]
 eframe = { version = "0.29", features = ["wgpu"] }
 glam = { version = "0.29", features = ["bytemuck"] }

@@ -181,7 +181,10 @@ impl FemCraftApp {
                 ui.label("Spacing presets");
                 ui.horizontal_wrapped(|ui| {
                     for s in SPACING_PRESETS {
-                        if ui.selectable_label(g.spacing == s, format!("{s} m")).clicked() {
+                        if ui
+                            .selectable_label(g.spacing == s, format!("{s} m"))
+                            .clicked()
+                        {
                             g.spacing = s;
                         }
                     }
@@ -213,8 +216,16 @@ impl FemCraftApp {
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.camera.projection, Projection::Perspective, "Perspective");
-                    ui.radio_value(&mut self.camera.projection, Projection::Orthographic, "Orthographic");
+                    ui.radio_value(
+                        &mut self.camera.projection,
+                        Projection::Perspective,
+                        "Perspective",
+                    );
+                    ui.radio_value(
+                        &mut self.camera.projection,
+                        Projection::Orthographic,
+                        "Orthographic",
+                    );
                 });
                 ui.checkbox(&mut self.show_axes, "Show global axes");
 
@@ -291,10 +302,12 @@ impl FemCraftApp {
             let ndc_x = (pos.x - rect.left()) / rect.width() * 2.0 - 1.0;
             let ndc_y = 1.0 - (pos.y - rect.top()) / rect.height() * 2.0;
             let (origin, dir) = self.camera.ray(aspect, ndc_x, ndc_y);
-            self.grid.intersect(origin, dir).map(|hit| self.grid.snap(hit))
+            self.grid
+                .intersect(origin, dir)
+                .map(|hit| self.grid.snap(hit))
         });
         if let Some(s) = self.cursor.and_then(to_screen) {
-            let stroke = Stroke::new(1.5_f32,Color32::from_rgb(255, 200, 60));
+            let stroke = Stroke::new(1.5_f32, Color32::from_rgb(255, 200, 60));
             painter.line_segment([s - egui::vec2(6.0, 0.0), s + egui::vec2(6.0, 0.0)], stroke);
             painter.line_segment([s - egui::vec2(0.0, 6.0), s + egui::vec2(0.0, 6.0)], stroke);
         }
@@ -302,9 +315,19 @@ impl FemCraftApp {
         // Axis labels at the tips of the global axes
         if self.show_axes {
             let len = self.grid.half_size().max(self.grid.spacing * 5.0);
-            for (dir, name, color) in [(Vec3::X, "X", AXIS_X), (Vec3::Y, "Y", AXIS_Y), (Vec3::Z, "Z", AXIS_Z)] {
+            for (dir, name, color) in [
+                (Vec3::X, "X", AXIS_X),
+                (Vec3::Y, "Y", AXIS_Y),
+                (Vec3::Z, "Z", AXIS_Z),
+            ] {
                 if let Some(p) = to_screen(dir * len * 1.03) {
-                    painter.text(p, egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(14.0), rgba(color));
+                    painter.text(
+                        p,
+                        egui::Align2::CENTER_CENTER,
+                        name,
+                        egui::FontId::proportional(14.0),
+                        rgba(color),
+                    );
                 }
             }
         }
@@ -350,15 +373,19 @@ fn paint_background(painter: &egui::Painter, rect: egui::Rect) {
 fn paint_axis_triad(painter: &egui::Painter, rect: egui::Rect, camera: &OrbitCamera) {
     let center = Pos2::new(rect.left() + 55.0, rect.bottom() - 55.0);
     let view = camera.view();
-    let mut axes: Vec<(Vec3, &str, [f32; 4])> = [(Vec3::X, "X", AXIS_X), (Vec3::Y, "Y", AXIS_Y), (Vec3::Z, "Z", AXIS_Z)]
-        .into_iter()
-        .map(|(d, n, c)| (view.transform_vector3(d), n, c))
-        .collect();
+    let mut axes: Vec<(Vec3, &str, [f32; 4])> = [
+        (Vec3::X, "X", AXIS_X),
+        (Vec3::Y, "Y", AXIS_Y),
+        (Vec3::Z, "Z", AXIS_Z),
+    ]
+    .into_iter()
+    .map(|(d, n, c)| (view.transform_vector3(d), n, c))
+    .collect();
     // Draw the axis pointing away from the viewer first.
     axes.sort_by(|a, b| a.0.z.total_cmp(&b.0.z));
     for (v, name, color) in axes {
         let tip = center + egui::vec2(v.x, -v.y) * 38.0;
-        painter.line_segment([center, tip], Stroke::new(2.5_f32,rgba(color)));
+        painter.line_segment([center, tip], Stroke::new(2.5_f32, rgba(color)));
         painter.text(
             center + egui::vec2(v.x, -v.y) * 48.0,
             egui::Align2::CENTER_CENTER,

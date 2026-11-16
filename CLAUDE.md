@@ -16,11 +16,26 @@ Plan and milestone status: `docs/ROADMAP.md`.
 - `cargo build`, `cargo test`, `cargo run`.
 - Stack: eframe / egui with the wgpu renderer, `glam` maths, WGSL shaders in `src/shaders/`.
 
-## Code layout (before the M0 workspace split)
+## Code layout
+
+Cargo workspace: the app is still the root package; library crates live in `crates/`.
 
 - `src/main.rs` window setup, `src/app.rs` UI and viewport interaction,
   `src/camera.rs` orbit camera (Z up), `src/grid.rs` grid and snapping,
   `src/viewport.rs` wgpu line renderer (egui paint callback).
+- `crates/femcraft-model` - no I/O. `kinds.rs`: every object kind (materials, sections,
+  thicknesses, nodes, lines, members, surfaces, solids, 4 support kinds, load cases, 11 load
+  kinds) with field descriptors (key, label, type/SI unit) that drive tables and dialogs.
+  `model.rs`: `Model` of `ObjectId { kind, load_case, no }` -> `Object` (field values),
+  typed `set` with dirty / removed tracking, geometry helpers. References are object numbers.
+- `crates/femcraft-rfdb` - `.rf6` I/O. `archive.rs` ZIP / bare db / folder, raw-copies
+  sidecars on save. `mapping.rs`: **all RFEM table and column names (guesses until
+  verified)**. `document.rs`: `RfDocument::open` loads every kind generically (main row ->
+  impl row -> `{Table}_{field}` child tables), auto-detects whether refs store db ids or
+  numbers, reports missing fields / unmapped columns; `save` writes only changed scalar fields.
+  Not yet: editing list fields held in child tables, changing type, adding / deleting objects.
+- `rf6-catalog` research tool: `cargo run -p femcraft-rfdb --bin rf6-catalog -- file.rf6`
+  (load report), `--tables [FILTER..]`, `--rows TABLE [N]`.
 
 ## RFEM `.rf6` facts
 

@@ -105,7 +105,11 @@ impl GridSettings {
         out.reserve((half as usize * 2 + 1) * 4);
         for i in -half..=half {
             let t = i as f32 * self.spacing;
-            let color = if i % major == 0 { MAJOR_COLOR } else { MINOR_COLOR };
+            let color = if i % major == 0 {
+                MAJOR_COLOR
+            } else {
+                MINOR_COLOR
+            };
             let mut line = |a: Vec3, b: Vec3| {
                 out.push(LineVertex::new(a, color));
                 out.push(LineVertex::new(b, color));
@@ -142,7 +146,11 @@ mod tests {
 
     #[test]
     fn line_count_matches_spacing() {
-        let g = GridSettings { spacing: 0.5, extent: 2.0, ..Default::default() };
+        let g = GridSettings {
+            spacing: 0.5,
+            extent: 2.0,
+            ..Default::default()
+        };
         let mut v = Vec::new();
         g.build_lines(&mut v);
         // 9 positions (-2..=2 step 0.5), 2 lines each, 2 vertices per line
@@ -151,7 +159,11 @@ mod tests {
 
     #[test]
     fn snap_and_intersect_on_xz_plane() {
-        let g = GridSettings { plane: GridPlane::XZ, offset: 3.0, ..Default::default() };
+        let g = GridSettings {
+            plane: GridPlane::XZ,
+            offset: 3.0,
+            ..Default::default()
+        };
         let hit = g.intersect(Vec3::new(1.2, -10.0, 2.7), Vec3::Y).unwrap();
         assert_eq!(hit, Vec3::new(1.2, 3.0, 2.7));
         assert_eq!(g.snap(hit), Vec3::new(1.0, 3.0, 3.0));

@@ -19,7 +19,10 @@ pub struct LineVertex {
 
 impl LineVertex {
     pub fn new(pos: Vec3, color: [f32; 4]) -> Self {
-        Self { pos: pos.to_array(), color }
+        Self {
+            pos: pos.to_array(),
+            color,
+        }
     }
 }
 

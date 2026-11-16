@@ -66,7 +66,11 @@ interface on top of a working file layer rather than ahead of it.
    2 nodes, 1 member, ...) - ideally through the Dlubal API - and diff the databases to see
    exactly which rows change.
 4. Confirm what `.rfc` is by saving a model as `.rfc` from RFEM.
-5. Goal: open a real model and show nodes, lines, members and surfaces in the viewport, with a
+5. Done (unverified against real files): `femcraft-model` object kinds and editable model,
+   `femcraft-rfdb` generic loader / scalar-field saver driven by `mapping.rs`, and the
+   `rf6-catalog` tool. Next: run `rf6-catalog` on small RFEM test models and correct
+   `mapping.rs` until the load report shows no missing fields.
+6. Goal: open a real model and show nodes, lines, members and surfaces in the viewport, with a
    read-only navigator tree and tables.
 
 ### M2 - Saving that RFEM accepts
