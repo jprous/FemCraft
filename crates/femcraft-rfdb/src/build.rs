@@ -472,14 +472,45 @@ impl Builder {
             }
             self.insert(t, &out)?;
         }
+        // List entries: references to rows of this object's own tree are remapped (for
+        // example `addonProperties_values` -> owned `AddonThicknessProperties`); references to
+        // other objects are dropped (FemCraft writes those lists itself). When a map value is
+        // dropped, its key (same `..._keys` table, owner and order) goes too.
+        let mut kept: Vec<(String, Row)> = Vec::new();
+        let mut dropped: HashSet<(String, i64, i64)> = HashSet::new();
         for (l, row) in &proto.lists {
-            // Drop entries referring to other objects; FemCraft writes those lists itself.
-            let refers = ["reference_id", "value_id"]
-                .iter()
-                .any(|c| matches!(get(row, c), Some(v) if !matches!(v, Sql::Null)));
-            if refers {
-                continue;
+            let mut out = row.clone();
+            let mut keep = true;
+            if let Some(Sql::Integer(rid)) = get(row, "reference_id") {
+                match get(row, "reference_table") {
+                    Some(Sql::Text(rt)) if map.contains_key(&(rt.clone(), *rid)) => {
+                        let new = map[&(rt.clone(), *rid)];
+                        for (c, v) in &mut out {
+                            if c == "reference_id" {
+                                *v = Sql::Integer(new);
+                            }
+                        }
+                    }
+                    _ => keep = false,
+                }
             }
+            if matches!(get(row, "value_id"), Some(Sql::Integer(_))) {
+                keep = false;
+            }
+            if keep {
+                kept.push((l.clone(), out));
+            } else if let Some(base) = l.strip_suffix("_values") {
+                let id = int(get(row, "id")).unwrap_or(0);
+                let order = int(get(row, "container_order")).unwrap_or(0);
+                dropped.insert((format!("{base}_keys"), id, order));
+            }
+        }
+        kept.retain(|(l, row)| {
+            let id = int(get(row, "id")).unwrap_or(0);
+            let order = int(get(row, "container_order")).unwrap_or(0);
+            !dropped.contains(&(l.clone(), id, order))
+        });
+        for (l, row) in &kept {
             let owner = self
                 .schema
                 .lists
