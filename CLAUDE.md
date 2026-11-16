@@ -58,6 +58,13 @@ Plan and milestone status: `docs/ROADMAP.md`.
   `<Impl>_magnitudes`; section values via `librarySection` -> `SectionData_parameterValues`;
   material values via `MaterialProperties_propertiesMap`. Library sections / materials store
   no name (RFEM generates it). Line / member lengths are not stored. `-inf` = "not set".
+  Surface thickness via `SurfaceStiffnessStandard.thickness_id`; surface load magnitude via
+  `loadParameters_id` -> `<Impl>_NodeAndMagnitudeParameters_loadParameters`; member / surface
+  support springs are `springConstant_N` on the impl row.
+- Verified models (local only): `Prokon Model1.rf6` (frame) and `Al Qou_Rev6.rf6` (reservoir:
+  surfaces, thicknesses, member supports, nodal / line / surface / free loads). Not yet seen:
+  solids, solid loads, free concentrated / line loads, imposed deformations, nodal load
+  components.
 - Solver data and results are under `!solver/` in the ZIP (`Data.RFemX`, `RN_*` folders).
 - Saving strategy: start from a database RFEM saved, change only edited rows, keep all
   unknown tables and sidecars byte-identical.

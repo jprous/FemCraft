@@ -28,6 +28,8 @@ pub struct KindReport {
 #[derive(Debug, Clone, Default)]
 pub struct LoadReport {
     pub kinds: Vec<KindReport>,
+    /// Problems found while loading (for example duplicate object numbers).
+    pub warnings: Vec<String>,
 }
 
 impl std::fmt::Display for LoadReport {
@@ -35,6 +37,11 @@ impl std::fmt::Display for LoadReport {
         for k in &self.kinds {
             match &k.table {
                 None => writeln!(f, "{:<26} no table", k.kind.name())?,
+                Some(t) if k.objects == 0 => writeln!(
+                    f,
+                    "{:<26} {t}: 0 objects (mapping unverified)",
+                    k.kind.name()
+                )?,
                 Some(t) => {
                     writeln!(f, "{:<26} {t}: {} objects", k.kind.name(), k.objects)?;
                     if !k.missing_fields.is_empty() {
@@ -46,6 +53,9 @@ impl std::fmt::Display for LoadReport {
                     }
                 }
             }
+        }
+        for w in &self.warnings {
+            writeln!(f, "warning: {w}")?;
         }
         Ok(())
     }
@@ -356,7 +366,7 @@ fn derived_value(
     impl_row: &Row,
 ) -> Result<Option<Sql>, Error> {
     match d {
-        Derived::SectionParameter(key) => {
+        Derived::SectionParameter(keys) => {
             let (Some(Sql::Text(lib)), Some(lib_id)) = (
                 get(impl_row, "librarySection_table"),
                 get(impl_row, "librarySection_id").and_then(int),
@@ -369,7 +379,13 @@ fn derived_value(
             let Some(data) = lookup_int(conn, lib, "sectionData_id", lib_id)? else {
                 return Ok(None);
             };
-            map_value(conn, cat, "SectionData", "parameterValues", data, key)
+            for key in keys {
+                if let Some(v) = map_value(conn, cat, "SectionData", "parameterValues", data, key)?
+                {
+                    return Ok(Some(v));
+                }
+            }
+            Ok(None)
         }
         Derived::MaterialProperty(key) => {
             let vector = format!("{impl_name}_materialDataVector");
@@ -511,16 +527,21 @@ impl RfDocument {
                             (_, Some((n, _, iid, _)))
                                 if mapping::part_column(kind, fs.key).is_some() =>
                             {
-                                let (pt, pc) = mapping::part_column(kind, fs.key).unwrap();
+                                let part = mapping::part_column(kind, fs.key).unwrap();
+                                let owner = match part.via {
+                                    None => Some(*iid),
+                                    Some(c) => get(&impl_row.as_ref().unwrap().3, c).and_then(int),
+                                };
+                                let Some(owner) = owner else { continue };
                                 let Some((table, rowid, v)) =
-                                    part_value(&conn, &cat, pt, pc, n, *iid)?
+                                    part_value(&conn, &cat, part.table, part.column, n, owner)?
                                 else {
                                     continue;
                                 };
                                 let loc = Loc::Part {
                                     table,
                                     rowid,
-                                    column: pc.to_owned(),
+                                    column: part.column.to_owned(),
                                 };
                                 (loc, from_sql(fs.ty, &v))
                             }
@@ -553,11 +574,13 @@ impl RfDocument {
                                     .collect();
                                 (Loc::Child, Value::RefList(items))
                             }
-                            (_, Some((n, ..))) if fs.key == "type" || fs.key == "load_type" => {
-                                let prefix = if fs.key == "type" {
-                                    "TYPE"
-                                } else {
-                                    "LOAD_TYPE"
+                            (_, Some((n, ..)))
+                                if matches!(fs.key, "type" | "load_type" | "geometry") =>
+                            {
+                                let prefix = match fs.key {
+                                    "type" => "TYPE",
+                                    "load_type" => "LOAD_TYPE",
+                                    _ => "GEOMETRY",
                                 };
                                 let Some(t) = type_from_impl(prefix, n) else {
                                     continue;
@@ -702,6 +725,13 @@ impl RfDocument {
                 map(by_id, ObjectKind::LoadCase, lc)
             });
             let id = ObjectId::load(r.kind, lc, r.no);
+            if self.model.get(id).is_some() {
+                // Keep the first; editing the wrong row would be worse than hiding one.
+                self.report
+                    .warnings
+                    .push(format!("duplicate {id:?} (db id {}) skipped", r.db_id));
+                continue;
+            }
             r.binding.loaded = r.obj.clone();
             self.bindings.insert(id, r.binding.clone());
             self.model.insert_loaded(id, std::mem::take(&mut r.obj));

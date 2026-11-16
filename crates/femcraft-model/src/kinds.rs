@@ -177,13 +177,11 @@ static MEMBER: &[FieldSpec] = &[
     COMMENT,
 ];
 
+/// Material comes from the thickness.
 static SURFACE: &[FieldSpec] = &[
-    TYPE,
     f("geometry", "Geometry", Enum),
     f("boundary_lines", "Boundary lines", RefList(K::Line)),
     f("thickness", "Thickness", Ref(K::Thickness)),
-    f("material", "Material", Ref(K::Material)),
-    f("area", "Area", Float("m²")),
     COMMENT,
 ];
 
@@ -227,7 +225,6 @@ static LINE_SUPPORT: &[FieldSpec] = &[
 
 static MEMBER_SUPPORT: &[FieldSpec] = &[
     NAME,
-    TYPE,
     f("members", "Members", RefList(K::Member)),
     f("spring_translation_x", "Spring Cu,x", Float(N_M2)),
     f("spring_translation_y", "Spring Cu,y", Float(N_M2)),
@@ -241,7 +238,6 @@ static MEMBER_SUPPORT: &[FieldSpec] = &[
 
 static SURFACE_SUPPORT: &[FieldSpec] = &[
     NAME,
-    TYPE,
     f("surfaces", "Surfaces", RefList(K::Surface)),
     f("translation_x", "Spring uX", Float("N/m³")),
     f("translation_y", "Spring uY", Float("N/m³")),
@@ -267,8 +263,7 @@ static NODAL_LOAD: &[FieldSpec] = &[
     f("nodes", "Nodes", RefList(K::Node)),
     LOAD_TYPE,
     LOAD_DIR,
-    f("force_magnitude", "Force P", Float("N")),
-    f("moment_magnitude", "Moment M", Float("N·m")),
+    f("magnitude", "Magnitude P / M", Float("N | N·m")),
     f("components_force_x", "Force PX", Float("N")),
     f("components_force_y", "Force PY", Float("N")),
     f("components_force_z", "Force PZ", Float("N")),
@@ -314,12 +309,8 @@ static SURFACE_LOAD: &[FieldSpec] = &[
     LOAD_DIST,
     LOAD_DIR,
     f("uniform_magnitude", "Magnitude p", Float(N_M2)),
-    f("magnitude_1", "Magnitude p1", Float(N_M2)),
-    f("magnitude_2", "Magnitude p2", Float(N_M2)),
-    f("magnitude_3", "Magnitude p3", Float(N_M2)),
-    f("node_1", "Node 1", Ref(K::Node)),
-    f("node_2", "Node 2", Ref(K::Node)),
-    f("node_3", "Node 3", Ref(K::Node)),
+    f("magnitude_t_c", "Temperature Tc", Float("K")),
+    f("magnitude_delta_t", "Temperature ΔT", Float("K")),
     COMMENT,
 ];
 
@@ -340,9 +331,9 @@ static FREE_CONCENTRATED_LOAD: &[FieldSpec] = &[
     LOAD_TYPE,
     FREE_PROJECTION,
     LOAD_DIR,
-    f("load_magnitude", "Magnitude P", Float("N")),
-    f("load_location_x", "Location X", Float("m")),
-    f("load_location_y", "Location Y", Float("m")),
+    f("magnitude", "Magnitude P", Float("N")),
+    f("location_x", "Location X", Float("m")),
+    f("location_y", "Location Y", Float("m")),
     COMMENT,
 ];
 
@@ -353,10 +344,10 @@ static FREE_LINE_LOAD: &[FieldSpec] = &[
     LOAD_DIR,
     f("magnitude_first", "Magnitude p1", Float(N_M)),
     f("magnitude_second", "Magnitude p2", Float(N_M)),
-    f("load_location_first_x", "Point 1 X", Float("m")),
-    f("load_location_first_y", "Point 1 Y", Float("m")),
-    f("load_location_second_x", "Point 2 X", Float("m")),
-    f("load_location_second_y", "Point 2 Y", Float("m")),
+    f("location_first_x", "Point 1 X", Float("m")),
+    f("location_first_y", "Point 1 Y", Float("m")),
+    f("location_second_x", "Point 2 X", Float("m")),
+    f("location_second_y", "Point 2 Y", Float("m")),
     COMMENT,
 ];
 
@@ -365,13 +356,12 @@ static FREE_RECTANGULAR_LOAD: &[FieldSpec] = &[
     LOAD_DIST,
     FREE_PROJECTION,
     LOAD_DIR,
-    f("magnitude_uniform", "Magnitude p", Float(N_M2)),
-    f("magnitude_linear_first", "Magnitude p1", Float(N_M2)),
-    f("magnitude_linear_second", "Magnitude p2", Float(N_M2)),
-    f("load_location_first_x", "Corner 1 X", Float("m")),
-    f("load_location_first_y", "Corner 1 Y", Float("m")),
-    f("load_location_second_x", "Corner 2 X", Float("m")),
-    f("load_location_second_y", "Corner 2 Y", Float("m")),
+    f("magnitude_first", "Magnitude p / p1", Float(N_M2)),
+    f("magnitude_second", "Magnitude p2", Float(N_M2)),
+    f("location_first_x", "Corner 1 X", Float("m")),
+    f("location_first_y", "Corner 1 Y", Float("m")),
+    f("location_second_x", "Corner 2 X", Float("m")),
+    f("location_second_y", "Corner 2 Y", Float("m")),
     COMMENT,
 ];
 
@@ -381,7 +371,7 @@ static FREE_POLYGON_LOAD: &[FieldSpec] = &[
     LOAD_DIST,
     FREE_PROJECTION,
     LOAD_DIR,
-    f("magnitude_uniform", "Magnitude p", Float(N_M2)),
+    f("magnitude", "Magnitude p", Float(N_M2)),
     COMMENT,
 ];
 

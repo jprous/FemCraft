@@ -71,8 +71,10 @@ interface on top of a working file layer rather than ahead of it.
    (Prokon import: materials, sections, nodes, lines, members, nodal / line / surface supports,
    load cases, member loads): all fields load; unchanged save gives a byte-identical
    `model.db`; edits to impl and part columns reload correctly.
-   Next: models containing thicknesses, surfaces, solids, member supports and the other load
-   types, to confirm the "guess" entries; then confirm RFEM opens an edited file (M2).
+   A second model (reservoir) confirmed thicknesses, surfaces, member supports and nodal, line,
+   surface, free rectangular and free polygon loads.
+   Next: solids, solid loads, free concentrated / line loads and imposed deformations; then
+   confirm RFEM opens an edited file (M2).
 6. Goal: open a real model and show nodes, lines, members and surfaces in the viewport, with a
    read-only navigator tree and tables.
 

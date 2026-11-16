@@ -96,14 +96,26 @@ fn overrides(kind: ObjectKind, key: &str) -> &'static [&'static str] {
         // guess: which of the remaining two is xz / yz
         (SurfaceSupport, "shear_xz") => &["springConstant_3"],
         (SurfaceSupport, "shear_yz") => &["springConstant_4"],
+        // Member support constants: 0-2 translation x / y / z (confirmed by a support with
+        // 2.5e6, 2.5e6, 5e6); guess: 3 rotation, 4-6 shear x / y / z, as in RFEM's API order.
+        (MemberSupport, "spring_translation_x") => &["springConstant_0"],
+        (MemberSupport, "spring_translation_y") => &["springConstant_1"],
+        (MemberSupport, "spring_translation_z") => &["springConstant_2"],
+        (MemberSupport, "spring_rotation") => &["springConstant_3"],
+        (MemberSupport, "spring_shear_x") => &["springConstant_4"],
+        (MemberSupport, "spring_shear_y") => &["springConstant_5"],
+        (MemberSupport, "spring_shear_z") => &["springConstant_6"],
+        (Material, "type") => &["materialType"],
+        (NodalLoad, "load_direction") => &["loadDirectionAxis"],
+        (FreeRectangularLoad | FreeLineLoad, "load_distribution") => &["distribution"],
         // Objects a load is applied to.
         (k, "nodes" | "lines" | "members" | "surfaces" | "solids") if k.spec().is_load() => {
             &["assignedTo"]
         }
+        (Surface, "boundary_lines") => &["boundaryLines"],
+        (Thickness, "uniform_thickness") => &["thickness"],
         // guess
-        (Surface, "boundary_lines") => &["boundaryLines", "lines"],
         (Solid, "boundary_surfaces") => &["boundarySurfaces", "surfaces"],
-        (Thickness, "uniform_thickness") => &["thickness", "d"],
         _ => &[],
     }
 }
@@ -115,36 +127,61 @@ pub fn column_candidates(kind: ObjectKind, key: &'static str) -> Vec<String> {
     v
 }
 
-/// A field held in a part table owned by the impl row: `(table, column)`.
-/// `{impl}` in the table name is replaced by the impl table name.
-pub fn part_column(kind: ObjectKind, key: &str) -> Option<(&'static str, &'static str)> {
+/// A field held in a one-row part table.
+#[derive(Debug, Clone, Copy)]
+pub struct Part {
+    /// Table name; `{impl}` is replaced by the impl table name.
+    pub table: &'static str,
+    pub column: &'static str,
+    /// Impl-row column holding the owner key; `None` = the impl row id itself.
+    pub via: Option<&'static str>,
+}
+
+/// Where a field held in a part table lives.
+pub fn part_column(kind: ObjectKind, key: &str) -> Option<Part> {
     use ObjectKind::*;
+    const fn p(table: &'static str, column: &'static str) -> Part {
+        Part {
+            table,
+            column,
+            via: None,
+        }
+    }
     const SPRINGS: &str = "SpringConstants";
+    const SURFACE_LOAD_PARAMS: &str = "{impl}_NodeAndMagnitudeParameters_loadParameters";
     Some(match (kind, key) {
-        (NodalSupport | LineSupport, "spring_x") => (SPRINGS, "springConstantAlongX"),
-        (NodalSupport | LineSupport, "spring_y") => (SPRINGS, "springConstantAlongY"),
-        (NodalSupport | LineSupport, "spring_z") => (SPRINGS, "springConstantAlongZ"),
+        (NodalSupport | LineSupport, "spring_x") => p(SPRINGS, "springConstantAlongX"),
+        (NodalSupport | LineSupport, "spring_y") => p(SPRINGS, "springConstantAlongY"),
+        (NodalSupport | LineSupport, "spring_z") => p(SPRINGS, "springConstantAlongZ"),
         (NodalSupport | LineSupport, "rotational_restraint_x") => {
-            (SPRINGS, "springConstantAroundX")
+            p(SPRINGS, "springConstantAroundX")
         }
         (NodalSupport | LineSupport, "rotational_restraint_y") => {
-            (SPRINGS, "springConstantAroundY")
+            p(SPRINGS, "springConstantAroundY")
         }
         (NodalSupport | LineSupport, "rotational_restraint_z") => {
-            (SPRINGS, "springConstantAroundZ")
+            p(SPRINGS, "springConstantAroundZ")
         }
-        // guess: member supports use the same spring table
-        (MemberSupport, "spring_translation_x") => (SPRINGS, "springConstantAlongX"),
-        (MemberSupport, "spring_translation_y") => (SPRINGS, "springConstantAlongY"),
-        (MemberSupport, "spring_translation_z") => (SPRINGS, "springConstantAlongZ"),
-        (MemberSupport, "spring_rotation") => (SPRINGS, "springConstantAroundX"),
         (MemberLoad | LineLoad, "magnitude") => {
-            ("{impl}_magnitudes", "temperaturesOrMagnitudeFirstMagnitude")
+            p("{impl}_magnitudes", "temperaturesOrMagnitudeFirstMagnitude")
         }
-        (MemberLoad | LineLoad, "magnitude_2") => (
+        (MemberLoad | LineLoad, "magnitude_2") => p(
             "{impl}_magnitudes",
             "temperaturesOrMagnitudeSecondMagnitude",
         ),
+        // Surface loads: impl.loadParameters_id -> parameter list, first row.
+        (SurfaceLoad, "uniform_magnitude" | "magnitude_t_c" | "magnitude_delta_t") => Part {
+            table: SURFACE_LOAD_PARAMS,
+            column: match key {
+                "uniform_magnitude" => "magnitude",
+                "magnitude_t_c" => "magnitude1",
+                _ => "magnitude2",
+            },
+            via: Some("loadParameters_id"),
+        },
+        (FreePolygonLoad, "magnitude") => p("{impl}_loadMagnitudeParameters", "magnitude"),
+        // Surface stiffness row (owner = surface impl) holds the thickness.
+        (Surface, "thickness") => p("SurfaceStiffnessStandard", "thickness_id"),
         _ => return None,
     })
 }
@@ -153,8 +190,8 @@ pub fn part_column(kind: ObjectKind, key: &str) -> Option<(&'static str, &'stati
 #[derive(Debug, Clone, Copy)]
 pub enum Derived {
     /// Impl `librarySection_id` -> library row `sectionData_id` ->
-    /// `SectionData_parameterValues[key].valueSI`.
-    SectionParameter(&'static str),
+    /// `SectionData_parameterValues[key].valueSI`, first key present.
+    SectionParameter(&'static [&'static str]),
     /// `MaterialImpl_materialDataVector[0]` -> `MaterialData.properties_id` ->
     /// `MaterialProperties_propertiesMap[key]` -> referenced row `valueSI`.
     MaterialProperty(&'static str),
@@ -164,9 +201,13 @@ pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
     use Derived::*;
     use ObjectKind::*;
     Some(match (kind, key) {
-        (Section, "A" | "I_y" | "I_z" | "I_t") => SectionParameter(key),
-        (Section, "A_y") => SectionParameter("A_v_y"),
-        (Section, "A_z") => SectionParameter("A_v_z"),
+        (Section, "A") => SectionParameter(&["A"]),
+        (Section, "I_y") => SectionParameter(&["I_y"]),
+        (Section, "I_z") => SectionParameter(&["I_z"]),
+        (Section, "I_t") => SectionParameter(&["I_t"]),
+        // Library steel uses A_v_*, parametric sections A_y / A_z.
+        (Section, "A_y") => SectionParameter(&["A_v_y", "A_y"]),
+        (Section, "A_z") => SectionParameter(&["A_v_z", "A_z"]),
         (Material, "elasticity_modulus") => MaterialProperty("E"),
         (Material, "shear_modulus") => MaterialProperty("G"),
         (Material, "poisson_ratio") => MaterialProperty("nu"),
