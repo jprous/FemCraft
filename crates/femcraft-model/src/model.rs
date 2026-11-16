@@ -198,15 +198,9 @@ impl Model {
             .map_or(&[], |l| l.get("definition_nodes").as_ref_list())
     }
 
-    /// Start and end node of a member, from its own fields or else from its line.
+    /// Start and end node of a member (RFEM takes them from the member's line).
     pub fn member_nodes(&self, no: u32) -> Option<(u32, u32)> {
         let m = self.get(ObjectId::new(ObjectKind::Member, no))?;
-        if let (Some(a), Some(b)) = (
-            m.get("node_start").as_ref_no(),
-            m.get("node_end").as_ref_no(),
-        ) {
-            return Some((a, b));
-        }
         let nodes = self.line_nodes(m.get("line").as_ref_no()?);
         Some((*nodes.first()?, *nodes.last()?))
     }

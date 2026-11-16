@@ -31,8 +31,9 @@ impl TableInfo {
     }
 
     /// Child list table owned by a row of another table.
+    /// Child list (`id` = owner + `container_order`) or part table (`owner_id`).
     pub fn is_child(&self) -> bool {
-        self.column("owner_id").is_some()
+        self.column("owner_id").is_some() || self.column("container_order").is_some()
     }
 }
 

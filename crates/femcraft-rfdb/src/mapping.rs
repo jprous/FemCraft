@@ -1,12 +1,22 @@
 //! Where each FemCraft field lives in RFEM's `model.db`.
 //!
-//! Confirmed on RFEM 6.16 (`rf6-catalog` load report): main tables use camelCase columns, the
-//! object number is `userID`, references are `<name>_id` (plus `<name>_table` when the target
-//! table varies) holding database ids, and loads point to their load case via `parent_id`.
-//! Names marked "guess" below are still unconfirmed.
+//! Confirmed on RFEM 6.16 with `rf6-catalog --kinds` on a real model:
+//! - Main tables use camelCase columns; the object number is `userID`, the db key is `id`.
+//! - `impl_id` / `impl_table` point to the detail row, whose table name gives the type
+//!   (`MemberImplBeam` -> `TYPE_BEAM`, `LineTypeLoadImplForce` -> `LOAD_TYPE_FORCE`).
+//! - References are `<name>_id` (+ `<name>_table` when the target varies) holding db ids.
+//! - Loads point to their load case via `parentModelObject_id` on the main row.
+//! - List tables are `<ImplTable>_<field>`: `id` = owner impl id, `container_order`, and the
+//!   value in `reference_id` (+ `reference_table`), `value_id` or `value`.
+//! - "Part" tables hold one row per object: either `owner_id` / `owner_table` = impl row
+//!   (`SpringConstants`), or `id` = impl id with `container_order` 0 (`..._magnitudes`).
+//! - Key / value maps are `<Table>_<map>_keys` and `_values` paired by `id` + `container_order`.
+//!
+//! Entries marked "guess" are unconfirmed (no such objects in the test model yet).
 //!
 //! For each field the loader tries (case-insensitive, main table then impl table): the field key,
-//! its camelCase form, camelCase + `_id`, then the overrides below.
+//! camelCase + `_id`, camelCase, then [`overrides`]; then [`part_column`], then child lists for
+//! list fields, then [`derived`].
 
 use femcraft_model::ObjectKind;
 
@@ -15,29 +25,41 @@ pub const NUMBER_COLUMNS: &[&str] = &["userID", "no", "number"];
 /// Primary-key column (falls back to SQLite `rowid`).
 pub const ID_COLUMNS: &[&str] = &["id"];
 /// Load-case reference on load tables.
-pub const LOAD_CASE_COLUMNS: &[&str] = &["parent_id", "loadCase_id", "load_case"];
+pub const LOAD_CASE_COLUMNS: &[&str] = &["parentModelObject_id", "loadCase_id", "load_case"];
 /// Columns that are bookkeeping, not data, in child list tables.
-pub const CHILD_META_COLUMNS: &[&str] = &["id", "owner_id", "row", "row_index", "index", "order"];
-pub const CHILD_ORDER_COLUMNS: &[&str] = &["row", "row_index", "index", "order", "position"];
+pub const CHILD_META_COLUMNS: &[&str] = &[
+    "id",
+    "owner_id",
+    "owner_table",
+    "container_order",
+    "reference_table",
+    "value_table",
+    "row",
+    "index",
+    "order",
+];
+pub const CHILD_ORDER_COLUMNS: &[&str] = &["container_order", "row", "index", "order"];
+/// Value column of a list table, in order of preference.
+pub const CHILD_VALUE_COLUMNS: &[&str] = &["reference_id", "value_id", "value"];
 
 /// Candidate table names for each kind.
 pub fn tables(kind: ObjectKind) -> &'static [&'static str] {
     use ObjectKind::*;
     match kind {
         Material => &["Material"],
-        Section => &["Section", "CrossSection"],
+        Section => &["Section"],
         Thickness => &["Thickness"],
         Node => &["Node"],
         Line => &["Line"],
         Member => &["Member"],
         Surface => &["Surface"],
         Solid => &["Solid"],
-        NodalSupport => &["NodalSupport", "NodeSupport"],
+        NodalSupport => &["NodalSupport"],
         LineSupport => &["LineSupport"],
         MemberSupport => &["MemberSupport"],
         SurfaceSupport => &["SurfaceSupport"],
         LoadCase => &["LoadCase"],
-        NodalLoad => &["NodalLoad", "NodeLoad"],
+        NodalLoad => &["NodalLoad"],
         LineLoad => &["LineLoad"],
         MemberLoad => &["MemberLoad"],
         SurfaceLoad => &["SurfaceLoad"],
@@ -51,7 +73,7 @@ pub fn tables(kind: ObjectKind) -> &'static [&'static str] {
     }
 }
 
-/// Alternative column names tried after the field key itself.
+/// Alternative column (or list-table suffix) names tried after the automatic ones.
 fn overrides(kind: ObjectKind, key: &str) -> &'static [&'static str] {
     use ObjectKind::*;
     match (kind, key) {
@@ -67,25 +89,21 @@ fn overrides(kind: ObjectKind, key: &str) -> &'static [&'static str] {
         (MemberLoad | LineLoad, "distance_a_is_relative") => &["distanceADefinition_isRelative"],
         (MemberLoad | LineLoad, "distance_b") => &["distanceBDefinition_distance"],
         (MemberLoad | LineLoad, "distance_b_is_relative") => &["distanceBDefinition_isRelative"],
-        // guess: order of the five surface support constants
+        // Order confirmed by "Sliding in x and y" = 0, 0, inf, inf, inf.
         (SurfaceSupport, "translation_x") => &["springConstant_0"],
         (SurfaceSupport, "translation_y") => &["springConstant_1"],
         (SurfaceSupport, "translation_z") => &["springConstant_2"],
+        // guess: which of the remaining two is xz / yz
         (SurfaceSupport, "shear_xz") => &["springConstant_3"],
         (SurfaceSupport, "shear_yz") => &["springConstant_4"],
-        (Line, "definition_nodes") => &["nodes", "items", "node"],
-        (Surface, "boundary_lines") => &["lines", "items", "line"],
-        (Solid, "boundary_surfaces") => &["surfaces", "items", "surface"],
-        (Material, "elasticity_modulus") => &["elasticity_modulus_global", "e", "e_modulus"],
-        (Material, "shear_modulus") => &["shear_modulus_global", "g", "g_modulus"],
-        (Material, "poisson_ratio") => &["poisson_ratio_global", "nu"],
-        (Material, "thermal_expansion_coefficient") => {
-            &["thermal_expansion_coefficient_global", "alpha"]
+        // Objects a load is applied to.
+        (k, "nodes" | "lines" | "members" | "surfaces" | "solids") if k.spec().is_load() => {
+            &["assignedTo"]
         }
+        // guess
+        (Surface, "boundary_lines") => &["boundaryLines", "lines"],
+        (Solid, "boundary_surfaces") => &["boundarySurfaces", "surfaces"],
         (Thickness, "uniform_thickness") => &["thickness", "d"],
-        (Member, "section_end") => &["section"],
-        (Member, "section_start") => &["section"],
-        (_, "name") => &["user_defined_name", "description"],
         _ => &[],
     }
 }
@@ -95,6 +113,68 @@ pub fn column_candidates(kind: ObjectKind, key: &'static str) -> Vec<String> {
     let mut v = vec![key.to_owned(), format!("{camel}_id"), camel];
     v.extend(overrides(kind, key).iter().map(|s| s.to_string()));
     v
+}
+
+/// A field held in a part table owned by the impl row: `(table, column)`.
+/// `{impl}` in the table name is replaced by the impl table name.
+pub fn part_column(kind: ObjectKind, key: &str) -> Option<(&'static str, &'static str)> {
+    use ObjectKind::*;
+    const SPRINGS: &str = "SpringConstants";
+    Some(match (kind, key) {
+        (NodalSupport | LineSupport, "spring_x") => (SPRINGS, "springConstantAlongX"),
+        (NodalSupport | LineSupport, "spring_y") => (SPRINGS, "springConstantAlongY"),
+        (NodalSupport | LineSupport, "spring_z") => (SPRINGS, "springConstantAlongZ"),
+        (NodalSupport | LineSupport, "rotational_restraint_x") => {
+            (SPRINGS, "springConstantAroundX")
+        }
+        (NodalSupport | LineSupport, "rotational_restraint_y") => {
+            (SPRINGS, "springConstantAroundY")
+        }
+        (NodalSupport | LineSupport, "rotational_restraint_z") => {
+            (SPRINGS, "springConstantAroundZ")
+        }
+        // guess: member supports use the same spring table
+        (MemberSupport, "spring_translation_x") => (SPRINGS, "springConstantAlongX"),
+        (MemberSupport, "spring_translation_y") => (SPRINGS, "springConstantAlongY"),
+        (MemberSupport, "spring_translation_z") => (SPRINGS, "springConstantAlongZ"),
+        (MemberSupport, "spring_rotation") => (SPRINGS, "springConstantAroundX"),
+        (MemberLoad | LineLoad, "magnitude") => {
+            ("{impl}_magnitudes", "temperaturesOrMagnitudeFirstMagnitude")
+        }
+        (MemberLoad | LineLoad, "magnitude_2") => (
+            "{impl}_magnitudes",
+            "temperaturesOrMagnitudeSecondMagnitude",
+        ),
+        _ => return None,
+    })
+}
+
+/// Read-only values found through key / value maps.
+#[derive(Debug, Clone, Copy)]
+pub enum Derived {
+    /// Impl `librarySection_id` -> library row `sectionData_id` ->
+    /// `SectionData_parameterValues[key].valueSI`.
+    SectionParameter(&'static str),
+    /// `MaterialImpl_materialDataVector[0]` -> `MaterialData.properties_id` ->
+    /// `MaterialProperties_propertiesMap[key]` -> referenced row `valueSI`.
+    MaterialProperty(&'static str),
+}
+
+pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
+    use Derived::*;
+    use ObjectKind::*;
+    Some(match (kind, key) {
+        (Section, "A" | "I_y" | "I_z" | "I_t") => SectionParameter(key),
+        (Section, "A_y") => SectionParameter("A_v_y"),
+        (Section, "A_z") => SectionParameter("A_v_z"),
+        (Material, "elasticity_modulus") => MaterialProperty("E"),
+        (Material, "shear_modulus") => MaterialProperty("G"),
+        (Material, "poisson_ratio") => MaterialProperty("nu"),
+        (Material, "specific_weight") => MaterialProperty("gamma"),
+        (Material, "mass_density") => MaterialProperty("rho"),
+        (Material, "thermal_expansion_coefficient") => MaterialProperty("alpha"),
+        _ => return None,
+    })
 }
 
 /// `self_weight_active` -> `selfWeightActive`; single-letter parts such as `I_y` stay as they are.

@@ -1,5 +1,6 @@
-//! Round trip on a small synthetic database shaped like RFEM's (object / impl / child tables).
-//! Ids deliberately differ from object numbers to exercise reference resolution.
+//! Round trip on a small synthetic database laid out like RFEM 6.16's `model.db`
+//! (main / impl / list / part tables, key-value maps). Written for FemCraft; contains no RFEM
+//! data. Database ids deliberately differ from object numbers (`userID`).
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -8,27 +9,78 @@ use femcraft_model::{ObjectId, ObjectKind as K, Value};
 use femcraft_rfdb::RfDocument;
 
 const SCHEMA: &str = "
-CREATE TABLE Material (id INTEGER PRIMARY KEY, no INTEGER, name TEXT, elasticity_modulus REAL);
-CREATE TABLE Section (id INTEGER PRIMARY KEY, no INTEGER, name TEXT, material INTEGER, A REAL);
-CREATE TABLE Node (id INTEGER PRIMARY KEY, no INTEGER, impl_id INTEGER, impl_table TEXT, comment TEXT);
-CREATE TABLE NodeImplStandard (id INTEGER PRIMARY KEY, coordinate_1 REAL, coordinate_2 REAL, coordinate_3 REAL);
-CREATE TABLE Line (id INTEGER PRIMARY KEY, no INTEGER, impl_id INTEGER, impl_table TEXT);
+CREATE TABLE Material (id INTEGER PRIMARY KEY, userID INTEGER, impl_id INTEGER, impl_table TEXT);
+CREATE TABLE MaterialImpl (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE MaterialImpl_materialDataVector (id INTEGER, container_order INTEGER, reference_id INTEGER, reference_table TEXT);
+CREATE TABLE MaterialData (id INTEGER PRIMARY KEY, properties_id INTEGER);
+CREATE TABLE MaterialProperties (id INTEGER PRIMARY KEY);
+CREATE TABLE MaterialProperties_propertiesMap_keys (id INTEGER, container_order INTEGER, value TEXT);
+CREATE TABLE MaterialProperties_propertiesMap_values (id INTEGER, container_order INTEGER, reference_id INTEGER, reference_table TEXT);
+CREATE TABLE MaterialPropertyDouble (id INTEGER PRIMARY KEY, propertyKey TEXT, valueSI REAL);
+
+CREATE TABLE Section (id INTEGER PRIMARY KEY, userID INTEGER, impl_id INTEGER, impl_table TEXT);
+CREATE TABLE SectionImplStandardizedSteel (id INTEGER PRIMARY KEY, material_id INTEGER, librarySection_id INTEGER, librarySection_table TEXT);
+CREATE TABLE DatabaseSection (id INTEGER PRIMARY KEY, sectionData_id INTEGER);
+CREATE TABLE SectionData (id INTEGER PRIMARY KEY);
+CREATE TABLE SectionData_parameterValues_keys (id INTEGER, container_order INTEGER, value TEXT);
+CREATE TABLE SectionData_parameterValues_values (id INTEGER, container_order INTEGER, valueSI REAL);
+
+CREATE TABLE Node (id INTEGER PRIMARY KEY, userID INTEGER, impl_id INTEGER, impl_table TEXT, comment TEXT);
+CREATE TABLE NodeImplStandard (id INTEGER PRIMARY KEY, coordinates_x REAL, coordinates_y REAL, coordinates_z REAL);
+CREATE TABLE Line (id INTEGER PRIMARY KEY, userID INTEGER, impl_id INTEGER, impl_table TEXT);
 CREATE TABLE LineImplPolyline (id INTEGER PRIMARY KEY);
-CREATE TABLE LineImplPolyline_definition_nodes (id INTEGER PRIMARY KEY, owner_id INTEGER, node INTEGER);
-CREATE TABLE Member (id INTEGER PRIMARY KEY, no INTEGER, line INTEGER, section_start INTEGER, section_end INTEGER);
-CREATE TABLE LoadCase (id INTEGER PRIMARY KEY, no INTEGER, name TEXT, self_weight_active INTEGER);
-CREATE TABLE NodalLoad (id INTEGER PRIMARY KEY, no INTEGER, load_case INTEGER, nodes TEXT, force_magnitude REAL);
+CREATE TABLE LineImplPolyline_definitionNodes (id INTEGER, container_order INTEGER, reference_id INTEGER, reference_table TEXT);
+CREATE TABLE Member (id INTEGER PRIMARY KEY, userID INTEGER, impl_id INTEGER, impl_table TEXT);
+CREATE TABLE MemberImplBeam (id INTEGER PRIMARY KEY, line_id INTEGER, sectionStart_id INTEGER, angle REAL);
+
+CREATE TABLE NodalSupport (id INTEGER PRIMARY KEY, userID INTEGER, impl_id INTEGER, impl_table TEXT);
+CREATE TABLE NodalSupportImpl (id INTEGER PRIMARY KEY, name TEXT, springConstants_id INTEGER);
+CREATE TABLE NodalSupportImpl_nodes (id INTEGER, container_order INTEGER, value_id INTEGER);
+CREATE TABLE SpringConstants (id INTEGER PRIMARY KEY, owner_id INTEGER, owner_table TEXT, springConstantAlongX REAL, springConstantAlongY REAL, springConstantAlongZ REAL, springConstantAroundX REAL, springConstantAroundY REAL, springConstantAroundZ REAL);
+
+CREATE TABLE LoadCase (id INTEGER PRIMARY KEY, userID INTEGER, impl_id INTEGER, impl_table TEXT);
+CREATE TABLE LoadCaseImplStatic (id INTEGER PRIMARY KEY, name TEXT, selfWeightActive INTEGER, selfWeightFactors_z REAL);
+CREATE TABLE MemberLoad (id INTEGER PRIMARY KEY, parentModelObject_id INTEGER, parentModelObject_table TEXT, userID INTEGER, impl_id INTEGER, impl_table TEXT);
+CREATE TABLE LineTypeLoadImplForce (id INTEGER PRIMARY KEY, parent_id INTEGER, loadDirection INTEGER, loadDistribution INTEGER);
+CREATE TABLE LineTypeLoadImplForce_assignedTo (id INTEGER, container_order INTEGER, reference_id INTEGER, reference_table TEXT);
+CREATE TABLE LineTypeLoadImplForce_magnitudes (id INTEGER, container_order INTEGER, temperaturesOrMagnitudeFirstMagnitude REAL, temperaturesOrMagnitudeSecondMagnitude REAL);
 CREATE TABLE Unknown (id INTEGER PRIMARY KEY, blob BLOB);
-INSERT INTO Material VALUES (500, 1, 'S235', 2.1e11);
-INSERT INTO Section VALUES (600, 1, 'IPE 200', 500, 0.00285);
+
+INSERT INTO Material VALUES (500, 1, 50, 'MaterialImpl');
+INSERT INTO MaterialImpl VALUES (50, NULL);
+INSERT INTO MaterialImpl_materialDataVector VALUES (50, 0, 51, 'MaterialData');
+INSERT INTO MaterialData VALUES (51, 52);
+INSERT INTO MaterialProperties VALUES (52);
+INSERT INTO MaterialProperties_propertiesMap_keys VALUES (52, 0, 'E'), (52, 1, 'nu');
+INSERT INTO MaterialProperties_propertiesMap_values VALUES (52, 0, 53, 'MaterialPropertyDouble'), (52, 1, 54, 'MaterialPropertyDouble');
+INSERT INTO MaterialPropertyDouble VALUES (53, 'E', 2.1e11), (54, 'nu', 0.3);
+
+INSERT INTO Section VALUES (600, 1, 60, 'SectionImplStandardizedSteel');
+INSERT INTO SectionImplStandardizedSteel VALUES (60, 500, 61, 'DatabaseSection');
+INSERT INTO DatabaseSection VALUES (61, 62);
+INSERT INTO SectionData VALUES (62);
+INSERT INTO SectionData_parameterValues_keys VALUES (62, 0, 'A'), (62, 1, 'I_y'), (62, 2, 'A_v_z');
+INSERT INTO SectionData_parameterValues_values VALUES (62, 0, 0.00285), (62, 1, 1.943e-5), (62, 2, 0.0014);
+
 INSERT INTO NodeImplStandard VALUES (11, 0, 0, 0), (12, 5, 0, 0);
 INSERT INTO Node VALUES (101, 1, 11, 'NodeImplStandard', NULL), (102, 2, 12, 'NodeImplStandard', 'top');
 INSERT INTO LineImplPolyline VALUES (21);
 INSERT INTO Line VALUES (201, 1, 21, 'LineImplPolyline');
-INSERT INTO LineImplPolyline_definition_nodes VALUES (1, 21, 101), (2, 21, 102);
-INSERT INTO Member VALUES (301, 1, 201, 600, 600);
-INSERT INTO LoadCase VALUES (701, 1, 'Self-weight', 1);
-INSERT INTO NodalLoad VALUES (801, 1, 701, '101', -10000);
+INSERT INTO LineImplPolyline_definitionNodes VALUES (21, 0, 101, 'Node'), (21, 1, 102, 'Node');
+INSERT INTO MemberImplBeam VALUES (31, 201, 600, 0);
+INSERT INTO Member VALUES (301, 1, 31, 'MemberImplBeam');
+
+INSERT INTO NodalSupport VALUES (401, 1, 41, 'NodalSupportImpl');
+INSERT INTO NodalSupportImpl VALUES (41, 'Hinged', 42);
+INSERT INTO NodalSupportImpl_nodes VALUES (41, 0, 101);
+INSERT INTO SpringConstants VALUES (42, 41, 'NodalSupportImpl', 1e308 * 10, 1e308 * 10, 1e308 * 10, 0, 0, 0);
+
+INSERT INTO LoadCase VALUES (701, 1, 71, 'LoadCaseImplStatic');
+INSERT INTO LoadCaseImplStatic VALUES (71, 'Dead', 1, 1.0);
+INSERT INTO MemberLoad VALUES (801, 701, 'LoadCase', 1, 81, 'LineTypeLoadImplForce');
+INSERT INTO LineTypeLoadImplForce VALUES (81, 801, 2, 0);
+INSERT INTO LineTypeLoadImplForce_assignedTo VALUES (81, 0, 301, 'Member');
+INSERT INTO LineTypeLoadImplForce_magnitudes VALUES (81, 0, 330, -1e308 * 10);
 INSERT INTO Unknown VALUES (1, x'0102');
 ";
 
@@ -58,33 +110,48 @@ fn entry(path: &Path, name: &str) -> Vec<u8> {
     buf
 }
 
+fn f(doc: &RfDocument, id: ObjectId, key: &str) -> Value {
+    doc.model.get(id).expect("object exists").get(key).clone()
+}
+
 #[test]
 fn load_edit_save() {
     let dir = tempfile::tempdir().unwrap();
     let src = make_rf6(dir.path());
     let mut doc = RfDocument::open(&src).unwrap();
-    let m = &doc.model;
+    let node2 = ObjectId::new(K::Node, 2);
+    let section = ObjectId::new(K::Section, 1);
+    let member = ObjectId::new(K::Member, 1);
+    let support = ObjectId::new(K::NodalSupport, 1);
+    let load = ObjectId::load(K::MemberLoad, 1, 1);
 
-    assert_eq!(m.node_position(2), Some([5.0, 0.0, 0.0]));
-    let node = m.get(ObjectId::new(K::Node, 2)).unwrap();
-    assert_eq!(node.get("type"), &Value::Text("TYPE_STANDARD".into()));
-    assert_eq!(node.get("comment"), &Value::Text("top".into()));
+    // Plain, impl and reference columns.
+    assert_eq!(doc.model.node_position(2), Some([5.0, 0.0, 0.0]));
+    assert_eq!(f(&doc, node2, "type"), Value::Text("TYPE_STANDARD".into()));
+    assert_eq!(f(&doc, node2, "comment"), Value::Text("top".into()));
+    assert_eq!(f(&doc, member, "section_start"), Value::Ref(1));
+    assert_eq!(f(&doc, section, "material"), Value::Ref(1));
+    // List tables (ids resolved to numbers).
+    assert_eq!(doc.model.line_nodes(1), &[1, 2]);
+    assert_eq!(doc.model.member_nodes(1), Some((1, 2)));
+    assert_eq!(f(&doc, support, "nodes"), Value::RefList(vec![1]));
+    // Part tables.
+    assert_eq!(f(&doc, support, "spring_x"), Value::Float(f64::INFINITY));
+    assert_eq!(f(&doc, load, "magnitude"), Value::Float(330.0));
+    // Key / value maps.
+    assert_eq!(f(&doc, section, "A"), Value::Float(0.00285));
+    assert_eq!(f(&doc, section, "A_z"), Value::Float(0.0014));
+    let mat = ObjectId::new(K::Material, 1);
+    assert_eq!(f(&doc, mat, "elasticity_modulus"), Value::Float(2.1e11));
+    assert_eq!(f(&doc, mat, "poisson_ratio"), Value::Float(0.3));
+    // Loads: type from impl table, load case from parentModelObject_id.
     assert_eq!(
-        m.line_nodes(1),
-        &[1, 2],
-        "child-table ids resolved to node numbers"
+        f(&doc, load, "load_type"),
+        Value::Text("LOAD_TYPE_FORCE".into())
     );
-    assert_eq!(m.member_nodes(1), Some((1, 2)));
-    let member = m.get(ObjectId::new(K::Member, 1)).unwrap();
-    assert_eq!(member.get("section_start"), &Value::Ref(1));
-    let section = m.get(ObjectId::new(K::Section, 1)).unwrap();
-    assert_eq!(section.get("material"), &Value::Ref(1));
-    let load = m
-        .get(ObjectId::load(K::NodalLoad, 1, 1))
-        .expect("load keyed by load case number");
-    assert_eq!(load.get("nodes"), &Value::RefList(vec![1]));
-    let lc = m.get(ObjectId::new(K::LoadCase, 1)).unwrap();
-    assert_eq!(lc.get("self_weight_active"), &Value::Bool(true));
+    assert_eq!(f(&doc, load, "members"), Value::RefList(vec![1]));
+    let lc = ObjectId::new(K::LoadCase, 1);
+    assert_eq!(f(&doc, lc, "self_weight_active"), Value::Bool(true));
     assert!(doc.report.to_string().contains("Solid"));
 
     // Unchanged save keeps every entry byte-identical.
@@ -94,45 +161,47 @@ fn load_edit_save() {
         assert_eq!(entry(&src, name), entry(&same, name), "{name} changed");
     }
 
-    // Edit scalar fields and a reference, save, reopen.
+    // Edit an impl column, a reference, a part-table column; save; reopen.
     doc.model
-        .set(ObjectId::new(K::Node, 2), "coordinate_1", Value::Float(6.0))
+        .set(node2, "coordinate_1", Value::Float(6.0))
         .unwrap();
     doc.model
-        .set(ObjectId::new(K::Section, 1), "A", Value::Float(0.003))
+        .set(member, "rotation_angle", Value::Float(0.5))
         .unwrap();
     doc.model
-        .set(
-            ObjectId::load(K::NodalLoad, 1, 1),
-            "nodes",
-            Value::RefList(vec![2]),
-        )
+        .set(load, "magnitude", Value::Float(450.0))
         .unwrap();
+    doc.model
+        .set(support, "spring_z", Value::Float(1e6))
+        .unwrap();
+    doc.model.set(lc, "name", Value::Text("G".into())).unwrap();
     let edited = dir.path().join("edited.rf6");
     doc.save(&edited).unwrap();
     assert!(!doc.model.is_modified());
 
     let doc2 = RfDocument::open(&edited).unwrap();
     assert_eq!(doc2.model.node_position(2), Some([6.0, 0.0, 0.0]));
-    let a = doc2
-        .model
-        .get(ObjectId::new(K::Section, 1))
-        .unwrap()
-        .get("A")
-        .as_f64();
-    assert_eq!(a, Some(0.003));
-    let load = doc2.model.get(ObjectId::load(K::NodalLoad, 1, 1)).unwrap();
-    assert_eq!(load.get("nodes"), &Value::RefList(vec![2]));
+    assert_eq!(f(&doc2, member, "rotation_angle"), Value::Float(0.5));
+    assert_eq!(f(&doc2, load, "magnitude"), Value::Float(450.0));
+    assert_eq!(f(&doc2, support, "spring_z"), Value::Float(1e6));
+    assert_eq!(f(&doc2, support, "spring_x"), Value::Float(f64::INFINITY));
+    assert_eq!(f(&doc2, lc, "name"), Value::Text("G".into()));
     assert_eq!(entry(&src, "views.xml"), entry(&edited, "views.xml"));
 
-    // List fields stored in child tables are read-only for now.
-    let mut doc3 = RfDocument::open(&edited).unwrap();
-    doc3.model
-        .set(
+    // Library properties and list fields are read-only for now.
+    for (id, key, v) in [
+        (section, "A", Value::Float(0.003)),
+        (
             ObjectId::new(K::Line, 1),
             "definition_nodes",
             Value::RefList(vec![2, 1]),
-        )
-        .unwrap();
-    assert!(doc3.save(&dir.path().join("x.rf6")).is_err());
+        ),
+    ] {
+        let mut d = RfDocument::open(&edited).unwrap();
+        d.model.set(id, key, v).unwrap();
+        assert!(
+            d.save(&dir.path().join("x.rf6")).is_err(),
+            "{key} should be read-only"
+        );
+    }
 }

@@ -30,14 +30,19 @@ Plan and milestone status: `docs/ROADMAP.md`.
   `model.rs`: `Model` of `ObjectId { kind, load_case, no }` -> `Object` (field values),
   typed `set` with dirty / removed tracking, geometry helpers. References are object numbers.
 - `crates/femcraft-rfdb` - `.rf6` I/O. `archive.rs` ZIP / bare db / folder, raw-copies
-  sidecars on save. `mapping.rs`: **all RFEM table and column names (guesses until
-  verified)**. `document.rs`: `RfDocument::open` loads every kind generically (main row ->
-  impl row -> `{Table}_{field}` child tables), auto-detects whether refs store db ids or
-  numbers, reports missing fields / unmapped columns; `save` writes only changed scalar fields.
-  Not yet: editing list fields held in child tables, changing type, adding / deleting objects.
+  sidecars on save. `mapping.rs`: **all RFEM table and column names** (layout rules in its
+  header; entries marked "guess" are unconfirmed). `document.rs`: `RfDocument::open` loads
+  every kind generically (main row -> impl row -> list / part tables -> derived maps), resolves
+  db ids to object numbers, reports missing fields; `save` writes changed main / impl / part
+  columns. Read-only for now: list fields, type, library section / material properties.
+  Not yet: adding / deleting objects.
 - `rf6-catalog` research tool: `cargo run -p femcraft-rfdb --bin rf6-catalog -- file.rf6`
-  (load report), `--kinds [KIND..]` (impl / related tables with samples), `--tables [FILTER..]`,
-  `--rows TABLE [N]`.
+  (load report), `--kinds [KIND..]`, `--tables [FILTER..]`, `--rows TABLE [N]`,
+  `--sql "SELECT .."`, `--objects KIND [N]`, `--edit OUT KIND NO[@LC] FIELD VALUE`.
+- Tests: `tests/roundtrip.rs` (synthetic RFEM-shaped db), `tests/private_model.rs` (real model
+  from `FEMCRAFT_TEST_MODEL` or `testdata/private/test.rf6`; skipped if absent).
+- On the owner's PC antivirus quarantines the `femcraft_rfdb` lib unit-test exe
+  ("Access is denied"); run `cargo test -p femcraft-rfdb --test roundtrip --test private_model`.
 
 ## RFEM `.rf6` facts
 
@@ -46,11 +51,14 @@ Plan and milestone status: `docs/ROADMAP.md`.
 - About 5,900 tables. Pattern: main table (`Node`, `Line`, `Member`, ...) with
   `impl_id` / `impl_table` -> detail table (`NodeImplStandard`, `LineImplPolyline`,
   `MemberImplBeam`, ...) -> child rows (`*_items`, `*_keys` / `*_values`, `owner_id`).
-- Confirmed on RFEM 6.16: main-table columns are camelCase; object number is `userID`
-  (`id` is the db key); references are `<name>_id` (+ `<name>_table` if the target varies);
-  loads point to their load case via `parent_id`. Section / material properties and support
-  springs (`springConstants_id`) live in other tables. Solver data and results are under
-  `!solver/` in the ZIP (`Data.RFemX`, per-combination `RN_*` folders).
+- Confirmed on RFEM 6.16 (details in `mapping.rs`): camelCase columns; object number is
+  `userID` (`id` is the db key); refs are `<name>_id` holding db ids; loads -> load case via
+  `parentModelObject_id`; list tables `<Impl>_<field>` keyed by `id` + `container_order`;
+  springs in `SpringConstants` (owner = support impl); member load magnitudes in
+  `<Impl>_magnitudes`; section values via `librarySection` -> `SectionData_parameterValues`;
+  material values via `MaterialProperties_propertiesMap`. Library sections / materials store
+  no name (RFEM generates it). Line / member lengths are not stored. `-inf` = "not set".
+- Solver data and results are under `!solver/` in the ZIP (`Data.RFemX`, `RN_*` folders).
 - Saving strategy: start from a database RFEM saved, change only edited rows, keep all
   unknown tables and sidecars byte-identical.
 

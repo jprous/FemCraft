@@ -163,21 +163,17 @@ static NODE: &[FieldSpec] = &[
 static LINE: &[FieldSpec] = &[
     TYPE,
     f("definition_nodes", "Nodes", RefList(K::Node)),
-    f("length", "Length", Float("m")),
     COMMENT,
 ];
 
 static MEMBER: &[FieldSpec] = &[
     TYPE,
     f("line", "Line", Ref(K::Line)),
-    f("node_start", "Start node", Ref(K::Node)),
-    f("node_end", "End node", Ref(K::Node)),
     f("section_start", "Section start", Ref(K::Section)),
     f("section_end", "Section end", Ref(K::Section)),
     f("rotation_angle", "Rotation β", Float("rad")),
     f("member_hinge_start", "Hinge start", Int),
     f("member_hinge_end", "Hinge end", Int),
-    f("length", "Length", Float("m")),
     COMMENT,
 ];
 
@@ -290,8 +286,7 @@ macro_rules! linear_load {
             LOAD_TYPE,
             LOAD_DIST,
             LOAD_DIR,
-            f("magnitude", "Magnitude p", Float(N_M)),
-            f("magnitude_1", "Magnitude p1", Float(N_M)),
+            f("magnitude", "Magnitude p / p1", Float(N_M)),
             f("magnitude_2", "Magnitude p2", Float(N_M)),
             f(
                 "distance_a",

@@ -5,12 +5,12 @@ use std::path::Path;
 
 use femcraft_model::{FieldType, Model, Object, ObjectId, ObjectKind, Value, list};
 use rusqlite::types::Value as Sql;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::Error;
 use crate::archive::{Archive, SourceFormat};
 use crate::catalog::{Catalog, quote};
-use crate::mapping::{self, CHILD_META_COLUMNS, CHILD_ORDER_COLUMNS};
+use crate::mapping::{self, CHILD_META_COLUMNS, CHILD_ORDER_COLUMNS, CHILD_VALUE_COLUMNS, Derived};
 
 /// What the loader found for one object kind.
 #[derive(Debug, Clone)]
@@ -40,7 +40,8 @@ impl std::fmt::Display for LoadReport {
                     if !k.missing_fields.is_empty() {
                         writeln!(f, "    missing: {}", k.missing_fields.join(", "))?;
                     }
-                    if !k.unmapped_columns.is_empty() {
+                    // `{:#}` also lists unmapped columns.
+                    if f.alternate() && !k.unmapped_columns.is_empty() {
                         writeln!(f, "    unmapped: {}", k.unmapped_columns.join(", "))?;
                     }
                 }
@@ -59,6 +60,14 @@ enum Loc {
     Child,
     /// Object type derived from the impl table name (read-only).
     ImplType,
+    /// Column of a one-row part table, addressed by SQLite rowid.
+    Part {
+        table: String,
+        rowid: i64,
+        column: String,
+    },
+    /// Looked up through key / value maps (read-only).
+    Derived,
 }
 
 #[derive(Debug, Clone)]
@@ -166,15 +175,22 @@ impl Cache {
     ) -> Result<Vec<Sql>, Error> {
         if !self.children.contains_key(table) {
             let info = cat.table(table).expect("checked by caller");
-            let value_col = info
-                .columns
+            let value_col = CHILD_VALUE_COLUMNS
                 .iter()
-                .find(|c| {
-                    !CHILD_META_COLUMNS
-                        .iter()
-                        .any(|m| c.name.eq_ignore_ascii_case(m))
+                .find_map(|c| info.column(c))
+                .or_else(|| {
+                    info.columns.iter().find(|c| {
+                        !CHILD_META_COLUMNS
+                            .iter()
+                            .any(|m| c.name.eq_ignore_ascii_case(m))
+                    })
                 })
                 .map(|c| c.name.clone());
+            let owner = if info.column("owner_id").is_some() {
+                "owner_id"
+            } else {
+                "id"
+            };
             let order = CHILD_ORDER_COLUMNS
                 .iter()
                 .find_map(|o| info.column(o))
@@ -182,7 +198,7 @@ impl Cache {
             let mut map: HashMap<i64, Vec<Sql>> = HashMap::new();
             if let Some(vc) = value_col {
                 let sql = format!(
-                    "SELECT owner_id, {} FROM {} ORDER BY owner_id, {order}",
+                    "SELECT {owner}, {} FROM {} ORDER BY {owner}, {order}",
                     quote(&vc),
                     quote(table)
                 );
@@ -201,18 +217,180 @@ impl Cache {
     }
 }
 
-/// `NodeImplStandard` on table `Node` -> `TYPE_STANDARD`.
-fn type_from_impl(main: &str, impl_table: &str) -> String {
-    let rest = impl_table.strip_prefix(main).unwrap_or(impl_table);
-    let rest = rest.strip_prefix("Impl").unwrap_or(rest);
-    let mut out = String::from("TYPE");
+/// `MemberImplBeam` -> `TYPE_BEAM`; `LineTypeLoadImplForce` with prefix `LOAD_TYPE` ->
+/// `LOAD_TYPE_FORCE`. `None` when the impl table name carries no type (`MaterialImpl`).
+fn type_from_impl(prefix: &str, impl_table: &str) -> Option<String> {
+    let rest = &impl_table[impl_table.rfind("Impl")? + 4..];
+    if rest.is_empty() {
+        return None;
+    }
+    let mut out = String::from(prefix);
     for c in rest.chars() {
         if c.is_uppercase() {
             out.push('_');
         }
         out.push(c.to_ascii_uppercase());
     }
-    out
+    Some(out)
+}
+
+/// The one row of a part table owned by an impl row: `(rowid, value of column)`.
+fn part_value(
+    conn: &Connection,
+    cat: &Catalog,
+    table: &str,
+    column: &str,
+    impl_table: &str,
+    impl_id: i64,
+) -> Result<Option<(String, i64, Sql)>, Error> {
+    let table = table.replace("{impl}", impl_table);
+    let Some(info) = cat.table(&table) else {
+        return Ok(None);
+    };
+    let Some(col) = info.column(column) else {
+        return Ok(None);
+    };
+    let filter = if info.column("owner_id").is_some() {
+        if info.column("owner_table").is_some() {
+            "owner_id = ?1 AND owner_table = ?2"
+        } else {
+            "owner_id = ?1"
+        }
+    } else if info.column("container_order").is_some() {
+        "id = ?1 AND container_order = 0"
+    } else {
+        "id = ?1"
+    };
+    let n_params = if filter.contains("?2") { 2 } else { 1 };
+    let sql = format!(
+        "SELECT rowid, {} FROM {} WHERE {filter} LIMIT 1",
+        quote(&col.name),
+        quote(&info.name)
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let row = if n_params == 2 {
+        stmt.query_row(rusqlite::params![impl_id, impl_table], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+    } else {
+        stmt.query_row(rusqlite::params![impl_id], |r| Ok((r.get(0)?, r.get(1)?)))
+    }
+    .optional()?;
+    Ok(row.map(|(rowid, v)| (info.name.clone(), rowid, v)))
+}
+
+/// Value of `key` in the map `<table>_<map>_keys` / `_values` owned by `owner`.
+/// Values holding `reference_id` / `reference_table` are followed to that row's `valueSI`.
+fn map_value(
+    conn: &Connection,
+    cat: &Catalog,
+    table: &str,
+    map: &str,
+    owner: i64,
+    key: &str,
+) -> Result<Option<Sql>, Error> {
+    let keys = format!("{table}_{map}_keys");
+    let values = format!("{table}_{map}_values");
+    let Some(vinfo) = cat.table(&values) else {
+        return Ok(None);
+    };
+    if cat.table(&keys).is_none() {
+        return Ok(None);
+    }
+    let join = format!(
+        "FROM {} k JOIN {} v ON v.id = k.id AND v.container_order = k.container_order \
+         WHERE k.id = ?1 AND k.value = ?2",
+        quote(&keys),
+        quote(&values)
+    );
+    if vinfo.column("valueSI").is_some() {
+        let sql = format!("SELECT v.valueSI {join}");
+        return Ok(conn
+            .prepare_cached(&sql)?
+            .query_row(rusqlite::params![owner, key], |r| r.get(0))
+            .optional()?);
+    }
+    if vinfo.column("reference_id").is_some() {
+        let sql = format!("SELECT v.reference_table, v.reference_id {join}");
+        let target: Option<(String, i64)> = conn
+            .prepare_cached(&sql)?
+            .query_row(rusqlite::params![owner, key], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        if let Some((t, id)) = target
+            && let Some(info) = cat.table(&t)
+            && info.column("valueSI").is_some()
+        {
+            let sql = format!("SELECT valueSI FROM {} WHERE id = ?1", quote(&info.name));
+            return Ok(conn
+                .prepare_cached(&sql)?
+                .query_row([id], |r| r.get(0))
+                .optional()?);
+        }
+    }
+    Ok(None)
+}
+
+/// Integer column of the row `id` in `table`.
+fn lookup_int(conn: &Connection, table: &str, column: &str, id: i64) -> Result<Option<i64>, Error> {
+    let sql = format!(
+        "SELECT {} FROM {} WHERE id = ?1",
+        quote(column),
+        quote(table)
+    );
+    Ok(conn
+        .prepare_cached(&sql)?
+        .query_row([id], |r| r.get::<_, Option<i64>>(0))
+        .optional()?
+        .flatten())
+}
+
+/// Read-only property values through RFEM's library / property maps.
+fn derived_value(
+    conn: &Connection,
+    cat: &Catalog,
+    d: Derived,
+    impl_name: &str,
+    impl_id: i64,
+    impl_row: &Row,
+) -> Result<Option<Sql>, Error> {
+    match d {
+        Derived::SectionParameter(key) => {
+            let (Some(Sql::Text(lib)), Some(lib_id)) = (
+                get(impl_row, "librarySection_table"),
+                get(impl_row, "librarySection_id").and_then(int),
+            ) else {
+                return Ok(None);
+            };
+            if cat.table(lib).is_none() {
+                return Ok(None);
+            }
+            let Some(data) = lookup_int(conn, lib, "sectionData_id", lib_id)? else {
+                return Ok(None);
+            };
+            map_value(conn, cat, "SectionData", "parameterValues", data, key)
+        }
+        Derived::MaterialProperty(key) => {
+            let vector = format!("{impl_name}_materialDataVector");
+            if cat.table(&vector).is_none() || cat.table("MaterialData").is_none() {
+                return Ok(None);
+            }
+            let sql = format!(
+                "SELECT reference_id FROM {} WHERE id = ?1 ORDER BY container_order LIMIT 1",
+                quote(&vector)
+            );
+            let data: Option<i64> = conn
+                .prepare_cached(&sql)?
+                .query_row([impl_id], |r| r.get(0))
+                .optional()?;
+            let Some(data) = data else { return Ok(None) };
+            let Some(props) = lookup_int(conn, "MaterialData", "properties_id", data)? else {
+                return Ok(None);
+            };
+            map_value(conn, cat, "MaterialProperties", "propertiesMap", props, key)
+        }
+    }
 }
 
 /// Converts a stored value; references stay raw until resolved.
@@ -330,6 +508,31 @@ impl RfDocument {
                             (loc, from_sql(fs.ty, &v))
                         }
                         None => match (fs.ty, &impl_row) {
+                            (_, Some((n, _, iid, _)))
+                                if mapping::part_column(kind, fs.key).is_some() =>
+                            {
+                                let (pt, pc) = mapping::part_column(kind, fs.key).unwrap();
+                                let Some((table, rowid, v)) =
+                                    part_value(&conn, &cat, pt, pc, n, *iid)?
+                                else {
+                                    continue;
+                                };
+                                let loc = Loc::Part {
+                                    table,
+                                    rowid,
+                                    column: pc.to_owned(),
+                                };
+                                (loc, from_sql(fs.ty, &v))
+                            }
+                            (_, Some((n, _, iid, r)))
+                                if mapping::derived(kind, fs.key).is_some() =>
+                            {
+                                let d = mapping::derived(kind, fs.key).unwrap();
+                                let Some(v) = derived_value(&conn, &cat, d, n, *iid, r)? else {
+                                    continue;
+                                };
+                                (Loc::Derived, from_sql(fs.ty, &v))
+                            }
                             (FieldType::RefList(_), _) => {
                                 let mut bases = vec![(table.name.clone(), db_id)];
                                 if let Some((n, _, iid, _)) = &impl_row {
@@ -350,8 +553,16 @@ impl RfDocument {
                                     .collect();
                                 (Loc::Child, Value::RefList(items))
                             }
-                            (_, Some((n, ..))) if fs.key == "type" => {
-                                (Loc::ImplType, Value::Text(type_from_impl(&table.name, n)))
+                            (_, Some((n, ..))) if fs.key == "type" || fs.key == "load_type" => {
+                                let prefix = if fs.key == "type" {
+                                    "TYPE"
+                                } else {
+                                    "LOAD_TYPE"
+                                };
+                                let Some(t) = type_from_impl(prefix, n) else {
+                                    continue;
+                                };
+                                (Loc::ImplType, Value::Text(t))
                             }
                             _ => continue,
                         },
@@ -452,7 +663,8 @@ impl RfDocument {
         }
         self.ref_by_id = votes
             .into_iter()
-            .map(|(k, (by_id, by_no))| (k, by_id > by_no))
+            // RFEM stores db ids; ties (ids equal to numbers) count as ids.
+            .map(|(k, (by_id, by_no))| (k, by_id > 0 && by_id >= by_no))
             .collect();
 
         let map = |by_id: bool, target: ObjectKind, n: u32| -> u32 {
@@ -532,6 +744,17 @@ impl RfDocument {
                     Some(Loc::ImplType) => {
                         return Err(Error::Unsupported(format!(
                             "changing {} type",
+                            id.kind.name()
+                        )));
+                    }
+                    Some(Loc::Part {
+                        table,
+                        rowid,
+                        column,
+                    }) => (table, "rowid", *rowid, column),
+                    Some(Loc::Derived) => {
+                        return Err(Error::Unsupported(format!(
+                            "editing library property {}.{key}",
                             id.kind.name()
                         )));
                     }

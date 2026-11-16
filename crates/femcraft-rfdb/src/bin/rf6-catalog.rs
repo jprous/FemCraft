@@ -6,6 +6,9 @@
 //! rf6-catalog <file.rf6> --rows TABLE [N]      first N rows of a table (default 20)
 //! rf6-catalog <file.rf6> --kinds [KIND...]     per object kind: main, impl and related tables
 //!                                              with 2 sample rows each (compact, for pasting)
+//! rf6-catalog <file.rf6> --sql "SELECT ..."    read-only ad-hoc query, compact output
+//! rf6-catalog <file.rf6> --objects KIND [N]    first N objects as FemCraft loads them
+//! rf6-catalog <file.rf6> --edit OUT KIND NO[@LC] FIELD VALUE   change one field, save as OUT
 //! ```
 
 use std::path::Path;
@@ -79,6 +82,67 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     print!("{}", describe_kind(&conn, &cat, kind, !wanted.is_empty())?);
                 }
             }
+        }
+        Some("--edit") => {
+            // --edit OUT.rf6 KIND NO[@LC] FIELD VALUE
+            let [out, kind_name, no, field, value] = &args[2..] else {
+                return Err("usage: --edit OUT.rf6 KIND NO[@LOADCASE] FIELD VALUE".into());
+            };
+            let kind = ObjectKind::ALL
+                .iter()
+                .copied()
+                .find(|k| k.name().eq_ignore_ascii_case(kind_name))
+                .ok_or("unknown kind")?;
+            let (no, lc) = match no.split_once('@') {
+                Some((n, lc)) => (n.parse()?, lc.parse()?),
+                None => (no.parse()?, 0),
+            };
+            let id = femcraft_model::ObjectId::load(kind, lc, no);
+            let value = match value.parse::<f64>() {
+                Ok(v) => femcraft_model::Value::Float(v),
+                Err(_) => femcraft_model::Value::Text(value.clone()),
+            };
+            let mut doc = RfDocument::open(path)?;
+            println!(
+                "before: {field} = {}",
+                doc.model.get(id).ok_or("no such object")?.get(field)
+            );
+            doc.model.set(id, field, value)?;
+            doc.save(Path::new(out))?;
+            println!("saved {out}");
+        }
+        Some("--objects") => {
+            let kind_name = args.get(2).ok_or("--objects needs a kind")?;
+            let kind = ObjectKind::ALL
+                .iter()
+                .copied()
+                .find(|k| k.name().eq_ignore_ascii_case(kind_name))
+                .ok_or("unknown kind")?;
+            let n = args.get(3).map_or(Ok(5), |s| s.parse())?;
+            let doc = RfDocument::open(path)?;
+            for (id, obj) in doc.model.iter_kind(kind).take(n) {
+                let fields: Vec<String> = obj
+                    .values
+                    .iter()
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect();
+                let lc = if id.load_case > 0 {
+                    format!(" (LC{})", id.load_case)
+                } else {
+                    String::new()
+                };
+                println!("{} {}{lc}: {}", kind.name(), id.no, fields.join(" "));
+            }
+        }
+        Some("--sql") => {
+            let sql = args.get(2).ok_or("--sql needs a query")?;
+            let archive = Archive::open(path)?;
+            let conn = Connection::open_with_flags(
+                archive.db_path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            println!("{}", compact_rows(&conn, sql, &[])?.join("\n"));
         }
         Some(other) => return Err(format!("unknown option {other}").into()),
     }
