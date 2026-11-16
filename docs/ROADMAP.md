@@ -80,9 +80,10 @@ interface on top of a working file layer rather than ahead of it.
 coordinate (impl column) and a surface load magnitude (part table) - with the new values.
 The approach of editing rows in place is viable. List fields are now editable too.
 
-**New models (in test):** `rf6-build` creates a portal frame and a 3 x 3 x 3 m pit from an
-emptied template plus cloned prototype objects (see `docs/rfem-tables.md`); waiting for the
-RFEM open test.
+**New models: confirmed.** `rf6-build` creates a portal frame and a 3 x 3 x 3 m pit from an
+emptied template plus cloned prototype objects (see `docs/rfem-tables.md`); RFEM 6.16 opens
+all of them. Lessons: concrete surfaces need a `ConcreteExposureCondition` and a
+`ReinforcementDirection`; owned key / value maps (`addonProperties`) must be cloned intact.
 6. Goal: open a real model and show nodes, lines, members and surfaces in the viewport, with a
    read-only navigator tree and tables.
 
