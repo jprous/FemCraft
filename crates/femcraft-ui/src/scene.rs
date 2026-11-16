@@ -19,6 +19,9 @@ pub const NODAL_LOAD: [f32; 4] = [1.0, 0.35, 0.30, 1.0];
 pub const LINE_LOAD: [f32; 4] = [1.0, 0.62, 0.20, 1.0];
 pub const SURFACE_LOAD: [f32; 4] = [0.98, 0.86, 0.30, 1.0];
 const SURFACE_LOAD_FILL: [f32; 4] = [0.98, 0.86, 0.30, 0.18];
+const AXIS_X: [f32; 4] = [0.95, 0.30, 0.30, 1.0];
+const AXIS_Y: [f32; 4] = [0.35, 0.85, 0.35, 1.0];
+const AXIS_Z: [f32; 4] = [0.35, 0.60, 1.0, 1.0];
 
 /// Above this many load labels in one load case, values are not drawn.
 const MAX_LOAD_LABELS: usize = 60;
@@ -51,6 +54,8 @@ pub struct Visibility {
     pub loads: bool,
     /// Value labels next to loads.
     pub load_values: bool,
+    /// Local axis triads on members and surfaces.
+    pub local_axes: bool,
     /// Load case whose loads are shown.
     pub load_case: u32,
     /// Spacing of support glyphs along lines and surface edges (the grid spacing), metres.
@@ -67,6 +72,7 @@ impl Default for Visibility {
             supports: true,
             loads: true,
             load_values: true,
+            local_axes: false,
             load_case: 1,
             glyph_spacing: 1.0,
         }
@@ -245,6 +251,32 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
             for w in pts.windows(2) {
                 member_box(&mut s, w[0], w[1], b, h, beta);
             }
+        }
+    }
+
+    if vis.local_axes {
+        let size = (arrow_len * 0.8).max(0.1);
+        for (_, m) in model.iter_kind(K::Member) {
+            let Some(line) = m.get("line").as_ref_no() else {
+                continue;
+            };
+            let pts: Vec<Vec3> = model
+                .line_nodes(line)
+                .iter()
+                .filter_map(|n| model.node_position(*n))
+                .map(|p| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32))
+                .collect();
+            if let (Some(a), Some(b)) = (pts.first(), pts.last()) {
+                let beta = f(m, "rotation_angle").unwrap_or(0.0) as f32;
+                let mid = to_world([a.x as f64, a.y as f64, a.z as f64])
+                    .lerp(to_world([b.x as f64, b.y as f64, b.z as f64]), 0.5);
+                axes_triad(&mut s, mid, member_axes(*a, *b, beta), size);
+            }
+        }
+        for (no, poly) in &surface_polys {
+            let srf = model.get(ObjectId::new(K::Surface, *no));
+            let c = poly.iter().copied().sum::<Vec3>() / poly.len() as f32;
+            axes_triad(&mut s, c, surface_axes(poly, srf), size);
         }
     }
 
@@ -439,6 +471,57 @@ fn member_axes(a: Vec3, b: Vec3, beta: f32) -> (Vec3, Vec3, Vec3) {
     (x, y * cb + z * sb, z * cb - y * sb)
 }
 
+/// Rotation of a line's local axes (lines carry a rotation like members).
+fn line_beta(model: &Model, line: u32) -> f32 {
+    model
+        .get(ObjectId::new(K::Line, line))
+        .and_then(|l| f(l, "rotation_angle"))
+        .unwrap_or(0.0) as f32
+}
+
+/// Surface local axes in model coordinates from its boundary (world coordinates), following
+/// RFEM's defaults as far as known:
+/// - z normal to the surface; horizontal or inclined surfaces: z points down (global +Z);
+///   vertical surfaces: z towards +X, or +Y when the surface is parallel to X (assumption);
+///   then reversed if the surface says so;
+/// - x along global X projected onto the surface (global Y when X is normal to it), then
+///   rotated about z by the surface's axes rotation;
+/// - y = z × x.
+fn surface_axes(poly: &[Vec3], srf: Option<&Object>) -> (Vec3, Vec3, Vec3) {
+    let model_poly: Vec<Vec3> = poly.iter().map(|p| to_model(*p)).collect();
+    let mut z = newell_normal(&model_poly);
+    let flip = if z.z.abs() > 1e-3 {
+        z.z < 0.0
+    } else if z.x.abs() > 1e-3 {
+        z.x < 0.0
+    } else {
+        z.y < 0.0
+    };
+    if flip {
+        z = -z;
+    }
+    if srf.is_some_and(|o| o.get("axes_z_reversed").as_bool() == Some(true)) {
+        z = -z;
+    }
+    let along = |g: Vec3| (g - z * g.dot(z)).normalize_or_zero();
+    let mut x = along(Vec3::X);
+    if x.length_squared() < 0.5 {
+        x = along(Vec3::Y);
+    }
+    let rot = srf.and_then(|o| f(o, "axes_rotation")).unwrap_or(0.0) as f32;
+    if rot != 0.0 {
+        x = glam::Quat::from_axis_angle(z, rot) * x;
+    }
+    (x, z.cross(x).normalize_or_zero(), z)
+}
+
+/// Small x / y / z triad (red / green / blue) at a world point for model-space axes.
+fn axes_triad(s: &mut Scene, at: Vec3, (x, y, z): (Vec3, Vec3, Vec3), size: f32) {
+    for (d, c) in [(x, AXIS_X), (y, AXIS_Y), (z, AXIS_Z)] {
+        s.line(at, at + dir_world(d) * size, c);
+    }
+}
+
 /// Wire box around a member segment: b along local y, h along local z.
 fn member_box(s: &mut Scene, a: [f64; 3], b: [f64; 3], width: f32, height: f32, beta: f32) {
     let am = Vec3::new(a[0] as f32, a[1] as f32, a[2] as f32);
@@ -597,10 +680,17 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
         }
     }
 
-    // Line loads on lines, member loads on members' lines.
-    let mut linear: Vec<(Vec<u32>, &Object)> = Vec::new();
+    // Line loads on lines (line axes, line rotation), member loads on members' lines
+    // (member axes, member rotation beta). Each entry: (line, beta).
+    let mut linear: Vec<(Vec<(u32, f32)>, &Object)> = Vec::new();
     for (_, l) in in_case(K::LineLoad) {
-        linear.push((l.get("lines").as_ref_list().to_vec(), l));
+        let lines = l
+            .get("lines")
+            .as_ref_list()
+            .iter()
+            .map(|ln| (*ln, line_beta(model, *ln)))
+            .collect();
+        linear.push((lines, l));
     }
     for (_, l) in in_case(K::MemberLoad) {
         let lines = l
@@ -608,10 +698,11 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
             .as_ref_list()
             .iter()
             .filter_map(|m| {
-                model
-                    .get(ObjectId::new(K::Member, *m))?
-                    .get("line")
-                    .as_ref_no()
+                let mo = model.get(ObjectId::new(K::Member, *m))?;
+                Some((
+                    mo.get("line").as_ref_no()?,
+                    f(mo, "rotation_angle").unwrap_or(0.0) as f32,
+                ))
             })
             .collect();
         linear.push((lines, l));
@@ -620,7 +711,7 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
         let p1 = f(l, "magnitude").unwrap_or(0.0);
         let p2 = f(l, "magnitude_2").filter(|v| v.is_finite()).unwrap_or(p1);
         let code = l.get("load_direction").as_i64().unwrap_or(13);
-        for line in lines {
+        for (line, beta) in lines {
             let pts: Vec<[f64; 3]> = model
                 .line_nodes(line)
                 .iter()
@@ -631,7 +722,7 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
             };
             let am = Vec3::new(a[0] as f32, a[1] as f32, a[2] as f32);
             let bm = Vec3::new(b[0] as f32, b[1] as f32, b[2] as f32);
-            let Some(d) = load_dir(code, false, Some(member_axes(am, bm, 0.0))) else {
+            let Some(d) = load_dir(code, false, Some(member_axes(am, bm, beta))) else {
                 unknown_dir += 1;
                 continue;
             };
@@ -675,10 +766,8 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
             let Some((_, poly)) = surfaces.iter().find(|(no, _)| no == sn) else {
                 continue;
             };
-            let nw = newell_normal(poly);
-            // Local z of the surface (model space), for local directions.
-            let nm = dir_world(nw);
-            let local = Some((Vec3::X, nm.cross(Vec3::X).normalize_or_zero(), nm));
+            let srf = model.get(ObjectId::new(K::Surface, *sn));
+            let local = Some(surface_axes(poly, srf));
             let Some(d) = load_dir(code, false, local) else {
                 unknown_dir += 1;
                 continue;
@@ -769,6 +858,44 @@ mod tests {
             .map(|[a, b, c]| (*b - *a).cross(*c - *a).length() * 0.5)
             .sum();
         assert!((area - 3.0).abs() < 1e-5);
+    }
+
+    fn close(a: Vec3, b: Vec3) -> bool {
+        a.distance(b) < 1e-5
+    }
+
+    #[test]
+    fn member_local_axes() {
+        // Horizontal member along +X: y = +Y, z = +Z (down), right-handed.
+        let (x, y, z) = member_axes(Vec3::ZERO, Vec3::X * 6.0, 0.0);
+        assert!(close(x, Vec3::X) && close(y, Vec3::Y) && close(z, Vec3::Z));
+        // beta = 90 degrees turns y onto z and z onto -y.
+        let (_, y, z) = member_axes(Vec3::ZERO, Vec3::X * 6.0, std::f32::consts::FRAC_PI_2);
+        assert!(close(y, Vec3::Z) && close(z, -Vec3::Y));
+        // Inclined member (roof): z stays in the vertical plane, pointing down.
+        let (x, y, z) = member_axes(Vec3::ZERO, Vec3::new(4.0, 0.0, -1.0), 0.0);
+        assert!(z.z > 0.0 && z.dot(x).abs() < 1e-5 && close(y, Vec3::Y));
+        // Column (bottom to top, i.e. towards -Z): y along global Y.
+        let (_, y, _) = member_axes(Vec3::ZERO, Vec3::NEG_Z * 4.0, 0.0);
+        assert!(close(y, Vec3::Y));
+    }
+
+    #[test]
+    fn surface_local_axes() {
+        // Horizontal slab (world coordinates in, model axes out): z down, x = X, y = Y.
+        let slab: Vec<Vec3> = [[0., 0., 0.], [3., 0., 0.], [3., 3., 0.], [0., 3., 0.]]
+            .iter()
+            .map(|p| to_world(*p))
+            .collect();
+        let (x, y, z) = surface_axes(&slab, None);
+        assert!(close(x, Vec3::X) && close(y, Vec3::Y) && close(z, Vec3::Z));
+        // Wall in the XZ plane: z along +Y (assumed default), x along X.
+        let wall: Vec<Vec3> = [[0., 0., 0.], [3., 0., 0.], [3., 0., -3.], [0., 0., -3.]]
+            .iter()
+            .map(|p| to_world(*p))
+            .collect();
+        let (x, _, z) = surface_axes(&wall, None);
+        assert!(close(z, Vec3::Y) && close(x, Vec3::X));
     }
 
     #[test]

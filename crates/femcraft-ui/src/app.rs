@@ -84,9 +84,18 @@ impl FemCraftApp {
             open_path: String::new(),
             message: None,
         };
-        // `femcraft model.rf6` opens the file directly.
-        if let Some(path) = std::env::args().nth(1) {
-            app.open(Path::new(&path));
+        // `femcraft model.rf6 [--lc=N] [--local-axes]` opens the file directly.
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if let Some(path) = args.iter().find(|a| !a.starts_with("--")) {
+            app.open(Path::new(path));
+        }
+        for a in &args {
+            if let Some(lc) = a.strip_prefix("--lc=").and_then(|n| n.parse().ok()) {
+                app.vis.load_case = lc;
+            }
+            if a == "--local-axes" {
+                app.vis.local_axes = true;
+            }
         }
         app
     }
@@ -271,7 +280,7 @@ impl FemCraftApp {
             ui.checkbox(&mut v.supports, "Supports");
             ui.checkbox(&mut v.loads, "Loads");
             ui.end_row();
-            ui.label("");
+            ui.checkbox(&mut v.local_axes, "Local axes");
             ui.add_enabled(
                 v.loads,
                 egui::Checkbox::new(&mut v.load_values, "Load values"),

@@ -163,6 +163,7 @@ static NODE: &[FieldSpec] = &[
 static LINE: &[FieldSpec] = &[
     TYPE,
     f("definition_nodes", "Nodes", RefList(K::Node)),
+    f("rotation_angle", "Rotation β", Float("rad")),
     COMMENT,
 ];
 
@@ -183,6 +184,8 @@ static SURFACE: &[FieldSpec] = &[
     f("geometry", "Geometry", Enum),
     f("boundary_lines", "Boundary lines", RefList(K::Line)),
     f("thickness", "Thickness", Ref(K::Thickness)),
+    f("axes_rotation", "Local axes rotation", Float("rad")),
+    f("axes_z_reversed", "Local z reversed", Bool),
     COMMENT,
 ];
 
