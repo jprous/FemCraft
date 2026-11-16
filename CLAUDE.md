@@ -13,16 +13,17 @@ Plan and milestone status: `docs/ROADMAP.md`.
 
 - Windows, Rust stable, GNU toolchain (`x86_64-pc-windows-gnu`); MinGW binutils (WinLibs) on
   PATH provide `dlltool`.
-- `cargo build`, `cargo test`, `cargo run`.
+- `cargo build`, `cargo test --workspace`, `cargo run` (default member is `apps/femcraft`).
 - Stack: eframe / egui with the wgpu renderer, `glam` maths, WGSL shaders in `src/shaders/`.
 
-## Code layout
+## Code layout (Cargo workspace)
 
-Cargo workspace: the app is still the root package; library crates live in `crates/`.
-
-- `src/main.rs` window setup, `src/app.rs` UI and viewport interaction,
-  `src/camera.rs` orbit camera (Z up), `src/grid.rs` grid and snapping,
-  `src/viewport.rs` wgpu line renderer (egui paint callback).
+- `apps/femcraft` executable (window setup only).
+- `crates/femcraft-ui` panels and viewport interaction (`app.rs`).
+- `crates/femcraft-render` orbit camera (Z up), grid and snapping, wgpu line renderer, `shaders/`.
+- `crates/femcraft-aster`, `-results` placeholders.
+- egui / eframe 0.37 (panels are `egui::Panel`, `App::ui` instead of `update`).
+- CI: `.github/workflows/ci.yml` (Windows build + test).
 - `crates/femcraft-model` - no I/O. `kinds.rs`: every object kind (materials, sections,
   thicknesses, nodes, lines, members, surfaces, solids, 4 support kinds, load cases, 11 load
   kinds) with field descriptors (key, label, type/SI unit) that drive tables and dialogs.

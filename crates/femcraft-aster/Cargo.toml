@@ -1,0 +1,11 @@
+[package]
+name = "femcraft-aster"
+description = "FemCraft Salome-Meca / code_aster connection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+femcraft-model.workspace = true

@@ -1,8 +1,10 @@
 [package]
 name = "femcraft-model"
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-publish = false
+description = "FemCraft domain objects and edit commands (no UI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
