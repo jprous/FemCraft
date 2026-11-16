@@ -19,6 +19,8 @@ pub const NODAL_LOAD: [f32; 4] = [1.0, 0.35, 0.30, 1.0];
 pub const LINE_LOAD: [f32; 4] = [1.0, 0.62, 0.20, 1.0];
 pub const SURFACE_LOAD: [f32; 4] = [0.98, 0.86, 0.30, 1.0];
 const SURFACE_LOAD_FILL: [f32; 4] = [0.98, 0.86, 0.30, 0.18];
+const SUPPORT_FILL: [f32; 4] = [0.35, 0.85, 0.40, 0.20];
+const SUPPORT_EDGE: [f32; 4] = [0.35, 0.85, 0.40, 0.70];
 const AXIS_X: [f32; 4] = [0.95, 0.30, 0.30, 1.0];
 const AXIS_Y: [f32; 4] = [0.35, 0.85, 0.35, 1.0];
 const AXIS_Z: [f32; 4] = [0.35, 0.60, 1.0, 1.0];
@@ -302,6 +304,8 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
 
     if vis.supports {
         let spacing = vis.glyph_spacing.max(0.01);
+        // Support volumes are half as deep as surface load blocks.
+        let support_depth = arrow_len * 0.5;
         // Springs of nodal / line supports act along global Z (model), drawn in world.
         let global_z = dir_world(Vec3::Z);
         for (_, sup) in model.iter_kind(K::NodalSupport) {
@@ -325,6 +329,21 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
                     .filter_map(|n| node(*n))
                     .collect();
                 for w in pts.windows(2) {
+                    // Support side: global +Z (down) made perpendicular to the line; for
+                    // vertical lines, global +X.
+                    let along = (w[1] - w[0]).normalize_or_zero();
+                    let mut side = global_z - along * global_z.dot(along);
+                    if side.length_squared() < 1e-4 {
+                        side = Vec3::X - along * along.x;
+                    }
+                    strip(
+                        &mut s,
+                        w[0],
+                        w[1],
+                        side.normalize_or_zero() * support_depth,
+                        SUPPORT_FILL,
+                        SUPPORT_EDGE,
+                    );
                     for pos in points_along(w[0], w[1], spacing, true) {
                         s.supports.push(SupportGlyph {
                             pos,
@@ -344,6 +363,16 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
                     continue;
                 };
                 let normal = newell_normal(poly);
+                // Support side: the surface's positive local z (below a slab).
+                let srf = model.get(ObjectId::new(K::Surface, *sn));
+                let (_, _, z) = surface_axes(poly, srf);
+                prism(
+                    &mut s,
+                    poly,
+                    dir_world(z) * support_depth,
+                    SUPPORT_FILL,
+                    SUPPORT_EDGE,
+                );
                 for pos in inset_edge_points(poly, normal, spacing) {
                     s.supports.push(SupportGlyph {
                         pos,
@@ -815,21 +844,37 @@ pub fn first_loaded_case(model: &Model) -> Option<u32> {
 /// the surface on the load side (`dir` points towards the surface), with outlined edges and
 /// one arrow showing the direction.
 fn surface_load_block(s: &mut Scene, poly: &[Vec3], dir: Vec3, h: f32) {
-    let top: Vec<Vec3> = poly.iter().map(|p| *p - dir * h).collect();
+    prism(s, poly, -dir * h, SURFACE_LOAD_FILL, SURFACE_LOAD);
+    let c = poly.iter().copied().sum::<Vec3>() / poly.len() as f32;
+    s.arrow(c, dir, h * 0.9, SURFACE_LOAD);
+}
+
+/// Translucent block between a polygon and the same polygon moved by `offset` (world):
+/// filled far face and sides, outlined far edges and side edges.
+fn prism(s: &mut Scene, poly: &[Vec3], offset: Vec3, fill: [f32; 4], edge: [f32; 4]) {
+    let top: Vec<Vec3> = poly.iter().map(|p| *p + offset).collect();
     for [a, b, c] in triangulate(&top) {
-        s.tri(a, b, c, SURFACE_LOAD_FILL);
+        s.tri(a, b, c, fill);
     }
     let n = poly.len();
     for i in 0..n {
         let j = (i + 1) % n;
         let (a, b, ta, tb) = (poly[i], poly[j], top[i], top[j]);
-        s.tri(a, b, tb, SURFACE_LOAD_FILL);
-        s.tri(a, tb, ta, SURFACE_LOAD_FILL);
-        s.line(ta, tb, SURFACE_LOAD);
-        s.line(a, ta, SURFACE_LOAD);
+        s.tri(a, b, tb, fill);
+        s.tri(a, tb, ta, fill);
+        s.line(ta, tb, edge);
+        s.line(a, ta, edge);
     }
-    let c = poly.iter().copied().sum::<Vec3>() / n as f32;
-    s.arrow(c, dir, h * 0.9, SURFACE_LOAD);
+}
+
+/// Translucent strip hanging from a line segment by `offset` (world), outlined.
+fn strip(s: &mut Scene, a: Vec3, b: Vec3, offset: Vec3, fill: [f32; 4], edge: [f32; 4]) {
+    let (ta, tb) = (a + offset, b + offset);
+    s.tri(a, b, tb, fill);
+    s.tri(a, tb, ta, fill);
+    s.line(ta, tb, edge);
+    s.line(a, ta, edge);
+    s.line(b, tb, edge);
 }
 
 /// Load cases for the selector: (number, name).
