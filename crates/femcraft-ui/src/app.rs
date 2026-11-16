@@ -129,6 +129,20 @@ impl FemCraftApp {
         app
     }
 
+    /// Native "Open" dialog (modal), starting in the folder of the last opened model.
+    fn open_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Open RFEM model")
+            .add_filter("RFEM 6 model", &["rf6"])
+            .add_filter("All files", &["*"]);
+        if let Some(dir) = Path::new(&self.open_path).parent().filter(|d| d.is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.open(&path);
+        }
+    }
+
     /// Opens an `.rf6`; on failure keeps the current model and shows the error.
     fn open(&mut self, path: &Path) {
         match RfDocument::open(path) {
@@ -219,17 +233,9 @@ impl FemCraftApp {
         egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    ui.label("Open .rf6 (path, or drop a file on the window):");
-                    let edit = ui.add(
-                        egui::TextEdit::singleline(&mut self.open_path)
-                            .desired_width(420.0)
-                            .hint_text(r"C:\path\model.rf6"),
-                    );
-                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("Open").clicked() || enter {
-                        let p = PathBuf::from(self.open_path.trim().trim_matches('"'));
-                        self.open(&p);
+                    if ui.button("Open…").clicked() {
                         ui.close();
+                        self.open_dialog();
                     }
                     ui.separator();
                     if ui.button("Exit").clicked() {
@@ -334,8 +340,9 @@ impl FemCraftApp {
                     }
                 });
         });
+        let warn = ui.visuals().error_fg_color;
         for note in m.warnings.iter().chain(&self.scene.notes) {
-            ui.colored_label(Color32::YELLOW, note);
+            ui.colored_label(warn, note);
         }
         ui.separator();
     }
@@ -410,7 +417,7 @@ impl FemCraftApp {
                 });
                 if g.is_clamped() {
                     ui.colored_label(
-                        Color32::YELLOW,
+                        ui.visuals().error_fg_color,
                         "Too many lines for this spacing - grid is drawn smaller than the extent.",
                     );
                 }
@@ -693,10 +700,15 @@ impl FemCraftApp {
         for p in self.scene.nodes.iter().filter_map(|p| to_screen(*p)) {
             painter.circle_filled(p, 2.5, node);
         }
-        let green = rgba(scene::SUPPORT);
-        let stroke = Stroke::new(1.5_f32, green);
         for g in &self.scene.supports {
             let Some(p) = to_screen(g.pos) else { continue };
+            // Baby blue when a gap / nonlinearity is defined.
+            let green = rgba(if g.nonlinear {
+                scene::NONLINEAR_SUPPORT
+            } else {
+                scene::SUPPORT
+            });
+            let stroke = Stroke::new(1.5_f32, green);
             let v = |x: f32, y: f32| p + egui::vec2(x, y);
             match g.symbol {
                 SupportSymbol::Pinned => {

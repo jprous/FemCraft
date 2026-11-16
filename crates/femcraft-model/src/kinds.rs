@@ -200,6 +200,14 @@ static SOLID: &[FieldSpec] = &[
     COMMENT,
 ];
 
+// Nonlinearity type per direction (0 = linear; other codes: gap, failure, friction, ...).
+const NL_X: FieldSpec = f("nonlinearity_x", "Nonlinearity uX", Enum);
+const NL_Y: FieldSpec = f("nonlinearity_y", "Nonlinearity uY", Enum);
+const NL_Z: FieldSpec = f("nonlinearity_z", "Nonlinearity uZ", Enum);
+const NL_RX: FieldSpec = f("nonlinearity_rx", "Nonlinearity φX", Enum);
+const NL_RY: FieldSpec = f("nonlinearity_ry", "Nonlinearity φY", Enum);
+const NL_RZ: FieldSpec = f("nonlinearity_rz", "Nonlinearity φZ", Enum);
+
 static NODAL_SUPPORT: &[FieldSpec] = &[
     NAME,
     TYPE,
@@ -210,6 +218,12 @@ static NODAL_SUPPORT: &[FieldSpec] = &[
     f("rotational_restraint_x", "Restraint φX", Float("N·m/rad")),
     f("rotational_restraint_y", "Restraint φY", Float("N·m/rad")),
     f("rotational_restraint_z", "Restraint φZ", Float("N·m/rad")),
+    NL_X,
+    NL_Y,
+    NL_Z,
+    NL_RX,
+    NL_RY,
+    NL_RZ,
     COMMENT,
 ];
 
@@ -223,6 +237,12 @@ static LINE_SUPPORT: &[FieldSpec] = &[
     f("rotational_restraint_x", "Restraint φX", Float("N·m/rad/m")),
     f("rotational_restraint_y", "Restraint φY", Float("N·m/rad/m")),
     f("rotational_restraint_z", "Restraint φZ", Float("N·m/rad/m")),
+    NL_X,
+    NL_Y,
+    NL_Z,
+    NL_RX,
+    NL_RY,
+    NL_RZ,
     COMMENT,
 ];
 
@@ -247,6 +267,7 @@ static SURFACE_SUPPORT: &[FieldSpec] = &[
     f("translation_z", "Spring uZ", Float("N/m³")),
     f("shear_xz", "Shear vxz", Float(N_M)),
     f("shear_yz", "Shear vyz", Float(N_M)),
+    f("nonlinearity", "Nonlinearity", Enum),
     COMMENT,
 ];
 

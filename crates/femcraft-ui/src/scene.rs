@@ -19,6 +19,20 @@ pub const NODAL_LOAD: [f32; 4] = [1.0, 0.35, 0.30, 1.0];
 pub const LINE_LOAD: [f32; 4] = [1.0, 0.62, 0.20, 1.0];
 pub const SURFACE_LOAD: [f32; 4] = [0.98, 0.86, 0.30, 1.0];
 const SURFACE_LOAD_FILL: [f32; 4] = [0.98, 0.86, 0.30, 0.18];
+const SUPPORT_FILL: [f32; 4] = [0.35, 0.85, 0.40, 0.20];
+const SUPPORT_EDGE: [f32; 4] = [0.35, 0.85, 0.40, 0.70];
+/// Supports with a gap or other nonlinearity (baby blue).
+pub const NONLINEAR_SUPPORT: [f32; 4] = [0.54, 0.81, 0.94, 1.0];
+const NONLINEAR_FILL: [f32; 4] = [0.54, 0.81, 0.94, 0.22];
+const NONLINEAR_EDGE: [f32; 4] = [0.54, 0.81, 0.94, 0.75];
+const NL_KEYS: &[&str] = &[
+    "nonlinearity_x",
+    "nonlinearity_y",
+    "nonlinearity_z",
+    "nonlinearity_rx",
+    "nonlinearity_ry",
+    "nonlinearity_rz",
+];
 const AXIS_X: [f32; 4] = [0.95, 0.30, 0.30, 1.0];
 const AXIS_Y: [f32; 4] = [0.35, 0.85, 0.35, 1.0];
 const AXIS_Z: [f32; 4] = [0.35, 0.60, 1.0, 1.0];
@@ -99,6 +113,8 @@ pub struct SupportGlyph {
     pub pos: Vec3,
     pub symbol: SupportSymbol,
     pub dir: Vec3,
+    /// A gap or other nonlinearity is defined: drawn in baby blue.
+    pub nonlinear: bool,
 }
 
 /// A text label anchored at a world point.
@@ -302,22 +318,28 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
 
     if vis.supports {
         let spacing = vis.glyph_spacing.max(0.01);
+        // Support volumes are half as deep as surface load blocks.
+        let support_depth = arrow_len * 0.5;
         // Springs of nodal / line supports act along global Z (model), drawn in world.
         let global_z = dir_world(Vec3::Z);
         for (_, sup) in model.iter_kind(K::NodalSupport) {
             let symbol = nodal_or_line_symbol(sup);
+            let nonlinear = is_nonlinear(sup, NL_KEYS);
             for n in sup.get("nodes").as_ref_list() {
                 if let Some(pos) = node(*n) {
                     s.supports.push(SupportGlyph {
                         pos,
                         symbol,
                         dir: global_z,
+                        nonlinear,
                     });
                 }
             }
         }
         for (_, sup) in model.iter_kind(K::LineSupport) {
             let symbol = nodal_or_line_symbol(sup);
+            let nonlinear = is_nonlinear(sup, NL_KEYS);
+            let (fill, edge) = support_colors(nonlinear);
             for l in sup.get("lines").as_ref_list() {
                 let pts: Vec<Vec3> = model
                     .line_nodes(*l)
@@ -325,11 +347,27 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
                     .filter_map(|n| node(*n))
                     .collect();
                 for w in pts.windows(2) {
+                    // Support side: global +Z (down) made perpendicular to the line; for
+                    // vertical lines, global +X.
+                    let along = (w[1] - w[0]).normalize_or_zero();
+                    let mut side = global_z - along * global_z.dot(along);
+                    if side.length_squared() < 1e-4 {
+                        side = Vec3::X - along * along.x;
+                    }
+                    strip(
+                        &mut s,
+                        w[0],
+                        w[1],
+                        side.normalize_or_zero() * support_depth,
+                        fill,
+                        edge,
+                    );
                     for pos in points_along(w[0], w[1], spacing, true) {
                         s.supports.push(SupportGlyph {
                             pos,
                             symbol,
                             dir: global_z,
+                            nonlinear,
                         });
                     }
                 }
@@ -339,16 +377,23 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
         // spacing inside the surface.
         for (_, sup) in model.iter_kind(K::SurfaceSupport) {
             let symbol = surface_symbol(sup);
+            let nonlinear = is_nonlinear(sup, &["nonlinearity"]);
+            let (fill, edge) = support_colors(nonlinear);
             for sn in sup.get("surfaces").as_ref_list() {
                 let Some((_, poly)) = surface_polys.iter().find(|(no, _)| no == sn) else {
                     continue;
                 };
                 let normal = newell_normal(poly);
+                // Support side: the surface's positive local z (below a slab).
+                let srf = model.get(ObjectId::new(K::Surface, *sn));
+                let (_, _, z) = surface_axes(poly, srf);
+                prism(&mut s, poly, dir_world(z) * support_depth, fill, edge);
                 for pos in inset_edge_points(poly, normal, spacing) {
                     s.supports.push(SupportGlyph {
                         pos,
                         symbol,
                         dir: normal,
+                        nonlinear,
                     });
                 }
             }
@@ -387,6 +432,21 @@ fn classify(trans: [Option<f64>; 3], rot: &[Option<f64>]) -> SupportSymbol {
         }
     } else {
         SupportSymbol::Roller
+    }
+}
+
+/// Any nonlinearity code other than 0 (linear) among keys.
+fn is_nonlinear(sup: &Object, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|k| sup.get(k).as_i64().is_some_and(|v| v != 0))
+}
+
+/// Volume fill and edge colours for a support.
+fn support_colors(nonlinear: bool) -> ([f32; 4], [f32; 4]) {
+    if nonlinear {
+        (NONLINEAR_FILL, NONLINEAR_EDGE)
+    } else {
+        (SUPPORT_FILL, SUPPORT_EDGE)
     }
 }
 
@@ -815,21 +875,37 @@ pub fn first_loaded_case(model: &Model) -> Option<u32> {
 /// the surface on the load side (`dir` points towards the surface), with outlined edges and
 /// one arrow showing the direction.
 fn surface_load_block(s: &mut Scene, poly: &[Vec3], dir: Vec3, h: f32) {
-    let top: Vec<Vec3> = poly.iter().map(|p| *p - dir * h).collect();
+    prism(s, poly, -dir * h, SURFACE_LOAD_FILL, SURFACE_LOAD);
+    let c = poly.iter().copied().sum::<Vec3>() / poly.len() as f32;
+    s.arrow(c, dir, h * 0.9, SURFACE_LOAD);
+}
+
+/// Translucent block between a polygon and the same polygon moved by `offset` (world):
+/// filled far face and sides, outlined far edges and side edges.
+fn prism(s: &mut Scene, poly: &[Vec3], offset: Vec3, fill: [f32; 4], edge: [f32; 4]) {
+    let top: Vec<Vec3> = poly.iter().map(|p| *p + offset).collect();
     for [a, b, c] in triangulate(&top) {
-        s.tri(a, b, c, SURFACE_LOAD_FILL);
+        s.tri(a, b, c, fill);
     }
     let n = poly.len();
     for i in 0..n {
         let j = (i + 1) % n;
         let (a, b, ta, tb) = (poly[i], poly[j], top[i], top[j]);
-        s.tri(a, b, tb, SURFACE_LOAD_FILL);
-        s.tri(a, tb, ta, SURFACE_LOAD_FILL);
-        s.line(ta, tb, SURFACE_LOAD);
-        s.line(a, ta, SURFACE_LOAD);
+        s.tri(a, b, tb, fill);
+        s.tri(a, tb, ta, fill);
+        s.line(ta, tb, edge);
+        s.line(a, ta, edge);
     }
-    let c = poly.iter().copied().sum::<Vec3>() / n as f32;
-    s.arrow(c, dir, h * 0.9, SURFACE_LOAD);
+}
+
+/// Translucent strip hanging from a line segment by `offset` (world), outlined.
+fn strip(s: &mut Scene, a: Vec3, b: Vec3, offset: Vec3, fill: [f32; 4], edge: [f32; 4]) {
+    let (ta, tb) = (a + offset, b + offset);
+    s.tri(a, b, tb, fill);
+    s.tri(a, tb, ta, fill);
+    s.line(ta, tb, edge);
+    s.line(a, ta, edge);
+    s.line(b, tb, edge);
 }
 
 /// Load cases for the selector: (number, name).

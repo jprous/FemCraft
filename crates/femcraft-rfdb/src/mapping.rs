@@ -191,6 +191,12 @@ pub fn part_column(kind: ObjectKind, key: &str) -> Option<Part> {
         (NodalSupport | LineSupport, "rotational_restraint_z") => {
             p(SPRINGS, "springConstantAroundZ")
         }
+        (NodalSupport | LineSupport, "nonlinearity_x") => p(SPRINGS, "nonlinearityTypeAlongX"),
+        (NodalSupport | LineSupport, "nonlinearity_y") => p(SPRINGS, "nonlinearityTypeAlongY"),
+        (NodalSupport | LineSupport, "nonlinearity_z") => p(SPRINGS, "nonlinearityTypeAlongZ"),
+        (NodalSupport | LineSupport, "nonlinearity_rx") => p(SPRINGS, "nonlinearityTypeAroundX"),
+        (NodalSupport | LineSupport, "nonlinearity_ry") => p(SPRINGS, "nonlinearityTypeAroundY"),
+        (NodalSupport | LineSupport, "nonlinearity_rz") => p(SPRINGS, "nonlinearityTypeAroundZ"),
         (MemberLoad | LineLoad, "magnitude") => {
             p("{impl}_magnitudes", "temperaturesOrMagnitudeFirstMagnitude")
         }
