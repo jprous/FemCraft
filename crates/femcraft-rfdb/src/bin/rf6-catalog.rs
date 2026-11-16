@@ -7,6 +7,7 @@
 //! rf6-catalog <file.rf6> --kinds [KIND...]     per object kind: main, impl and related tables
 //!                                              with 2 sample rows each (compact, for pasting)
 //! rf6-catalog <file.rf6> --sql "SELECT ..."    read-only ad-hoc query, compact output
+//! rf6-catalog <file.rf6> --fk                 foreign-key check (dangling references)
 //! rf6-catalog <file.rf6> --objects KIND [N]    first N objects as FemCraft loads them
 //! rf6-catalog <file.rf6> --edit OUT KIND NO[@LC] FIELD VALUE   change one field, save as OUT
 //! ```
@@ -134,6 +135,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 println!("{} {}{lc}: {}", kind.name(), id.no, fields.join(" "));
             }
+        }
+        Some("--fk") => {
+            let archive = Archive::open(path)?;
+            let conn = Connection::open_with_flags(
+                archive.db_path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let problems = femcraft_rfdb::build::foreign_key_problems(&conn)?;
+            for (t, parent, n) in &problems {
+                println!("{n} row(s) of {t} -> missing {parent}");
+            }
+            println!("{} foreign-key problem group(s)", problems.len());
         }
         Some("--sql") => {
             let sql = args.get(2).ok_or("--sql needs a query")?;

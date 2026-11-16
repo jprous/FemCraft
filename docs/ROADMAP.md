@@ -78,8 +78,11 @@ interface on top of a working file layer rather than ahead of it.
 
 **M2 early result (2026-11): RFEM 6.16 opened FemCraft-edited files cleanly** - a node
 coordinate (impl column) and a surface load magnitude (part table) - with the new values.
-The approach of editing rows in place is viable; next are list edits and adding / deleting
-objects.
+The approach of editing rows in place is viable. List fields are now editable too.
+
+**New models (in test):** `rf6-build` creates a portal frame and a 3 x 3 x 3 m pit from an
+emptied template plus cloned prototype objects (see `docs/rfem-tables.md`); waiting for the
+RFEM open test.
 6. Goal: open a real model and show nodes, lines, members and surfaces in the viewport, with a
    read-only navigator tree and tables.
 

@@ -28,6 +28,10 @@ pub struct Archive {
     pub entries: Vec<String>,
     folder: Option<PathBuf>,
     db_file: tempfile::NamedTempFile,
+    /// Entries written with new contents on save (name, bytes).
+    pub replace: Vec<(String, Vec<u8>)>,
+    /// Entries whose name starts with one of these are left out on save (e.g. `!solver/`).
+    pub drop_prefixes: Vec<String>,
 }
 
 impl Archive {
@@ -53,6 +57,8 @@ impl Archive {
                 entries,
                 folder: Some(path.to_owned()),
                 db_file,
+                replace: Vec::new(),
+                drop_prefixes: Vec::new(),
             });
         }
 
@@ -65,6 +71,8 @@ impl Archive {
                 entries: vec![MODEL_DB.into()],
                 folder: None,
                 db_file,
+                replace: Vec::new(),
+                drop_prefixes: Vec::new(),
             });
         }
 
@@ -92,6 +100,8 @@ impl Archive {
             entries,
             folder: None,
             db_file,
+            replace: Vec::new(),
+            drop_prefixes: Vec::new(),
         })
     }
 
@@ -131,13 +141,29 @@ impl Archive {
             let mut out = zip::ZipWriter::new(fs::File::create(&tmp)?);
             for i in 0..zip.len() {
                 let f = zip.by_index_raw(i)?;
-                if f.name()? == MODEL_DB {
+                let name = f.name()?.into_owned();
+                if self
+                    .drop_prefixes
+                    .iter()
+                    .any(|p| name.starts_with(p.as_str()))
+                {
+                    continue;
+                }
+                let new_bytes = if name == MODEL_DB {
+                    Some(&db)
+                } else {
+                    self.replace
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .map(|(_, b)| b)
+                };
+                if let Some(bytes) = new_bytes {
                     let opts = zip::write::SimpleFileOptions::default()
                         .compression_method(f.compression())
                         .last_modified_time(f.last_modified().unwrap_or_default());
                     drop(f);
-                    out.start_file(MODEL_DB, opts)?;
-                    out.write_all(&db)?;
+                    out.start_file(name, opts)?;
+                    out.write_all(bytes)?;
                 } else {
                     out.raw_copy_file(f)?;
                 }

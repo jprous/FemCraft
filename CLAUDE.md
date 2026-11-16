@@ -68,6 +68,11 @@ Plan and milestone status: `docs/ROADMAP.md`.
   `Solids_check_RBeam.rf6` (solids). Not yet seen: solid loads, free concentrated / line
   loads, imposed deformations, nodal load components.
 - **RFEM opens FemCraft-edited files** (impl column and part table edits confirmed in RFEM).
+- Layout reference: `docs/rfem-tables.md`. RFEM 6 has no solid loads in practice (owner):
+  solids are closed sets of `TYPE_WITHOUT_THICKNESS` surfaces, loaded via surfaces / lines /
+  nodes.
+- New models: `build.rs` (template purge + prototype cloning, foreign-key cleanup) and
+  `rf6-build <out-dir> <template.rf6> [donor.rf6 ...]` (portal frame + pit test models).
 - Solver data and results are under `!solver/` in the ZIP (`Data.RFemX`, `RN_*` folders).
 - Saving strategy: start from a database RFEM saved, change only edited rows, keep all
   unknown tables and sidecars byte-identical.

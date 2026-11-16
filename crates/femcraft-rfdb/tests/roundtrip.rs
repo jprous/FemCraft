@@ -188,20 +188,26 @@ fn load_edit_save() {
     assert_eq!(f(&doc2, lc, "name"), Value::Text("G".into()));
     assert_eq!(entry(&src, "views.xml"), entry(&edited, "views.xml"));
 
-    // Library properties and list fields are read-only for now.
-    for (id, key, v) in [
-        (section, "A", Value::Float(0.003)),
-        (
-            ObjectId::new(K::Line, 1),
-            "definition_nodes",
-            Value::RefList(vec![2, 1]),
-        ),
-    ] {
-        let mut d = RfDocument::open(&edited).unwrap();
-        d.model.set(id, key, v).unwrap();
-        assert!(
-            d.save(&dir.path().join("x.rf6")).is_err(),
-            "{key} should be read-only"
-        );
-    }
+    // Library properties are read-only.
+    let mut d = RfDocument::open(&edited).unwrap();
+    d.model.set(section, "A", Value::Float(0.003)).unwrap();
+    assert!(
+        d.save(&dir.path().join("x.rf6")).is_err(),
+        "A should be read-only"
+    );
+
+    // List fields: rewritten as list rows holding db ids, in order.
+    let mut d = RfDocument::open(&edited).unwrap();
+    let line = ObjectId::new(K::Line, 1);
+    d.model
+        .set(line, "definition_nodes", Value::RefList(vec![2, 1]))
+        .unwrap();
+    d.model
+        .set(support, "nodes", Value::RefList(vec![1, 2]))
+        .unwrap();
+    let lists = dir.path().join("lists.rf6");
+    d.save(&lists).unwrap();
+    let d2 = RfDocument::open(&lists).unwrap();
+    assert_eq!(d2.model.line_nodes(1), &[2, 1]);
+    assert_eq!(f(&d2, support, "nodes"), Value::RefList(vec![1, 2]));
 }

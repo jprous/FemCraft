@@ -40,7 +40,7 @@ pub const CHILD_META_COLUMNS: &[&str] = &[
 ];
 pub const CHILD_ORDER_COLUMNS: &[&str] = &["container_order", "row", "index", "order"];
 /// Value column of a list table, in order of preference.
-pub const CHILD_VALUE_COLUMNS: &[&str] = &["reference_id", "value_id", "value"];
+pub const CHILD_VALUE_COLUMNS: &[&str] = &["reference_id", "object_id", "value_id", "value"];
 
 /// Candidate table names for each kind.
 pub fn tables(kind: ObjectKind) -> &'static [&'static str] {
@@ -106,6 +106,35 @@ fn overrides(kind: ObjectKind, key: &str) -> &'static [&'static str] {
         (MemberSupport, "spring_shear_y") => &["springConstant_5"],
         (MemberSupport, "spring_shear_z") => &["springConstant_6"],
         (Material, "type") => &["materialType"],
+        // From the table structure only (no objects seen yet).
+        (FreeConcentratedLoad, "location_x") => &["locationFirst"],
+        (FreeConcentratedLoad, "location_y") => &["locationSecond"],
+        (ImposedNodalDeformation, "imposed_displacement_x") => &["imposedDisplacement_x"],
+        (ImposedNodalDeformation, "imposed_displacement_y") => &["imposedDisplacement_y"],
+        (ImposedNodalDeformation, "imposed_displacement_z") => &["imposedDisplacement_z"],
+        (ImposedNodalDeformation, "imposed_rotation_x") => &["imposedRotation_x"],
+        (ImposedNodalDeformation, "imposed_rotation_y") => &["imposedRotation_y"],
+        (ImposedNodalDeformation, "imposed_rotation_z") => &["imposedRotation_z"],
+        (ImposedLineDeformation, "imposed_displacement_line_start_x") => {
+            &["imposedDisplacementAtLineStart_x"]
+        }
+        (ImposedLineDeformation, "imposed_displacement_line_start_y") => {
+            &["imposedDisplacementAtLineStart_y"]
+        }
+        (ImposedLineDeformation, "imposed_displacement_line_start_z") => {
+            &["imposedDisplacementAtLineStart_z"]
+        }
+        (ImposedLineDeformation, "imposed_displacement_line_end_x") => {
+            &["imposedDisplacementAtLineEnd_x"]
+        }
+        (ImposedLineDeformation, "imposed_displacement_line_end_y") => {
+            &["imposedDisplacementAtLineEnd_y"]
+        }
+        (ImposedLineDeformation, "imposed_displacement_line_end_z") => {
+            &["imposedDisplacementAtLineEnd_z"]
+        }
+        (ImposedLineDeformation, "imposed_rotation_line_start") => &["imposedRotationLineStart"],
+        (ImposedLineDeformation, "imposed_rotation_line_end") => &["imposedRotationAtLineEnd"],
         (NodalLoad, "load_direction") => &["loadDirectionAxis"],
         (FreeRectangularLoad | FreeLineLoad, "load_distribution") => &["distribution"],
         // Objects a load is applied to.

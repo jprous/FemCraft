@@ -4,6 +4,7 @@
 //! collected in [`mapping`] and must be confirmed against real files.
 
 pub mod archive;
+pub mod build;
 pub mod catalog;
 pub mod document;
 pub mod mapping;

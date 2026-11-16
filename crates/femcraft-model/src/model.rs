@@ -215,6 +215,8 @@ fn coerce(ty: FieldType, value: Value) -> Option<Value> {
         (T::Int, v) => Value::Int(v.as_i64()?),
         (T::Float(_), v) => Value::Float(v.as_f64()?),
         (T::Text | T::Enum, Value::Text(s)) => Value::Text(s),
+        // RFEM stores most enumerations as integer codes.
+        (T::Enum, v) => Value::Int(v.as_i64()?),
         (T::Ref(_), v) => Value::Ref(v.as_ref_no()?),
         (T::RefList(_), Value::RefList(l)) => Value::RefList(l),
         (T::RefList(_), Value::Text(s)) => Value::RefList(crate::list::parse_list(&s)?),

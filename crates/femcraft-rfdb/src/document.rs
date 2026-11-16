@@ -66,8 +66,11 @@ impl std::fmt::Display for LoadReport {
 enum Loc {
     Main(String),
     Impl(String),
-    /// List held in a child table (read-only for now).
-    Child,
+    /// List held in a child table: rows `id = owner`, ordered by `container_order`.
+    Child {
+        table: String,
+        owner: i64,
+    },
     /// Object type derived from the impl table name (read-only).
     ImplType,
     /// Column of a one-row part table, addressed by SQLite rowid.
@@ -346,6 +349,11 @@ fn map_value(
     Ok(None)
 }
 
+/// SQL string literal.
+fn quote_str(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 /// Integer column of the row `id` in `table`.
 fn lookup_int(conn: &Connection, table: &str, column: &str, id: i64) -> Result<Option<i64>, Error> {
     let sql = format!(
@@ -469,7 +477,17 @@ struct Raw {
 impl RfDocument {
     /// Opens an `.rf6`, a bare database file or an unpacked folder.
     pub fn open(path: &Path) -> Result<Self, Error> {
-        let archive = Archive::open(path)?;
+        Self::from_archive(Archive::open(path)?)
+    }
+
+    /// Main table and database key of a loaded object.
+    pub fn db_key(&self, id: ObjectId) -> Option<(&str, i64)> {
+        self.bindings.get(&id).map(|b| (b.table.as_str(), b.key))
+    }
+
+    /// Loads the model from an already opened archive (for example one prepared by
+    /// [`crate::build`]).
+    pub fn from_archive(archive: Archive) -> Result<Self, Error> {
         let conn =
             Connection::open_with_flags(archive.db_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let cat = Catalog::read(&conn)?;
@@ -591,7 +609,7 @@ impl RfDocument {
                                     .filter_map(int)
                                     .filter_map(|i| u32::try_from(i).ok())
                                     .collect();
-                                (Loc::Child, Value::RefList(items))
+                                (Loc::Child { table: ct, owner }, Value::RefList(items))
                             }
                             (_, Some((n, ..)))
                                 if matches!(fs.key, "type" | "load_type" | "geometry") =>
@@ -726,7 +744,7 @@ impl RfDocument {
                     .ref_by_id
                     .get(&(r.kind, fs.key))
                     .copied()
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 match (fs.ty, r.obj.values.get_mut(fs.key)) {
                     (FieldType::Ref(t), Some(Value::Ref(n))) => *n = map(by_id, t, *n),
                     (FieldType::RefList(t), Some(Value::RefList(l))) => {
@@ -740,7 +758,7 @@ impl RfDocument {
                     .ref_by_id
                     .get(&(r.kind, "load_case"))
                     .copied()
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 map(by_id, ObjectKind::LoadCase, lc)
             });
             let id = ObjectId::load(r.kind, lc, r.no);
@@ -784,11 +802,12 @@ impl RfDocument {
                         let (t, kc, k) = b.impl_row.as_ref().expect("impl loc has impl row");
                         (t, *kc, *k, c)
                     }
-                    Some(Loc::Child) => {
-                        return Err(Error::Unsupported(format!(
-                            "editing list field {}.{key}",
-                            id.kind.name()
-                        )));
+                    Some(Loc::Child { table, owner }) => {
+                        let FieldType::RefList(target) = field.ty else {
+                            return Err(Error::Unsupported(format!("list {key}")));
+                        };
+                        self.write_list(&tx, table, *owner, target, field.key, id.kind, val)?;
+                        continue;
                     }
                     Some(Loc::ImplType) => {
                         return Err(Error::Unsupported(format!(
@@ -829,6 +848,94 @@ impl RfDocument {
         Ok(())
     }
 
+    /// Replaces the rows of an RFEM list table (`id` = owner, `container_order`, value in
+    /// `reference_id` (+ `reference_table`) or `value_id`).
+    #[allow(clippy::too_many_arguments)]
+    fn write_list(
+        &self,
+        conn: &Connection,
+        table: &str,
+        owner: i64,
+        target: ObjectKind,
+        key: &'static str,
+        kind: ObjectKind,
+        val: &Value,
+    ) -> Result<(), Error> {
+        let cols: Vec<String> = conn
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info({})",
+                quote_str(table)
+            ))?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let has = |c: &str| cols.iter().any(|x| x.eq_ignore_ascii_case(c));
+        if !has("container_order") {
+            return Err(Error::Unsupported(format!("writing list table {table}")));
+        }
+        let (value_col, table_col) = if has("reference_id") {
+            ("reference_id", "reference_table")
+        } else if has("object_id") {
+            ("object_id", "object_table")
+        } else if has("value_id") {
+            ("value_id", "")
+        } else {
+            return Err(Error::Unsupported(format!(
+                "list table {table} has no id column"
+            )));
+        };
+        let items = val.as_ref_list();
+        let ids = items
+            .iter()
+            .map(|n| self.db_id(kind, key, target, *n))
+            .collect::<Result<Vec<_>, _>>()?;
+        conn.execute(
+            &format!("DELETE FROM {} WHERE id = ?1", quote(table)),
+            [owner],
+        )?;
+        let target_table = mapping::tables(target)[0];
+        for (i, db) in ids.iter().enumerate() {
+            if !table_col.is_empty() && has(table_col) {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {} (id, container_order, {value_col}, {table_col}) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        quote(table)
+                    ),
+                    rusqlite::params![owner, i as i64, db, target_table],
+                )?;
+            } else {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {} (id, container_order, {value_col}) VALUES (?1, ?2, ?3)",
+                        quote(table)
+                    ),
+                    rusqlite::params![owner, i as i64, db],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Database id stored for a reference from `kind.key` to object `n` of `target`.
+    fn db_id(
+        &self,
+        kind: ObjectKind,
+        key: &'static str,
+        target: ObjectKind,
+        n: u32,
+    ) -> Result<i64, Error> {
+        if !self.ref_by_id.get(&(kind, key)).copied().unwrap_or(true) {
+            return Ok(n as i64);
+        }
+        self.ids
+            .get(&target)
+            .and_then(|m| m.get(&n))
+            .copied()
+            .ok_or_else(|| {
+                Error::Unsupported(format!("{} {n} is not stored in the file", target.name()))
+            })
+    }
+
     fn to_sql(
         &self,
         kind: ObjectKind,
@@ -836,19 +943,7 @@ impl RfDocument {
         ty: FieldType,
         v: &Value,
     ) -> Result<Sql, Error> {
-        let by_id = self.ref_by_id.get(&(kind, key)).copied().unwrap_or(false);
-        let lookup = |target: ObjectKind, n: u32| -> Result<i64, Error> {
-            if !by_id {
-                return Ok(n as i64);
-            }
-            self.ids
-                .get(&target)
-                .and_then(|m| m.get(&n))
-                .copied()
-                .ok_or_else(|| {
-                    Error::Unsupported(format!("{} {n} is not stored in the file", target.name()))
-                })
-        };
+        let lookup = |target: ObjectKind, n: u32| self.db_id(kind, key, target, n);
         Ok(match (ty, v) {
             (_, Value::Null) => Sql::Null,
             (_, Value::Bool(b)) => Sql::Integer(*b as i64),
