@@ -84,7 +84,10 @@ The approach of editing rows in place is viable. List fields are now editable to
 emptied template plus cloned prototype objects (see `docs/rfem-tables.md`); RFEM 6.16 opens
 all of them. Lessons: concrete surfaces need a `ConcreteExposureCondition` and a
 `ReinforcementDirection`; owned key / value maps (`addonProperties`) must be cloned intact.
-6. Goal: open a real model and show nodes, lines, members and surfaces in the viewport, with a
+6. Basic viewer done: nodes, lines, members (section box outline), surfaces (translucent
+   fill), supports (nodal / line / surface symbols), nodal / line / member / surface loads
+   per load case, display toggles. Still to do: depth buffer, navigator tree and tables.
+   Goal: open a real model and show nodes, lines, members and surfaces in the viewport, with a
    read-only navigator tree and tables.
 
 ### M2 - Saving that RFEM accepts

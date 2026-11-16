@@ -32,10 +32,13 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
 /// GPU objects kept alive by egui between frames.
 struct LineRenderer {
     pipeline: wgpu::RenderPipeline,
+    tri_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     vertex_buffer: Option<wgpu::Buffer>,
     vertex_count: u32,
+    tri_buffer: Option<wgpu::Buffer>,
+    tri_count: u32,
     geometry_version: Option<u64>,
 }
 
@@ -68,41 +71,50 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
         immediate_size: 0,
     });
 
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("femcraft lines pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<LineVertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &VERTEX_ATTRIBUTES,
-            })],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: render_state.target_format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::LineList,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState {
-            count: MSAA_SAMPLES,
-            ..Default::default()
-        },
-        multiview_mask: None,
-        cache: None,
-    });
+    let make_pipeline = |label: &str, topology: wgpu::PrimitiveTopology| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<LineVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &VERTEX_ATTRIBUTES,
+                })],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: render_state.target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: MSAA_SAMPLES,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let pipeline = make_pipeline("femcraft lines pipeline", wgpu::PrimitiveTopology::LineList);
+    // Translucent fills (surfaces); no depth buffer yet, so drawn before the lines.
+    let tri_pipeline = make_pipeline(
+        "femcraft triangles pipeline",
+        wgpu::PrimitiveTopology::TriangleList,
+    );
 
     let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("femcraft view_proj"),
@@ -126,10 +138,13 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
         .callback_resources
         .insert(LineRenderer {
             pipeline,
+            tri_pipeline,
             uniform_buffer,
             bind_group,
             vertex_buffer: None,
             vertex_count: 0,
+            tri_buffer: None,
+            tri_count: 0,
             geometry_version: None,
         });
 }
@@ -137,8 +152,11 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
 /// One frame's draw request for the viewport.
 pub struct LinesCallback {
     pub view_proj: Mat4,
+    /// Line list (pairs of vertices).
     pub vertices: Arc<Vec<LineVertex>>,
-    /// Bumped whenever `vertices` changes, so the GPU buffer is only rebuilt then.
+    /// Triangle list (triples of vertices), drawn first.
+    pub triangles: Arc<Vec<LineVertex>>,
+    /// Bumped whenever `vertices` or `triangles` change, so GPU buffers are only rebuilt then.
     pub version: u64,
 }
 
@@ -162,14 +180,19 @@ impl egui_wgpu::CallbackTrait for LinesCallback {
         );
 
         if r.geometry_version != Some(self.version) {
-            r.vertex_buffer = (!self.vertices.is_empty()).then(|| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("femcraft lines vertices"),
-                    contents: bytemuck::cast_slice(self.vertices.as_slice()),
-                    usage: wgpu::BufferUsages::VERTEX,
+            let upload = |label: &str, v: &[LineVertex]| {
+                (!v.is_empty()).then(|| {
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: bytemuck::cast_slice(v),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    })
                 })
-            });
+            };
+            r.vertex_buffer = upload("femcraft lines vertices", &self.vertices);
             r.vertex_count = self.vertices.len() as u32;
+            r.tri_buffer = upload("femcraft triangle vertices", &self.triangles);
+            r.tri_count = self.triangles.len() as u32;
             r.geometry_version = Some(self.version);
         }
 
@@ -185,9 +208,14 @@ impl egui_wgpu::CallbackTrait for LinesCallback {
         let Some(r) = resources.get::<LineRenderer>() else {
             return;
         };
+        render_pass.set_bind_group(0, &r.bind_group, &[]);
+        if let Some(tb) = &r.tri_buffer {
+            render_pass.set_pipeline(&r.tri_pipeline);
+            render_pass.set_vertex_buffer(0, tb.slice(..));
+            render_pass.draw(0..r.tri_count, 0..1);
+        }
         if let Some(vb) = &r.vertex_buffer {
             render_pass.set_pipeline(&r.pipeline);
-            render_pass.set_bind_group(0, &r.bind_group, &[]);
             render_pass.set_vertex_buffer(0, vb.slice(..));
             render_pass.draw(0..r.vertex_count, 0..1);
         }

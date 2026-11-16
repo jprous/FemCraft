@@ -19,8 +19,12 @@ Plan and milestone status: `docs/ROADMAP.md`.
 ## Code layout (Cargo workspace)
 
 - `apps/femcraft` executable (window setup only).
-- `crates/femcraft-ui` panels and viewport interaction (`app.rs`).
-- `crates/femcraft-render` orbit camera (Z up), grid and snapping, wgpu line renderer, `shaders/`.
+- `crates/femcraft-ui` panels and viewport interaction (`app.rs`); `scene.rs` turns a `Model`
+  into GPU lines / triangles plus 2D marks (nodes, support symbols, load labels). RFEM's Z
+  points down: model `(x, y, z)` is drawn at world `(x, -y, -z)`. Open a model with
+  `cargo run --release -- file.rf6`, File > Open (path) or drag and drop.
+- `crates/femcraft-render` orbit camera (Z up), grid and snapping, wgpu renderer (line list +
+  translucent triangle list, no depth buffer yet), `shaders/`.
 - `crates/femcraft-aster`, `-results` placeholders.
 - egui / eframe 0.37 (panels are `egui::Panel`, `App::ui` instead of `update`).
 - CI: `.github/workflows/ci.yml` (Windows build + test).

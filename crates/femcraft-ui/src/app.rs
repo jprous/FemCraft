@@ -1,14 +1,27 @@
 //! Main window: menu, settings panel, status bar and the 3D viewport.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, Pos2, Stroke};
 use eframe::egui_wgpu;
 use glam::Vec3;
 
+use femcraft_model::{Model, ObjectKind};
 use femcraft_render::camera::{self, OrbitCamera, Projection, StandardView};
 use femcraft_render::grid::{GridPlane, GridSettings};
 use femcraft_render::viewport::{self, LineVertex, LinesCallback};
+use femcraft_rfdb::RfDocument;
+
+use crate::scene::{self, Scene, SupportSymbol, Visibility};
+
+/// An opened model file.
+struct OpenModel {
+    path: PathBuf,
+    model: Model,
+    load_cases: Vec<(u32, String)>,
+    warnings: Vec<String>,
+}
 
 const AXIS_X: [f32; 4] = [0.92, 0.30, 0.30, 1.0];
 const AXIS_Y: [f32; 4] = [0.40, 0.82, 0.35, 1.0];
@@ -26,11 +39,20 @@ pub struct FemCraftApp {
 
     /// Geometry last sent to the GPU, and what it was built from.
     lines: Arc<Vec<LineVertex>>,
+    triangles: Arc<Vec<LineVertex>>,
     lines_version: u64,
-    built_from: Option<(GridSettings, bool)>,
+    built_from: Option<(GridSettings, bool, Visibility, u64)>,
 
     /// Snapped grid point under the mouse.
     cursor: Option<Vec3>,
+
+    model: Option<OpenModel>,
+    /// Bumped when a model is opened.
+    model_version: u64,
+    vis: Visibility,
+    scene: Scene,
+    open_path: String,
+    message: Option<String>,
 }
 
 impl FemCraftApp {
@@ -46,43 +68,105 @@ impl FemCraftApp {
         let mut camera = OrbitCamera::default();
         camera.fit(grid.origin(), grid.half_size());
 
-        Self {
+        let mut app = Self {
             camera,
             grid,
             show_axes: true,
             lines: Arc::new(Vec::new()),
+            triangles: Arc::new(Vec::new()),
             lines_version: 0,
             built_from: None,
             cursor: None,
+            model: None,
+            model_version: 0,
+            vis: Visibility::default(),
+            scene: Scene::default(),
+            open_path: String::new(),
+            message: None,
+        };
+        // `femcraft model.rf6` opens the file directly.
+        if let Some(path) = std::env::args().nth(1) {
+            app.open(Path::new(&path));
+        }
+        app
+    }
+
+    /// Opens an `.rf6`; on failure keeps the current model and shows the error.
+    fn open(&mut self, path: &Path) {
+        match RfDocument::open(path) {
+            Ok(doc) => {
+                let load_cases = scene::load_cases(&doc.model);
+                self.vis.load_case = scene::first_loaded_case(&doc.model)
+                    .or(load_cases.first().map(|(n, _)| *n))
+                    .unwrap_or(1);
+                self.model = Some(OpenModel {
+                    path: path.to_owned(),
+                    load_cases,
+                    warnings: doc.report.warnings.clone(),
+                    model: doc.model,
+                });
+                self.model_version += 1;
+                self.message = None;
+                self.open_path = path.display().to_string();
+                self.refresh_lines();
+                self.zoom_to_model();
+            }
+            Err(e) => self.message = Some(format!("Could not open {}: {e}", path.display())),
         }
     }
 
-    /// Rebuild the line geometry only when the grid or axes settings changed.
+    /// Rebuild the GPU geometry only when the grid, axes, display settings or model changed.
     fn refresh_lines(&mut self) {
-        let key = (self.grid.clone(), self.show_axes);
+        let key = (
+            self.grid.clone(),
+            self.show_axes,
+            self.vis.clone(),
+            self.model_version,
+        );
         if self.built_from.as_ref() == Some(&key) {
             return;
         }
+
+        self.scene = match &self.model {
+            Some(m) => scene::build(&m.model, &self.vis),
+            None => Scene::default(),
+        };
 
         let mut v = Vec::new();
         if self.grid.visible {
             self.grid.build_lines(&mut v);
         }
         if self.show_axes {
-            let len = self.grid.half_size().max(self.grid.spacing * 5.0);
-            for (dir, color) in [(Vec3::X, AXIS_X), (Vec3::Y, AXIS_Y), (Vec3::Z, AXIS_Z)] {
+            let len = self.axis_length();
+            for ((dir, _), color) in scene::GLOBAL_AXES.iter().zip([AXIS_X, AXIS_Y, AXIS_Z]) {
                 v.push(LineVertex::new(Vec3::ZERO, color));
-                v.push(LineVertex::new(dir * len, color));
+                v.push(LineVertex::new(*dir * len, color));
             }
         }
+        v.extend_from_slice(&self.scene.lines);
 
         self.lines = Arc::new(v);
+        self.triangles = Arc::new(self.scene.triangles.clone());
         self.lines_version += 1;
         self.built_from = Some(key);
     }
 
+    fn axis_length(&self) -> f32 {
+        match self.scene.extent() {
+            Some((_, r)) => r * 0.4,
+            None => self.grid.half_size().max(self.grid.spacing * 5.0),
+        }
+    }
+
     fn zoom_to_grid(&mut self) {
         self.camera.fit(self.grid.origin(), self.grid.half_size());
+    }
+
+    fn zoom_to_model(&mut self) {
+        match self.scene.extent() {
+            Some((c, r)) => self.camera.fit(c, r * 1.3),
+            None => self.zoom_to_grid(),
+        }
     }
 
     fn set_view(&mut self, view: StandardView) {
@@ -94,6 +178,19 @@ impl FemCraftApp {
         egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    ui.label("Open .rf6 (path, or drop a file on the window):");
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.open_path)
+                            .desired_width(420.0)
+                            .hint_text(r"C:\path\model.rf6"),
+                    );
+                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Open").clicked() || enter {
+                        let p = PathBuf::from(self.open_path.trim().trim_matches('"'));
+                        self.open(&p);
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Exit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -111,6 +208,10 @@ impl FemCraftApp {
                         }
                     }
                     ui.separator();
+                    if ui.button("Zoom to model").clicked() {
+                        self.zoom_to_model();
+                        ui.close();
+                    }
                     if ui.button("Zoom to grid").clicked() {
                         self.zoom_to_grid();
                         ui.close();
@@ -125,7 +226,83 @@ impl FemCraftApp {
             .resizable(true)
             .default_size(250.0)
             .show(ui, |ui| {
-                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| self.settings_contents(ui));
+            });
+    }
+
+    /// Model summary, display toggles and load case selector.
+    fn model_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.heading("Model");
+        if let Some(msg) = &self.message {
+            ui.colored_label(Color32::LIGHT_RED, msg);
+        }
+        let Some(m) = &self.model else {
+            ui.weak("No model open. Use File > Open, drop an .rf6 on the window, or start\nfemcraft with a file path.");
+            ui.separator();
+            return;
+        };
+        ui.label(
+            m.path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+        )
+        .on_hover_text(m.path.display().to_string());
+        let count = |k| m.model.count(k);
+        ui.weak(format!(
+            "{} nodes · {} lines · {} members · {} surfaces · {} solids",
+            count(ObjectKind::Node),
+            count(ObjectKind::Line),
+            count(ObjectKind::Member),
+            count(ObjectKind::Surface),
+            count(ObjectKind::Solid),
+        ));
+
+        let v = &mut self.vis;
+        egui::Grid::new("display").num_columns(2).show(ui, |ui| {
+            ui.checkbox(&mut v.nodes, "Nodes");
+            ui.checkbox(&mut v.lines, "Lines");
+            ui.end_row();
+            ui.checkbox(&mut v.members, "Members");
+            ui.checkbox(&mut v.surfaces, "Surfaces");
+            ui.end_row();
+            ui.checkbox(&mut v.supports, "Supports");
+            ui.checkbox(&mut v.loads, "Loads");
+            ui.end_row();
+            ui.label("");
+            ui.add_enabled(
+                v.loads,
+                egui::Checkbox::new(&mut v.load_values, "Load values"),
+            );
+            ui.end_row();
+        });
+        let current = m
+            .load_cases
+            .iter()
+            .find(|(n, _)| *n == v.load_case)
+            .map_or_else(
+                || format!("LC{}", v.load_case),
+                |(n, name)| format!("LC{n} {name}"),
+            );
+        ui.add_enabled_ui(v.loads, |ui| {
+            egui::ComboBox::from_label("Load case")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (n, name) in &m.load_cases {
+                        ui.selectable_value(&mut v.load_case, *n, format!("LC{n} {name}"));
+                    }
+                });
+        });
+        for note in m.warnings.iter().chain(&self.scene.notes) {
+            ui.colored_label(Color32::YELLOW, note);
+        }
+        ui.separator();
+    }
+
+    fn settings_contents(&mut self, ui: &mut egui::Ui) {
+        self.model_section(ui);
+        {
+            {
                 ui.heading("Grid");
                 ui.checkbox(&mut self.grid.visible, "Show grid");
 
@@ -212,6 +389,9 @@ impl FemCraftApp {
                     if ui.button("Right").clicked() {
                         self.set_view(StandardView::Right);
                     }
+                    if ui.button("Zoom to model").clicked() {
+                        self.zoom_to_model();
+                    }
                     if ui.button("Zoom to grid").clicked() {
                         self.zoom_to_grid();
                     }
@@ -232,13 +412,15 @@ impl FemCraftApp {
 
                 ui.separator();
                 ui.weak("Right-drag: rotate\nMiddle-drag: pan\nWheel: zoom");
-            });
+            }
+        }
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                match self.cursor {
+                // `+ 0.0` turns -0.0 into 0.0 for display.
+                match self.cursor.map(|p| scene::to_model(p) + Vec3::ZERO) {
                     Some(p) => ui.monospace(format!(
                         "X {:>9.3} m   Y {:>9.3} m   Z {:>9.3} m",
                         p.x, p.y, p.z
@@ -285,6 +467,7 @@ impl FemCraftApp {
             LinesCallback {
                 view_proj,
                 vertices: self.lines.clone(),
+                triangles: self.triangles.clone(),
                 version: self.lines_version,
             },
         ));
@@ -313,15 +496,13 @@ impl FemCraftApp {
             painter.line_segment([s - egui::vec2(0.0, 6.0), s + egui::vec2(0.0, 6.0)], stroke);
         }
 
-        // Axis labels at the tips of the global axes
+        self.paint_model_marks(&painter, &to_screen);
+
+        // Axis labels at the tips of the global axes (RFEM orientation: Z down)
         if self.show_axes {
-            let len = self.grid.half_size().max(self.grid.spacing * 5.0);
-            for (dir, name, color) in [
-                (Vec3::X, "X", AXIS_X),
-                (Vec3::Y, "Y", AXIS_Y),
-                (Vec3::Z, "Z", AXIS_Z),
-            ] {
-                if let Some(p) = to_screen(dir * len * 1.03) {
+            let len = self.axis_length();
+            for ((dir, name), color) in scene::GLOBAL_AXES.iter().zip([AXIS_X, AXIS_Y, AXIS_Z]) {
+                if let Some(p) = to_screen(*dir * len * 1.03) {
                     painter.text(
                         p,
                         egui::Align2::CENTER_CENTER,
@@ -335,10 +516,51 @@ impl FemCraftApp {
 
         paint_axis_triad(&painter, rect, &self.camera);
     }
+
+    /// Nodes, support symbols and load labels, drawn in screen space over the GPU geometry.
+    fn paint_model_marks(&self, painter: &egui::Painter, to_screen: &dyn Fn(Vec3) -> Option<Pos2>) {
+        let node = rgba(scene::NODE);
+        for p in self.scene.nodes.iter().filter_map(|p| to_screen(*p)) {
+            painter.circle_filled(p, 2.5, node);
+        }
+        let green = rgba(scene::SUPPORT);
+        for (p, symbol) in &self.scene.supports {
+            let Some(p) = to_screen(*p) else { continue };
+            let tri = vec![p, p + egui::vec2(-7.0, 12.0), p + egui::vec2(7.0, 12.0)];
+            match symbol {
+                SupportSymbol::Fixed => {
+                    painter.add(egui::Shape::convex_polygon(tri, green, Stroke::NONE));
+                    painter.line_segment(
+                        [p + egui::vec2(-10.0, 14.0), p + egui::vec2(10.0, 14.0)],
+                        Stroke::new(2.0_f32, green),
+                    );
+                }
+                SupportSymbol::Hinged => {
+                    painter.add(egui::Shape::closed_line(tri, Stroke::new(1.5_f32, green)));
+                }
+            }
+        }
+        for l in &self.scene.labels {
+            if let Some(p) = to_screen(l.pos) {
+                painter.text(
+                    p,
+                    egui::Align2::CENTER_CENTER,
+                    &l.text,
+                    egui::FontId::proportional(12.0),
+                    rgba(l.color),
+                );
+            }
+        }
+    }
 }
 
 impl eframe::App for FemCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let dropped: Option<PathBuf> =
+            ui.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_owned()));
+        if let Some(path) = dropped {
+            self.open(&path);
+        }
         self.menu_bar(ui);
         self.settings_panel(ui);
         self.status_bar(ui);
@@ -374,14 +596,11 @@ fn paint_background(painter: &egui::Painter, rect: egui::Rect) {
 fn paint_axis_triad(painter: &egui::Painter, rect: egui::Rect, camera: &OrbitCamera) {
     let center = Pos2::new(rect.left() + 55.0, rect.bottom() - 55.0);
     let view = camera.view();
-    let mut axes: Vec<(Vec3, &str, [f32; 4])> = [
-        (Vec3::X, "X", AXIS_X),
-        (Vec3::Y, "Y", AXIS_Y),
-        (Vec3::Z, "Z", AXIS_Z),
-    ]
-    .into_iter()
-    .map(|(d, n, c)| (view.transform_vector3(d), n, c))
-    .collect();
+    let mut axes: Vec<(Vec3, &str, [f32; 4])> = scene::GLOBAL_AXES
+        .iter()
+        .zip([AXIS_X, AXIS_Y, AXIS_Z])
+        .map(|((d, n), c)| (view.transform_vector3(*d), *n, c))
+        .collect();
     // Draw the axis pointing away from the viewer first.
     axes.sort_by(|a, b| a.0.z.total_cmp(&b.0.z));
     for (v, name, color) in axes {
