@@ -53,6 +53,8 @@ pub struct Visibility {
     pub load_values: bool,
     /// Load case whose loads are shown.
     pub load_case: u32,
+    /// Spacing of support glyphs along lines and surface edges (the grid spacing), metres.
+    pub glyph_spacing: f32,
 }
 
 impl Default for Visibility {
@@ -66,16 +68,31 @@ impl Default for Visibility {
             loads: true,
             load_values: true,
             load_case: 1,
+            glyph_spacing: 1.0,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Support glyph type, from the support's stiffnesses.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SupportSymbol {
-    /// All rotations restrained.
+    /// All translations and rotations (or surface shear) restrained: horizontal rectangle.
     Fixed,
-    /// Translations restrained, rotations free (or partly).
-    Hinged,
+    /// All translations restrained, rotations free: triangle.
+    Pinned,
+    /// Some translations free: triangle with a line below.
+    Roller,
+    /// A finite translational spring: zig-zag along the spring direction.
+    Spring,
+}
+
+/// A support glyph at a world point. `dir` is the world direction of the restraint (for
+/// springs: global Z for nodes / lines, the surface's local z for surface supports).
+#[derive(Clone, Copy, Debug)]
+pub struct SupportGlyph {
+    pub pos: Vec3,
+    pub symbol: SupportSymbol,
+    pub dir: Vec3,
 }
 
 /// A text label anchored at a world point.
@@ -90,7 +107,7 @@ pub struct Scene {
     pub lines: Vec<LineVertex>,
     pub triangles: Vec<LineVertex>,
     pub nodes: Vec<Vec3>,
-    pub supports: Vec<(Vec3, SupportSymbol)>,
+    pub supports: Vec<SupportGlyph>,
     pub labels: Vec<Label>,
     /// World-space bounding box of the geometry.
     pub bounds: Option<(Vec3, Vec3)>,
@@ -240,16 +257,23 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
     }
 
     if vis.supports {
+        let spacing = vis.glyph_spacing.max(0.01);
+        // Springs of nodal / line supports act along global Z (model), drawn in world.
+        let global_z = dir_world(Vec3::Z);
         for (_, sup) in model.iter_kind(K::NodalSupport) {
-            let symbol = support_symbol(sup);
+            let symbol = nodal_or_line_symbol(sup);
             for n in sup.get("nodes").as_ref_list() {
-                if let Some(p) = node(*n) {
-                    s.supports.push((p, symbol));
+                if let Some(pos) = node(*n) {
+                    s.supports.push(SupportGlyph {
+                        pos,
+                        symbol,
+                        dir: global_z,
+                    });
                 }
             }
         }
         for (_, sup) in model.iter_kind(K::LineSupport) {
-            let symbol = support_symbol(sup);
+            let symbol = nodal_or_line_symbol(sup);
             for l in sup.get("lines").as_ref_list() {
                 let pts: Vec<Vec3> = model
                     .line_nodes(*l)
@@ -257,19 +281,31 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
                     .filter_map(|n| node(*n))
                     .collect();
                 for w in pts.windows(2) {
-                    for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
-                        s.supports.push((w[0].lerp(w[1], t), symbol));
+                    for pos in points_along(w[0], w[1], spacing, true) {
+                        s.supports.push(SupportGlyph {
+                            pos,
+                            symbol,
+                            dir: global_z,
+                        });
                     }
                 }
             }
         }
-        // Surface supports: tinted fill (above) plus symbols at the boundary corners.
+        // Surface supports: tinted fill (above) plus glyphs along the boundary edges, one
+        // spacing inside the surface.
         for (_, sup) in model.iter_kind(K::SurfaceSupport) {
+            let symbol = surface_symbol(sup);
             for sn in sup.get("surfaces").as_ref_list() {
-                if let Some((_, poly)) = surface_polys.iter().find(|(no, _)| no == sn) {
-                    for p in poly {
-                        s.supports.push((*p, SupportSymbol::Hinged));
-                    }
+                let Some((_, poly)) = surface_polys.iter().find(|(no, _)| no == sn) else {
+                    continue;
+                };
+                let normal = newell_normal(poly);
+                for pos in inset_edge_points(poly, normal, spacing) {
+                    s.supports.push(SupportGlyph {
+                        pos,
+                        symbol,
+                        dir: normal,
+                    });
                 }
             }
         }
@@ -292,17 +328,79 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
     s
 }
 
-fn support_symbol(sup: &Object) -> SupportSymbol {
-    let rot = [
-        "rotational_restraint_x",
-        "rotational_restraint_y",
-        "rotational_restraint_z",
-    ];
-    if rot.iter().all(|k| is_fixed(f(sup, k))) {
-        SupportSymbol::Fixed
+/// Glyph from translational stiffnesses and the "rotation" ones (rotations for nodes / lines,
+/// shear for surfaces): any finite spring -> spring; all translations fixed -> fixed when the
+/// rest are fixed too, else pinned; some translations free -> roller.
+fn classify(trans: [Option<f64>; 3], rot: &[Option<f64>]) -> SupportSymbol {
+    let spring = |v: &Option<f64>| v.is_some_and(|x| x.is_finite() && x > 0.0);
+    if trans.iter().any(spring) {
+        SupportSymbol::Spring
+    } else if trans.iter().all(|v| is_fixed(*v)) {
+        if rot.iter().all(|v| is_fixed(*v)) {
+            SupportSymbol::Fixed
+        } else {
+            SupportSymbol::Pinned
+        }
     } else {
-        SupportSymbol::Hinged
+        SupportSymbol::Roller
     }
+}
+
+fn nodal_or_line_symbol(sup: &Object) -> SupportSymbol {
+    classify(
+        [f(sup, "spring_x"), f(sup, "spring_y"), f(sup, "spring_z")],
+        &[
+            f(sup, "rotational_restraint_x"),
+            f(sup, "rotational_restraint_y"),
+            f(sup, "rotational_restraint_z"),
+        ],
+    )
+}
+
+fn surface_symbol(sup: &Object) -> SupportSymbol {
+    classify(
+        [
+            f(sup, "translation_x"),
+            f(sup, "translation_y"),
+            f(sup, "translation_z"),
+        ],
+        &[f(sup, "shear_xz"), f(sup, "shear_yz")],
+    )
+}
+
+/// Points along a segment every `spacing` (at least the midpoint); with `ends`, the end
+/// points too. Capped so a fine grid cannot flood the view.
+fn points_along(a: Vec3, b: Vec3, spacing: f32, ends: bool) -> Vec<Vec3> {
+    let len = a.distance(b);
+    let n = ((len / spacing).round() as usize).clamp(1, 400);
+    let range = if ends { 0..=n } else { 1..=n.saturating_sub(1) };
+    let mut v: Vec<Vec3> = range.map(|i| a.lerp(b, i as f32 / n as f32)).collect();
+    if v.is_empty() {
+        v.push(a.lerp(b, 0.5));
+    }
+    v
+}
+
+/// Points along each edge of a surface boundary, every `spacing`, moved one `spacing` into
+/// the surface (in its plane). Skips the edge ends, which the inset would push past the
+/// neighbouring edges; small surfaces get at least the edge midpoints, inset less.
+fn inset_edge_points(poly: &[Vec3], normal: Vec3, spacing: f32) -> Vec<Vec3> {
+    let c = poly.iter().copied().sum::<Vec3>() / poly.len() as f32;
+    let mut out = Vec::new();
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+        let edge = (b - a).normalize_or_zero();
+        let mut inward = normal.cross(edge).normalize_or_zero();
+        if inward.dot(c - a.lerp(b, 0.5)) < 0.0 {
+            inward = -inward;
+        }
+        // Do not inset past the middle of the surface.
+        let depth = spacing.min(a.lerp(b, 0.5).distance(c) * 0.5);
+        for p in points_along(a, b, spacing, false) {
+            out.push(p + inward * depth);
+        }
+    }
+    out
 }
 
 /// Width / height of an equivalent rectangle with the section's A, Iy and Iz
@@ -671,6 +769,33 @@ mod tests {
             .map(|[a, b, c]| (*b - *a).cross(*c - *a).length() * 0.5)
             .sum();
         assert!((area - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn support_classes() {
+        let (inf, free) = (Some(f64::INFINITY), Some(0.0));
+        use SupportSymbol::*;
+        assert_eq!(classify([inf; 3], &[inf; 3]), Fixed);
+        assert_eq!(classify([inf; 3], &[free, free, inf]), Pinned);
+        assert_eq!(classify([free, free, inf], &[free; 3]), Roller);
+        assert_eq!(classify([inf, inf, Some(5e7)], &[inf; 2]), Spring);
+    }
+
+    #[test]
+    fn inset_points_on_a_3m_square() {
+        let sq = [
+            Vec3::ZERO,
+            Vec3::X * 3.0,
+            Vec3::new(3.0, 3.0, 0.0),
+            Vec3::Y * 3.0,
+        ];
+        let pts = inset_edge_points(&sq, Vec3::Z, 1.0);
+        // Two interior points per edge, all strictly inside the square.
+        assert_eq!(pts.len(), 8);
+        assert!(
+            pts.iter()
+                .all(|p| p.x > 0.1 && p.x < 2.9 && p.y > 0.1 && p.y < 2.9)
+        );
     }
 
     #[test]

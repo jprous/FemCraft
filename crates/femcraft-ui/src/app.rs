@@ -117,6 +117,8 @@ impl FemCraftApp {
 
     /// Rebuild the GPU geometry only when the grid, axes, display settings or model changed.
     fn refresh_lines(&mut self) {
+        // Support glyphs along lines / surface edges follow the grid spacing.
+        self.vis.glyph_spacing = self.grid.spacing;
         let key = (
             self.grid.clone(),
             self.show_axes,
@@ -524,19 +526,54 @@ impl FemCraftApp {
             painter.circle_filled(p, 2.5, node);
         }
         let green = rgba(scene::SUPPORT);
-        for (p, symbol) in &self.scene.supports {
-            let Some(p) = to_screen(*p) else { continue };
-            let tri = vec![p, p + egui::vec2(-7.0, 12.0), p + egui::vec2(7.0, 12.0)];
-            match symbol {
+        let stroke = Stroke::new(1.5_f32, green);
+        for g in &self.scene.supports {
+            let Some(p) = to_screen(g.pos) else { continue };
+            let v = |x: f32, y: f32| p + egui::vec2(x, y);
+            match g.symbol {
+                SupportSymbol::Pinned => {
+                    painter.add(egui::Shape::closed_line(
+                        vec![p, v(-7.0, 12.0), v(7.0, 12.0)],
+                        stroke,
+                    ));
+                }
+                SupportSymbol::Roller => {
+                    painter.add(egui::Shape::closed_line(
+                        vec![p, v(-7.0, 11.0), v(7.0, 11.0)],
+                        stroke,
+                    ));
+                    painter.line_segment([v(-9.0, 15.0), v(9.0, 15.0)], stroke);
+                }
                 SupportSymbol::Fixed => {
-                    painter.add(egui::Shape::convex_polygon(tri, green, Stroke::NONE));
-                    painter.line_segment(
-                        [p + egui::vec2(-10.0, 14.0), p + egui::vec2(10.0, 14.0)],
-                        Stroke::new(2.0_f32, green),
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(v(-9.0, 1.0), v(9.0, 8.0)),
+                        0.0,
+                        green,
                     );
                 }
-                SupportSymbol::Hinged => {
-                    painter.add(egui::Shape::closed_line(tri, Stroke::new(1.5_f32, green)));
+                SupportSymbol::Spring => {
+                    // Zig-zag along the restraint direction, hanging away from the structure.
+                    let Some(q) = to_screen(g.pos + g.dir * 0.01) else {
+                        continue;
+                    };
+                    let mut d = (q - p).normalized();
+                    if !d.x.is_finite() || d.length() < 0.5 {
+                        d = egui::vec2(0.0, 1.0);
+                    }
+                    if d.y < 0.0 {
+                        d = -d;
+                    }
+                    let n = egui::vec2(-d.y, d.x);
+                    let (len, amp, zigs) = (18.0, 4.0, 6);
+                    let mut pts = vec![p];
+                    for i in 1..zigs {
+                        let side = if i % 2 == 0 { -amp } else { amp };
+                        pts.push(p + d * (len * i as f32 / zigs as f32) + n * side);
+                    }
+                    let end = p + d * len;
+                    pts.push(end);
+                    painter.add(egui::Shape::line(pts, stroke));
+                    painter.line_segment([end - n * 6.0, end + n * 6.0], stroke);
                 }
             }
         }
