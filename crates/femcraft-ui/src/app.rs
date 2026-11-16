@@ -1,5 +1,6 @@
 //! Main window: menu, settings panel, status bar and the 3D viewport.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ use eframe::egui::{self, Color32, Pos2, Stroke};
 use eframe::egui_wgpu;
 use glam::Vec3;
 
-use femcraft_model::{Model, ObjectKind};
+use femcraft_model::{Model, ObjectId, ObjectKind};
 use femcraft_render::camera::{self, OrbitCamera, Projection, StandardView};
 use femcraft_render::grid::{GridPlane, GridSettings};
 use femcraft_render::viewport::{self, LineVertex, LinesCallback};
@@ -53,6 +54,32 @@ pub struct FemCraftApp {
     scene: Scene,
     open_path: String,
     message: Option<String>,
+
+    /// Selected objects (box selection).
+    selection: HashSet<ObjectId>,
+    /// Box drag in progress: button and start position.
+    drag_box: Option<(egui::PointerButton, Pos2)>,
+}
+
+/// Does the segment `a`-`b` touch the rectangle?
+fn segment_hits_rect(a: Pos2, b: Pos2, r: egui::Rect) -> bool {
+    if r.contains(a) || r.contains(b) {
+        return true;
+    }
+    let corners = [
+        r.left_top(),
+        r.right_top(),
+        r.right_bottom(),
+        r.left_bottom(),
+    ];
+    (0..4).any(|i| segments_cross(a, b, corners[i], corners[(i + 1) % 4]))
+}
+
+fn segments_cross(p1: Pos2, p2: Pos2, q1: Pos2, q2: Pos2) -> bool {
+    let cross = |o: Pos2, a: Pos2, b: Pos2| (a - o).x * (b - o).y - (a - o).y * (b - o).x;
+    let (d1, d2) = (cross(q1, q2, p1), cross(q1, q2, p2));
+    let (d3, d4) = (cross(p1, p2, q1), cross(p1, p2, q2));
+    d1 * d2 < 0.0 && d3 * d4 < 0.0
 }
 
 impl FemCraftApp {
@@ -83,6 +110,8 @@ impl FemCraftApp {
             scene: Scene::default(),
             open_path: String::new(),
             message: None,
+            selection: HashSet::new(),
+            drag_box: None,
         };
         // `femcraft model.rf6 [--lc=N] [--local-axes]` opens the file directly.
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -115,6 +144,7 @@ impl FemCraftApp {
                     model: doc.model,
                 });
                 self.model_version += 1;
+                self.selection.clear();
                 self.message = None;
                 self.open_path = path.display().to_string();
                 self.refresh_lines();
@@ -422,7 +452,15 @@ impl FemCraftApp {
                 ui.checkbox(&mut self.show_axes, "Show global axes");
 
                 ui.separator();
-                ui.weak("Right-drag: rotate\nMiddle-drag: pan\nWheel: zoom");
+                ui.weak(
+                    "Wheel: zoom\n\
+                     Middle-drag: pan\n\
+                     Ctrl + middle-drag: rotate\n\
+                     Double-click middle: zoom to extents\n\
+                     Left-drag: select (→ window, ← crossing)\n\
+                     Left-click empty: clear selection\n\
+                     Right-drag: zoom to window",
+                );
             }
         }
     }
@@ -444,6 +482,17 @@ impl FemCraftApp {
                     self.grid.plane.label(),
                     self.grid.spacing
                 ));
+                if !self.selection.is_empty() {
+                    ui.separator();
+                    let n = |k| self.selection.iter().filter(|id| id.kind == k).count();
+                    ui.label(format!(
+                        "Selected: {} nodes · {} lines · {} members · {} surfaces",
+                        n(ObjectKind::Node),
+                        n(ObjectKind::Line),
+                        n(ObjectKind::Member),
+                        n(ObjectKind::Surface),
+                    ));
+                }
             });
         });
     }
@@ -452,19 +501,59 @@ impl FemCraftApp {
         let rect = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
-        // Navigation
+        // Navigation, as in RFEM: middle-drag pans, Ctrl + middle-drag rotates, double-click
+        // middle zooms to extents, wheel zooms; left-drag selects, right-drag zooms to a window.
+        use egui::PointerButton::{Middle, Primary, Secondary};
         let delta = response.drag_delta();
-        if response.dragged_by(egui::PointerButton::Secondary) {
-            self.camera.orbit(delta.x, delta.y);
+        let (ctrl, pointer_pos) = ui.input(|i| (i.modifiers.ctrl, i.pointer.latest_pos()));
+        if response.dragged_by(Middle) {
+            if ctrl {
+                self.camera.orbit(delta.x, delta.y);
+            } else {
+                self.camera.pan(delta.x, delta.y, rect.height());
+            }
         }
-        if response.dragged_by(egui::PointerButton::Middle) {
-            self.camera.pan(delta.x, delta.y, rect.height());
+        if response.double_clicked_by(Middle) {
+            self.zoom_to_model();
         }
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 self.camera.zoom(scroll);
             }
+        }
+        for button in [Primary, Secondary] {
+            if response.drag_started_by(button)
+                && let Some(p) = response.interact_pointer_pos()
+            {
+                self.drag_box = Some((button, p));
+            }
+        }
+        // A finished box: (button, rectangle, dragged left to right).
+        let mut finished: Option<(egui::PointerButton, egui::Rect, bool)> = None;
+        if let (Some((button, start)), Some(end)) = (self.drag_box, pointer_pos)
+            && response.drag_stopped_by(button)
+        {
+            finished = Some((
+                button,
+                egui::Rect::from_two_pos(start, end),
+                end.x >= start.x,
+            ));
+            self.drag_box = None;
+        }
+        if response.clicked_by(Primary) {
+            self.selection.clear();
+        }
+        let aspect = rect.width() / rect.height().max(1.0);
+        if let Some((Secondary, r, _)) = finished
+            && r.width() > 4.0
+            && r.height() > 4.0
+        {
+            let c = r.center();
+            let ndc_x = (c.x - rect.left()) / rect.width() * 2.0 - 1.0;
+            let ndc_y = 1.0 - (c.y - rect.top()) / rect.height() * 2.0;
+            let fraction = (r.width() / rect.width()).max(r.height() / rect.height());
+            self.camera.zoom_to_window(aspect, ndc_x, ndc_y, fraction);
         }
 
         let painter = ui.painter_at(rect);
@@ -508,6 +597,76 @@ impl FemCraftApp {
         }
 
         self.paint_model_marks(&painter, &to_screen);
+
+        // Box selection: left to right = window (fully inside), right to left = crossing.
+        if let Some((Primary, r, window)) = finished
+            && r.width() > 3.0
+            && r.height() > 3.0
+        {
+            let add = ctrl;
+            if !add {
+                self.selection.clear();
+            }
+            for (id, pts) in &self.scene.pick {
+                let screen: Option<Vec<Pos2>> = pts.iter().map(|p| to_screen(*p)).collect();
+                let Some(screen) = screen else { continue };
+                let hit = if window {
+                    screen.iter().all(|p| r.contains(*p))
+                } else if screen.len() == 1 {
+                    r.contains(screen[0])
+                } else {
+                    let closed = id.kind == ObjectKind::Surface;
+                    let n = screen.len();
+                    let segs = if closed { n } else { n - 1 };
+                    (0..segs).any(|i| segment_hits_rect(screen[i], screen[(i + 1) % n], r))
+                };
+                if hit {
+                    self.selection.insert(*id);
+                }
+            }
+        }
+
+        // Selection highlight.
+        let hl = Stroke::new(3.0_f32, Color32::from_rgb(255, 225, 40));
+        for (id, pts) in &self.scene.pick {
+            if !self.selection.contains(id) {
+                continue;
+            }
+            let screen: Vec<Pos2> = pts.iter().filter_map(|p| to_screen(*p)).collect();
+            match (id.kind, screen.as_slice()) {
+                (_, [p]) => {
+                    painter.circle_stroke(*p, 5.0, hl);
+                }
+                (ObjectKind::Surface, s) if s.len() > 2 => {
+                    painter.add(egui::Shape::closed_line(
+                        s.to_vec(),
+                        Stroke::new(2.0_f32, hl.color),
+                    ));
+                }
+                (_, s) if s.len() > 1 => {
+                    painter.add(egui::Shape::line(s.to_vec(), hl));
+                }
+                _ => {}
+            }
+        }
+
+        // Rectangle being dragged.
+        if let (Some((button, start)), Some(now)) = (self.drag_box, pointer_pos) {
+            let r = egui::Rect::from_two_pos(start, now);
+            let (fill, stroke) = match button {
+                Primary if now.x >= start.x => (
+                    Color32::from_rgba_unmultiplied(80, 140, 255, 40),
+                    Stroke::new(1.0_f32, Color32::from_rgb(110, 160, 255)),
+                ),
+                Primary => (
+                    Color32::from_rgba_unmultiplied(80, 220, 120, 40),
+                    Stroke::new(1.0_f32, Color32::from_rgb(110, 230, 140)),
+                ),
+                _ => (Color32::TRANSPARENT, Stroke::new(1.0_f32, Color32::WHITE)),
+            };
+            painter.rect_filled(r, 0.0, fill);
+            painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Inside);
+        }
 
         // Axis labels at the tips of the global axes (RFEM orientation: Z down)
         if self.show_axes {

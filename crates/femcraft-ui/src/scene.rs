@@ -113,6 +113,9 @@ pub struct Scene {
     pub lines: Vec<LineVertex>,
     pub triangles: Vec<LineVertex>,
     pub nodes: Vec<Vec3>,
+    /// Selectable objects with their world points (node: 1 point, line / member: polyline,
+    /// surface: boundary polygon).
+    pub pick: Vec<(ObjectId, Vec<Vec3>)>,
     pub supports: Vec<SupportGlyph>,
     pub labels: Vec<Label>,
     /// World-space bounding box of the geometry.
@@ -216,6 +219,7 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
             for [a, b, c] in triangulate(poly) {
                 s.tri(a, b, c, col);
             }
+            s.pick.push((ObjectId::new(K::Surface, *no), poly.clone()));
         }
     }
 
@@ -226,6 +230,9 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
                 .iter()
                 .filter_map(|n| node(*n))
                 .collect();
+            if pts.len() >= 2 {
+                s.pick.push((id, pts.clone()));
+            }
             for w in pts.windows(2) {
                 s.line(w[0], w[1], LINE);
             }
@@ -250,6 +257,10 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
             }
             for w in pts.windows(2) {
                 member_box(&mut s, w[0], w[1], b, h, beta);
+            }
+            if pts.len() >= 2 {
+                s.pick
+                    .push((id, pts.iter().map(|p| to_world(*p)).collect()));
             }
         }
     }
@@ -284,6 +295,7 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
         for (id, _) in model.iter_kind(K::Node) {
             if let Some(p) = node(id.no) {
                 s.nodes.push(p);
+                s.pick.push((id, vec![p]));
             }
         }
     }
