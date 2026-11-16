@@ -129,6 +129,20 @@ impl FemCraftApp {
         app
     }
 
+    /// Native "Open" dialog (modal), starting in the folder of the last opened model.
+    fn open_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Open RFEM model")
+            .add_filter("RFEM 6 model", &["rf6"])
+            .add_filter("All files", &["*"]);
+        if let Some(dir) = Path::new(&self.open_path).parent().filter(|d| d.is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.open(&path);
+        }
+    }
+
     /// Opens an `.rf6`; on failure keeps the current model and shows the error.
     fn open(&mut self, path: &Path) {
         match RfDocument::open(path) {
@@ -219,17 +233,9 @@ impl FemCraftApp {
         egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    ui.label("Open .rf6 (path, or drop a file on the window):");
-                    let edit = ui.add(
-                        egui::TextEdit::singleline(&mut self.open_path)
-                            .desired_width(420.0)
-                            .hint_text(r"C:\path\model.rf6"),
-                    );
-                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("Open").clicked() || enter {
-                        let p = PathBuf::from(self.open_path.trim().trim_matches('"'));
-                        self.open(&p);
+                    if ui.button("Open…").clicked() {
                         ui.close();
+                        self.open_dialog();
                     }
                     ui.separator();
                     if ui.button("Exit").clicked() {
