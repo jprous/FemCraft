@@ -125,6 +125,22 @@ impl OrbitCamera {
         self.distance = radius.max(0.1) / (self.fov_y * 0.5).tan() * 1.1;
     }
 
+    /// Zoom into a screen window: its centre (NDC) becomes the view centre, at the depth of the
+    /// current target, and `fraction` (window size / viewport size, the larger of width and
+    /// height ratios) scales the distance.
+    pub fn zoom_to_window(&mut self, aspect: f32, ndc_x: f32, ndc_y: f32, fraction: f32) {
+        let (origin, dir) = self.ray(aspect, ndc_x, ndc_y);
+        let forward = -self.eye_dir();
+        let denom = dir.dot(forward);
+        if denom.abs() > 1e-6 {
+            let t = (self.target - origin).dot(forward) / denom;
+            if t.is_finite() {
+                self.target = origin + dir * t;
+            }
+        }
+        self.distance = (self.distance * fraction.clamp(0.01, 1.0)).max(0.05);
+    }
+
     /// World-space ray through a point given in normalised device coordinates.
     pub fn ray(&self, aspect: f32, ndc_x: f32, ndc_y: f32) -> (Vec3, Vec3) {
         let inv = self.view_proj(aspect).inverse();

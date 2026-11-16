@@ -1132,6 +1132,7 @@ dependencies = [
  "eframe",
  "femcraft-model",
  "femcraft-render",
+ "femcraft-rfdb",
  "glam",
 ]
 

@@ -80,7 +80,7 @@ fn overrides(kind: ObjectKind, key: &str) -> &'static [&'static str] {
         (Node, "coordinate_1") => &["coordinates_x"],
         (Node, "coordinate_2") => &["coordinates_y"],
         (Node, "coordinate_3") => &["coordinates_z"],
-        (Member, "rotation_angle") => &["angle"],
+        (Member | Line, "rotation_angle") => &["angle"],
         (LoadCase, "action_category") => &["actionCategoryId"],
         (LoadCase, "self_weight_factor_x") => &["selfWeightFactors_x"],
         (LoadCase, "self_weight_factor_y") => &["selfWeightFactors_y"],
@@ -209,6 +209,9 @@ pub fn part_column(kind: ObjectKind, key: &str) -> Option<Part> {
             via: Some("loadParameters_id"),
         },
         (FreePolygonLoad, "magnitude") => p("{impl}_loadMagnitudeParameters", "magnitude"),
+        // Surface local axes (owner = surface impl).
+        (Surface, "axes_rotation") => p("SurfaceAxes", "inputAxesAngularRotation"),
+        (Surface, "axes_z_reversed") => p("SurfaceAxes", "reversedLocalAxisZ"),
         // Surface stiffness row (owner = surface impl) holds the thickness.
         (Surface, "thickness") => p("SurfaceStiffnessStandard", "thickness_id"),
         _ => return None,
