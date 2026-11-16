@@ -61,10 +61,13 @@ Plan and milestone status: `docs/ROADMAP.md`.
   Surface thickness via `SurfaceStiffnessStandard.thickness_id`; surface load magnitude via
   `loadParameters_id` -> `<Impl>_NodeAndMagnitudeParameters_loadParameters`; member / surface
   support springs are `springConstant_N` on the impl row.
-- Verified models (local only): `Prokon Model1.rf6` (frame) and `Al Qou_Rev6.rf6` (reservoir:
-  surfaces, thicknesses, member supports, nodal / line / surface / free loads). Not yet seen:
-  solids, solid loads, free concentrated / line loads, imposed deformations, nodal load
-  components.
+- Surface stiffness type from `SurfaceSpecificImplPart.stiffness_table`
+  (`SurfaceStiffnessWithoutThickness` -> `TYPE_WITHOUT_THICKNESS`, no thickness).
+- Verified models (local only): `Prokon Model1.rf6` (frame), `Al Qou_Rev6.rf6` (reservoir:
+  surfaces, thicknesses, member supports, nodal / line / surface / free loads),
+  `Solids_check_RBeam.rf6` (solids). Not yet seen: solid loads, free concentrated / line
+  loads, imposed deformations, nodal load components.
+- **RFEM opens FemCraft-edited files** (impl column and part table edits confirmed in RFEM).
 - Solver data and results are under `!solver/` in the ZIP (`Data.RFemX`, `RN_*` folders).
 - Saving strategy: start from a database RFEM saved, change only edited rows, keep all
   unknown tables and sidecars byte-identical.

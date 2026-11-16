@@ -179,6 +179,7 @@ static MEMBER: &[FieldSpec] = &[
 
 /// Material comes from the thickness.
 static SURFACE: &[FieldSpec] = &[
+    f("type", "Stiffness type", Enum),
     f("geometry", "Geometry", Enum),
     f("boundary_lines", "Boundary lines", RefList(K::Line)),
     f("thickness", "Thickness", Ref(K::Thickness)),
@@ -193,7 +194,6 @@ static SOLID: &[FieldSpec] = &[
         RefList(K::Surface),
     ),
     f("material", "Material", Ref(K::Material)),
-    f("volume", "Volume", Float("m³")),
     COMMENT,
 ];
 

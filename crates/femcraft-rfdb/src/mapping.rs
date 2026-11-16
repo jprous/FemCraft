@@ -195,6 +195,9 @@ pub enum Derived {
     /// `MaterialImpl_materialDataVector[0]` -> `MaterialData.properties_id` ->
     /// `MaterialProperties_propertiesMap[key]` -> referenced row `valueSI`.
     MaterialProperty(&'static str),
+    /// `SurfaceSpecificImplPart.stiffness_table` (owner = surface impl), e.g.
+    /// `SurfaceStiffnessWithoutThickness` -> `TYPE_WITHOUT_THICKNESS`.
+    SurfaceStiffness,
 }
 
 pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
@@ -208,6 +211,7 @@ pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
         // Library steel uses A_v_*, parametric sections A_y / A_z.
         (Section, "A_y") => SectionParameter(&["A_v_y", "A_y"]),
         (Section, "A_z") => SectionParameter(&["A_v_z", "A_z"]),
+        (Surface, "type") => SurfaceStiffness,
         (Material, "elasticity_modulus") => MaterialProperty("E"),
         (Material, "shear_modulus") => MaterialProperty("G"),
         (Material, "poisson_ratio") => MaterialProperty("nu"),

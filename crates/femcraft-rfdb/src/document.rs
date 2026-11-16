@@ -230,7 +230,11 @@ impl Cache {
 /// `MemberImplBeam` -> `TYPE_BEAM`; `LineTypeLoadImplForce` with prefix `LOAD_TYPE` ->
 /// `LOAD_TYPE_FORCE`. `None` when the impl table name carries no type (`MaterialImpl`).
 fn type_from_impl(prefix: &str, impl_table: &str) -> Option<String> {
-    let rest = &impl_table[impl_table.rfind("Impl")? + 4..];
+    upper_snake(prefix, &impl_table[impl_table.rfind("Impl")? + 4..])
+}
+
+/// `("TYPE", "WithoutThickness")` -> `TYPE_WITHOUT_THICKNESS`; `None` for an empty name.
+fn upper_snake(prefix: &str, rest: &str) -> Option<String> {
     if rest.is_empty() {
         return None;
     }
@@ -386,6 +390,21 @@ fn derived_value(
                 }
             }
             Ok(None)
+        }
+        Derived::SurfaceStiffness => {
+            let Some((_, _, Sql::Text(t))) = part_value(
+                conn,
+                cat,
+                "SurfaceSpecificImplPart",
+                "stiffness_table",
+                impl_name,
+                impl_id,
+            )?
+            else {
+                return Ok(None);
+            };
+            let rest = t.strip_prefix("SurfaceStiffness").unwrap_or(&t);
+            Ok(upper_snake("TYPE", rest).map(Sql::Text))
         }
         Derived::MaterialProperty(key) => {
             let vector = format!("{impl_name}_materialDataVector");

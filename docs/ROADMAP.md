@@ -73,8 +73,13 @@ interface on top of a working file layer rather than ahead of it.
    `model.db`; edits to impl and part columns reload correctly.
    A second model (reservoir) confirmed thicknesses, surfaces, member supports and nodal, line,
    surface, free rectangular and free polygon loads.
-   Next: solids, solid loads, free concentrated / line loads and imposed deformations; then
-   confirm RFEM opens an edited file (M2).
+   A third model confirmed solids (boundary surfaces, material) and surfaces without
+   thickness. Still unseen: solid loads, free concentrated / line loads, imposed deformations.
+
+**M2 early result (2026-11): RFEM 6.16 opened FemCraft-edited files cleanly** - a node
+coordinate (impl column) and a surface load magnitude (part table) - with the new values.
+The approach of editing rows in place is viable; next are list edits and adding / deleting
+objects.
 6. Goal: open a real model and show nodes, lines, members and surfaces in the viewport, with a
    read-only navigator tree and tables.
 
