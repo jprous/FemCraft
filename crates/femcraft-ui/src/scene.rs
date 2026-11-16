@@ -21,6 +21,18 @@ pub const SURFACE_LOAD: [f32; 4] = [0.98, 0.86, 0.30, 1.0];
 const SURFACE_LOAD_FILL: [f32; 4] = [0.98, 0.86, 0.30, 0.18];
 const SUPPORT_FILL: [f32; 4] = [0.35, 0.85, 0.40, 0.20];
 const SUPPORT_EDGE: [f32; 4] = [0.35, 0.85, 0.40, 0.70];
+/// Supports with a gap or other nonlinearity (baby blue).
+pub const NONLINEAR_SUPPORT: [f32; 4] = [0.54, 0.81, 0.94, 1.0];
+const NONLINEAR_FILL: [f32; 4] = [0.54, 0.81, 0.94, 0.22];
+const NONLINEAR_EDGE: [f32; 4] = [0.54, 0.81, 0.94, 0.75];
+const NL_KEYS: &[&str] = &[
+    "nonlinearity_x",
+    "nonlinearity_y",
+    "nonlinearity_z",
+    "nonlinearity_rx",
+    "nonlinearity_ry",
+    "nonlinearity_rz",
+];
 const AXIS_X: [f32; 4] = [0.95, 0.30, 0.30, 1.0];
 const AXIS_Y: [f32; 4] = [0.35, 0.85, 0.35, 1.0];
 const AXIS_Z: [f32; 4] = [0.35, 0.60, 1.0, 1.0];
@@ -101,6 +113,8 @@ pub struct SupportGlyph {
     pub pos: Vec3,
     pub symbol: SupportSymbol,
     pub dir: Vec3,
+    /// A gap or other nonlinearity is defined: drawn in baby blue.
+    pub nonlinear: bool,
 }
 
 /// A text label anchored at a world point.
@@ -310,18 +324,22 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
         let global_z = dir_world(Vec3::Z);
         for (_, sup) in model.iter_kind(K::NodalSupport) {
             let symbol = nodal_or_line_symbol(sup);
+            let nonlinear = is_nonlinear(sup, NL_KEYS);
             for n in sup.get("nodes").as_ref_list() {
                 if let Some(pos) = node(*n) {
                     s.supports.push(SupportGlyph {
                         pos,
                         symbol,
                         dir: global_z,
+                        nonlinear,
                     });
                 }
             }
         }
         for (_, sup) in model.iter_kind(K::LineSupport) {
             let symbol = nodal_or_line_symbol(sup);
+            let nonlinear = is_nonlinear(sup, NL_KEYS);
+            let (fill, edge) = support_colors(nonlinear);
             for l in sup.get("lines").as_ref_list() {
                 let pts: Vec<Vec3> = model
                     .line_nodes(*l)
@@ -341,14 +359,15 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
                         w[0],
                         w[1],
                         side.normalize_or_zero() * support_depth,
-                        SUPPORT_FILL,
-                        SUPPORT_EDGE,
+                        fill,
+                        edge,
                     );
                     for pos in points_along(w[0], w[1], spacing, true) {
                         s.supports.push(SupportGlyph {
                             pos,
                             symbol,
                             dir: global_z,
+                            nonlinear,
                         });
                     }
                 }
@@ -358,6 +377,8 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
         // spacing inside the surface.
         for (_, sup) in model.iter_kind(K::SurfaceSupport) {
             let symbol = surface_symbol(sup);
+            let nonlinear = is_nonlinear(sup, &["nonlinearity"]);
+            let (fill, edge) = support_colors(nonlinear);
             for sn in sup.get("surfaces").as_ref_list() {
                 let Some((_, poly)) = surface_polys.iter().find(|(no, _)| no == sn) else {
                     continue;
@@ -366,18 +387,13 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
                 // Support side: the surface's positive local z (below a slab).
                 let srf = model.get(ObjectId::new(K::Surface, *sn));
                 let (_, _, z) = surface_axes(poly, srf);
-                prism(
-                    &mut s,
-                    poly,
-                    dir_world(z) * support_depth,
-                    SUPPORT_FILL,
-                    SUPPORT_EDGE,
-                );
+                prism(&mut s, poly, dir_world(z) * support_depth, fill, edge);
                 for pos in inset_edge_points(poly, normal, spacing) {
                     s.supports.push(SupportGlyph {
                         pos,
                         symbol,
                         dir: normal,
+                        nonlinear,
                     });
                 }
             }
@@ -416,6 +432,21 @@ fn classify(trans: [Option<f64>; 3], rot: &[Option<f64>]) -> SupportSymbol {
         }
     } else {
         SupportSymbol::Roller
+    }
+}
+
+/// Any nonlinearity code other than 0 (linear) among keys.
+fn is_nonlinear(sup: &Object, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|k| sup.get(k).as_i64().is_some_and(|v| v != 0))
+}
+
+/// Volume fill and edge colours for a support.
+fn support_colors(nonlinear: bool) -> ([f32; 4], [f32; 4]) {
+    if nonlinear {
+        (NONLINEAR_FILL, NONLINEAR_EDGE)
+    } else {
+        (SUPPORT_FILL, SUPPORT_EDGE)
     }
 }
 

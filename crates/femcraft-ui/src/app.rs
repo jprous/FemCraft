@@ -700,10 +700,15 @@ impl FemCraftApp {
         for p in self.scene.nodes.iter().filter_map(|p| to_screen(*p)) {
             painter.circle_filled(p, 2.5, node);
         }
-        let green = rgba(scene::SUPPORT);
-        let stroke = Stroke::new(1.5_f32, green);
         for g in &self.scene.supports {
             let Some(p) = to_screen(g.pos) else { continue };
+            // Baby blue when a gap / nonlinearity is defined.
+            let green = rgba(if g.nonlinear {
+                scene::NONLINEAR_SUPPORT
+            } else {
+                scene::SUPPORT
+            });
+            let stroke = Stroke::new(1.5_f32, green);
             let v = |x: f32, y: f32| p + egui::vec2(x, y);
             match g.symbol {
                 SupportSymbol::Pinned => {
