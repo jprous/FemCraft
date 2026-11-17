@@ -3,8 +3,8 @@
 //! (hidden) and reopened from the ribbon / View menu.
 //!
 //! Each open model is a `Document` pane titled with its file name. New models open as tabs next
-//! to the active model, or next to the `Start` pane, which marks the model space: it shows a
-//! welcome page while no model is open and is hidden otherwise.
+//! to the active model, or next to the `Start` tab, which marks the model space and stays there
+//! (welcome page with Open and recent files).
 //!
 //! Default arrangement: Display left, Navigator right, Tables below the model space.
 //! (`egui_tiles` has no floating windows; `egui_dock` could add those once it supports the
@@ -109,7 +109,7 @@ pub fn focus(tree: &mut Tree<Pane>, pane: Pane) {
 }
 
 /// Adds a model tab next to `beside` (the active model) if it is still there, else next to the
-/// Start pane, and shows it. The Start pane is hidden while models are open.
+/// Start tab, and brings it to the front.
 pub fn add_document(tree: &mut Tree<Pane>, doc: u64, beside: Option<u64>) {
     let anchor = beside
         .and_then(|b| tree.tiles.find_pane(&Pane::Document(b)))
@@ -128,13 +128,10 @@ pub fn add_document(tree: &mut Tree<Pane>, doc: u64, beside: Option<u64>) {
             }
         }
     }
-    if let Some(start) = tree.tiles.find_pane(&Pane::Start) {
-        tree.tiles.set_visible(start, false);
-    }
     focus(tree, Pane::Document(doc));
 }
 
-/// Removes a model tab; shows the Start pane again when no model is left.
+/// Removes a model tab; brings the Start tab to the front when no model is left.
 pub fn remove_document(tree: &mut Tree<Pane>, doc: u64) {
     if let Some(tile) = tree.tiles.find_pane(&Pane::Document(doc)) {
         tree.remove_recursively(tile);
@@ -143,14 +140,12 @@ pub fn remove_document(tree: &mut Tree<Pane>, doc: u64) {
         .tiles
         .iter()
         .any(|(_, t)| matches!(t, Tile::Pane(Pane::Document(_))));
-    if !any_left && let Some(start) = tree.tiles.find_pane(&Pane::Start) {
-        tree.tiles.set_visible(start, true);
-        focus(tree, Pane::Start);
+    if !any_left {
+        set_open(tree, Pane::Start, true);
     }
 }
 
-/// The layout to save: model tabs removed (models are not reopened automatically) and the
-/// Start pane visible again.
+/// The layout to save: model tabs removed (models are not reopened automatically).
 pub fn for_saving(tree: &Tree<Pane>) -> Tree<Pane> {
     let mut tree = tree.clone();
     let docs: Vec<u64> = tree
@@ -200,7 +195,7 @@ mod tests {
         add_document(&mut tree, 1, None);
         add_document(&mut tree, 2, Some(1));
         assert_eq!(docs(&tree), 2);
-        assert!(!is_open(&tree, Pane::Start));
+        assert!(is_open(&tree, Pane::Start), "the Start tab stays");
         for d in [1, 2] {
             let t = tree.tiles.find_pane(&Pane::Document(d)).unwrap();
             assert_eq!(
@@ -212,7 +207,6 @@ mod tests {
 
         remove_document(&mut tree, 1);
         assert_eq!(docs(&tree), 1);
-        assert!(!is_open(&tree, Pane::Start));
         remove_document(&mut tree, 2);
         assert_eq!(docs(&tree), 0);
         assert!(is_open(&tree, Pane::Start));

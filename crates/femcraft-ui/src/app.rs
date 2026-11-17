@@ -45,6 +45,10 @@ pub struct FemCraftApp {
     next_doc_id: u64,
     /// Models whose tab was closed this frame (removed after the layout is drawn).
     closed: Vec<u64>,
+    /// True while the layout draws: it is taken out of `self.tree` then, so layout changes
+    /// (opening a model from a pane, e.g. the Start page) are queued in `to_open`.
+    drawing_layout: bool,
+    to_open: Vec<PathBuf>,
 
     /// Recently opened models, most recent first (saved between sessions).
     recent: Vec<PathBuf>,
@@ -75,6 +79,8 @@ impl FemCraftApp {
             active: None,
             next_doc_id: 1,
             closed: Vec::new(),
+            drawing_layout: false,
+            to_open: Vec::new(),
             recent: Vec::new(),
             ribbon_minimized: false,
             message: None,
@@ -145,6 +151,10 @@ impl FemCraftApp {
 
     /// Opens an `.rf6` in a new tab, or switches to it if it is already open.
     fn open(&mut self, path: &Path) {
+        if self.drawing_layout {
+            self.to_open.push(path.to_owned());
+            return;
+        }
         let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
         if let Some(id) = self
             .docs
@@ -498,8 +508,14 @@ impl FemCraftApp {
     fn docks(&mut self, ui: &mut egui::Ui) {
         // The tree is taken out while it draws, so panes can borrow the rest of the app.
         let mut tree = std::mem::replace(&mut self.tree, dock::default_tree());
+        self.drawing_layout = true;
         tree.ui(&mut TileBehavior { app: self }, ui);
+        self.drawing_layout = false;
         self.tree = tree;
+        // Models opened from a pane (Start page) while the layout was drawing.
+        for path in std::mem::take(&mut self.to_open) {
+            self.open(&path);
+        }
         // Model tabs closed with their ×: egui_tiles removed the tile, drop the model.
         for id in std::mem::take(&mut self.closed) {
             self.close(id);
