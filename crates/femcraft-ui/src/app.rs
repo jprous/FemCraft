@@ -937,6 +937,15 @@ impl FemCraftApp {
             ui.checkbox(&mut v.loads, "Loads");
             ui.checkbox(&mut v.local_axes, "Local axes");
             ui.end_row();
+            let has_mesh = d.fe_mesh.is_some() && !d.rf.model.is_modified();
+            ui.add_enabled(has_mesh, egui::Checkbox::new(&mut v.fe_mesh, "Mesh"))
+                .on_hover_text("FE mesh saved by RFEM")
+                .on_disabled_hover_text(if d.fe_mesh.is_some() {
+                    "The mesh no longer matches the edited model; mesh it again in RFEM"
+                } else {
+                    "No mesh in this file; mesh or calculate the model in RFEM"
+                });
+            ui.end_row();
             ui.add_enabled(
                 v.loads,
                 egui::Checkbox::new(&mut v.load_values, "Load values"),

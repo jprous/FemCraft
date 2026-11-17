@@ -242,6 +242,9 @@ pub enum Derived {
     /// `MaterialImpl_materialDataVector[0]` -> `MaterialData.properties_id` ->
     /// `MaterialProperties_propertiesMap[key]` -> referenced row `valueSI`.
     MaterialProperty(&'static str),
+    /// Impl `librarySection_id` -> `ParametricSection.parametrizationShape`, as RFEM's
+    /// API enum (see [`parametric_shape`]); other codes stay integers.
+    SectionShape,
     /// `SurfaceSpecificImplPart.stiffness_table` (owner = surface impl), e.g.
     /// `SurfaceStiffnessWithoutThickness` -> `TYPE_WITHOUT_THICKNESS`.
     SurfaceStiffness,
@@ -251,6 +254,10 @@ pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
     use Derived::*;
     use ObjectKind::*;
     Some(match (kind, key) {
+        (Section, "parametrization_type") => SectionShape,
+        (Section, "b") => SectionParameter(&["b"]),
+        (Section, "h") => SectionParameter(&["h"]),
+        (Section, "d") => SectionParameter(&["d", "D"]),
         (Section, "A") => SectionParameter(&["A"]),
         (Section, "I_y") => SectionParameter(&["I_y"]),
         (Section, "I_z") => SectionParameter(&["I_z"]),
@@ -265,6 +272,20 @@ pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
         (Material, "specific_weight") => MaterialProperty("gamma"),
         (Material, "mass_density") => MaterialProperty("rho"),
         (Material, "thermal_expansion_coefficient") => MaterialProperty("alpha"),
+        _ => return None,
+    })
+}
+
+/// `ParametricSection.parametrizationShape` codes confirmed on RFEM 6.16 (sections created by
+/// API I name `R_M1 0.3/0.6`, `SQ_M1 0.4`, `CIRCLE_M1 0.4`; dimensions in m) -> API I's
+/// `parametrization_type`. Massive (concrete) shapes; `seriesId` 1684 / 2006 / 1686.
+pub fn parametric_shape(code: i64) -> Option<&'static str> {
+    Some(match code {
+        49 => "PARAMETRIC_MASSIVE_I__MASSIVE_RECTANGLE__R_M1",
+        154 => "PARAMETRIC_MASSIVE_I__MASSIVE_SQUARE__SQ_M1",
+        53 => "PARAMETRIC_MASSIVE_I__MASSIVE_CIRCLE__CIRCLE_M1",
+        // Inferred: TYPE_PARAMETRIC_BARS with only `d` (rebar-like bar in the pit models).
+        188 => "PARAMETRIC_BARS__ROUND_BAR__ROUND",
         _ => return None,
     })
 }

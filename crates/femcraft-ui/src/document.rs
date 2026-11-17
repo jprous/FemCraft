@@ -32,6 +32,8 @@ pub struct Document {
     pub path: PathBuf,
     /// The file as loaded (model plus how it maps to the database), kept for saving.
     pub rf: RfDocument,
+    /// FE mesh RFEM saved in the file (shown until the model is edited).
+    pub fe_mesh: Option<femcraft_rfdb::FeMesh>,
     /// Bumped on every edit, so the 3D view is rebuilt.
     pub revision: u64,
     pub load_cases: Vec<(u32, String)>,
@@ -57,6 +59,11 @@ impl Document {
     pub fn open(id: u64, path: &Path) -> Result<Self, String> {
         let doc = RfDocument::open(path).map_err(|e| e.to_string())?;
         let load_cases = scene::load_cases(&doc.model);
+        let mut warnings = doc.report.warnings.clone();
+        let fe_mesh = doc.fe_mesh().unwrap_or_else(|e| {
+            warnings.push(format!("FE mesh not read: {e}"));
+            None
+        });
         let vis = Visibility {
             load_case: scene::first_loaded_case(&doc.model)
                 .or(load_cases.first().map(|(n, _)| *n))
@@ -67,8 +74,9 @@ impl Document {
             id,
             path: path.to_owned(),
             load_cases,
-            warnings: doc.report.warnings.clone(),
+            warnings,
             rf: doc,
+            fe_mesh,
             revision: 0,
             vis,
             scene: Scene::default(),
@@ -102,6 +110,10 @@ impl Document {
 
     /// Writes the model (with its edits) to `path` as `.rf6`; the document then refers to it.
     pub fn save_as(&mut self, path: &Path) -> Result<(), String> {
+        if self.rf.model.is_modified() {
+            // Saving an edited model drops RFEM's mesh (see `RfDocument::save`).
+            self.fe_mesh = None;
+        }
         self.rf.save(path).map_err(|e| e.to_string())?;
         self.path = path.to_owned();
         Ok(())
@@ -130,6 +142,11 @@ impl Document {
             return;
         }
         self.scene = scene::build(&self.rf.model, &self.vis);
+        if let Some(mesh) = &self.fe_mesh {
+            if self.vis.fe_mesh && !self.rf.model.is_modified() {
+                scene::add_fe_mesh(&mut self.scene, mesh);
+            }
+        }
 
         let mut v = Vec::new();
         if grid.visible {

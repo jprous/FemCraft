@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use femcraft_model::{FieldType, ObjectId, ObjectKind as K, Value};
-use femcraft_rfdb::RfDocument;
+use femcraft_rfdb::{Library, LibraryFilter, LibraryItem, LibraryKind, RfDocument};
 use serde_json::{Map, Value as Json, json};
 
 /// One open model as listed by `get_model_list`.
@@ -58,6 +58,7 @@ pub const KINDS: &[(K, &str, &str)] = &[
     (K::LoadCase, "load_case", "E_OBJECT_TYPE_LOAD_CASE"),
     (K::NodalLoad, "nodal_load", "E_OBJECT_TYPE_NODAL_LOAD"),
     (K::LineLoad, "line_load", "E_OBJECT_TYPE_LINE_LOAD"),
+    (K::MemberLoad, "member_load", "E_OBJECT_TYPE_MEMBER_LOAD"),
     (K::SurfaceLoad, "surface_load", "E_OBJECT_TYPE_SURFACE_LOAD"),
 ];
 
@@ -152,6 +153,45 @@ pub fn methods() -> Vec<MethodInfo> {
             name: "get_model_list".into(),
             description: "Open models: name, path, active, modified.".into(),
             schema: obj(json!({}), &[]),
+            changes_model: false,
+        },
+        MethodInfo {
+            name: "get_mesh".into(),
+            description: "FE mesh RFEM saved in the active model's file (after meshing or                 calculating in RFEM): node / element counts, elements per surface and the FE                 node chain along each line. full = true adds nodes ([x, y, z] in m, FE node n                 at index n - 1) and elements (4 FE node numbers, 4th = 3rd or 0 for a                 triangle, with their surface). stale = true once the model has been edited                 (saving then drops the mesh)."
+                .into(),
+            schema: obj(json!({"full": {"type": "boolean"}}), &[]),
+            changes_model: false,
+        },
+        MethodInfo {
+            name: "get_library_items".into(),
+            description: "Lists FemCraft's material or section library (Eurocode and South \
+                African items extracted from RFEM 6): RFEM name, standard, manufacturer, \
+                region (EU / ZA), family (IPE, UB, CHS, C, S, ...), category (materials: \
+                concrete, reinforcement, steel_hot_rolled, steel_cold_formed; sections: \
+                hot_rolled, cold_formed) and RFEM library id."
+                .into(),
+            schema: obj(
+                json!({"kind": {"type": "string", "enum": ["material", "section"]},
+                       "search": {"type": "string", "description": "part of the name"},
+                       "region": {"type": "string", "enum": ["EU", "ZA"]},
+                       "family": {"type": "string"},
+                       "category": {"type": "string"},
+                       "limit": {"type": "integer", "description": "default 100, 0 = all"}}),
+                &["kind"],
+            ),
+            changes_model: false,
+        },
+        MethodInfo {
+            name: "get_library_item".into(),
+            description: "One library material or section with all its RFEM property values \
+                (SI units; f_y / f_u per thickness range). name: RFEM's full name, or a \
+                designation such as 'IPE 200' when only one item has it."
+                .into(),
+            schema: obj(
+                json!({"kind": {"type": "string", "enum": ["material", "section"]},
+                       "name": {"type": "string"}}),
+                &["kind", "name"],
+            ),
             changes_model: false,
         },
     ];
@@ -253,6 +293,38 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
                 })
                 .collect();
             return Ok(json!(list));
+        }
+        "get_library_items" | "get_library_item" => return library_call(name, args),
+        "get_mesh" => {
+            let doc = ws.active().ok_or("no model is open")?;
+            let Some(mesh) = doc.fe_mesh().map_err(|e| e.to_string())? else {
+                return Ok(json!({"mesh": false,
+                    "note": "the file holds no FE mesh; mesh or calculate it in RFEM"}));
+            };
+            let mut per_surface = std::collections::BTreeMap::<u32, usize>::new();
+            for &s in &mesh.element_surface {
+                *per_surface.entry(s).or_default() += 1;
+            }
+            let mut out = json!({
+                "mesh": true,
+                "stale": doc.model.is_modified(),
+                "node_count": mesh.nodes.len(),
+                "element_count": mesh.elements.len(),
+                "elements_per_surface": per_surface.iter()
+                    .map(|(s, n)| json!({"surface": s, "elements": n})).collect::<Vec<_>>(),
+                "lines": mesh.lines.iter()
+                    .map(|(l, n)| json!({"line": l, "fe_nodes": n})).collect::<Vec<_>>(),
+            });
+            if args.get("full").and_then(Json::as_bool).unwrap_or(false) {
+                out["nodes"] = json!(mesh.nodes);
+                out["elements"] = mesh
+                    .elements
+                    .iter()
+                    .zip(&mesh.element_surface)
+                    .map(|(e, s)| json!({"nodes": e, "surface": s}))
+                    .collect();
+            }
+            return Ok(out);
         }
         _ => {}
     }
@@ -357,6 +429,76 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
         }
         _ => Err(format!("unknown method '{name}'")),
     }
+}
+
+/// `get_library_items` / `get_library_item` (see [`femcraft_rfdb::library`]).
+fn library_call(name: &str, args: &Map<String, Json>) -> Result<Json, String> {
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    let kind = LibraryKind::parse(&text("kind"))
+        .ok_or_else(|| format!("{name} needs 'kind': \"material\" or \"section\""))?;
+    let dirs = Library::default_dirs();
+    let lib = Library::find(&dirs).ok_or_else(|| {
+        let list: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        format!(
+            "no FemCraft library found (materials.db / sections.db in {}); build it with \
+             tools/rfem_library_extract.py",
+            list.join(", ")
+        )
+    })?;
+    let item_json = |i: &LibraryItem| {
+        json!({"name": i.name, "designation": i.designation, "standard": i.standard,
+               "manufacturer": i.manufacturer, "region": i.region, "family": i.family,
+               "category": i.category, "rfem_library_id": i.rfem_library_id})
+    };
+    if name == "get_library_items" {
+        let filter = LibraryFilter {
+            text: text("search"),
+            region: text("region"),
+            family: text("family"),
+            category: text("category"),
+            limit: args.get("limit").and_then(Json::as_u64).unwrap_or(100) as usize,
+        };
+        let items = lib.list(kind, &filter).map_err(|e| e.to_string())?;
+        return Ok(json!({"count": items.len(),
+                         "items": items.iter().map(item_json).collect::<Vec<_>>()}));
+    }
+    let wanted = text("name");
+    let item = lib
+        .get(kind, &wanted)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no library {} named '{wanted}'", kind.name()))?;
+    let mut values = Map::new();
+    for v in lib.values(&item).map_err(|e| e.to_string())? {
+        let val = match (v.value_si, &v.value_text) {
+            (Some(x), _) => json!(x),
+            (None, Some(t)) => json!(t),
+            _ => Json::Null,
+        };
+        let val = match v.thickness_si {
+            Some(t) => json!({"up_to_thickness": t, "value": val}),
+            None => val,
+        };
+        match values.get_mut(&v.key) {
+            // Thickness ranges: a list in RFEM's order.
+            Some(Json::Array(a)) => a.push(val),
+            Some(_) => {}
+            None if v.thickness_si.is_some() => {
+                values.insert(v.key, json!([val]));
+            }
+            None => {
+                values.insert(v.key, val);
+            }
+        }
+    }
+    let mut out = item_json(&item);
+    out["rfem_version"] = json!(item.rfem_version);
+    out["values"] = Json::Object(values);
+    Ok(out)
 }
 
 fn active(ws: &mut dyn Workspace) -> Result<&mut RfDocument, String> {

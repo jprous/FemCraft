@@ -4,3 +4,9 @@
 /testdata/private/
 *.rf6
 *.rfc
+
+# RFEM's own (encrypted) library databases and FemCraft libraries extracted from RFEM
+/databases/
+/library/
+*.db
+__pycache__/

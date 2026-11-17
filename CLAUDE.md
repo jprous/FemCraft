@@ -38,6 +38,35 @@ Plan and milestone status: `docs/ROADMAP.md`.
   New objects of a kind the model lacks need a prototype file holding one (line loads: e.g.
   `Al Qou_Rev6.rf6`); supports are assigned to the template's predefined ones (Hinged, Rigid).
   `tests/build_models.rs` builds a portal frame + RC pit over JSON-RPC.
+- Libraries (`femcraft-rfdb/src/library.rs`): RFEM's `material_database.db` etc. are encrypted
+  and API I cannot list them, so `tools/rfem_library_extract.py materials|sections OUT [--names
+  FILE]` creates items by name in a scratch RFEM model (via `tools/rfem_soap.py`, RFEM API on
+  8081) and keeps exact-name hits only (RFEM matches loosely). `OUT/<kind>.db` = that model's
+  `model.db` (RFEM layout; library link `MaterialImpl.databaseMaterialId` /
+  `DatabaseSection.databaseSectionId`) + index tables `femcraft_library`,
+  `femcraft_library_value`. Looked up in `FEMCRAFT_LIBRARY`, `%APPDATA%\FemCraft\data\library`,
+  `library/` next to the exe. MCP: `get_library_items`, `get_library_item`. Not yet: cloning a
+  library item into a model (`build::capture` must also follow `librarySection_*`). RFEM 6.16 has
+  no SANS concrete / reinforcement; SA sections are manufacturer `Macsteel`; SA steel is
+  `S355JR | SANS 50025-2`. API I deletes with `delete_object(type, no)`; a rejected
+  `set_material` still leaves a user-defined object behind. The translator files map
+  deprecated -> new RFEM library ids (tab separated).
+- Section names come from a Prokon `Sections.dat` export (`tools/prokon_sections.py`; `--prokon`
+  on the extractor): South Africa -> Macsteel catalogue with per-family suffixes
+  (`prokon_sections.SUFFIX`), Europe -> ArcelorMittal EN 10365, else the bare designation
+  (RFEM picks a manufacturer) accepted only if the area is within 3 % of Prokon's. Prokon's SA
+  concrete rectangles / squares / circles become `R_M1` / `SQ_M1` / `CIRCLE_M1` items (category
+  `concrete`). Left out: structural tees, timber, solid steel, custom sections. A rejected
+  section leaves an object RFEM will not delete: its number is reused.
+- RFEM's API `save` returns before the file is written (closing then loses it) and RFEM does not
+  write into `%APPDATA%`: the extractor saves to `Documents\FemCraft\library` (`--rf6-dir`),
+  waits for the file, then builds the `.db`. `--replay LOG` re-tries only names a log found;
+  `--from-rf6` builds `materials.db` from a model saved by hand.
+- Concrete sections are parametric, not library: `SectionImplParametricMassive` ->
+  `ParametricSection.parametrizationShape` 49 = `R_M1` rectangle, 154 = `SQ_M1` square,
+  53 = `CIRCLE_M1` circle (`mapping::parametric_shape`); dimensions `b` / `h` / `d` in
+  `SectionData_parameterValues`. API I names them in metres: `R_M1 0.3/0.6`, `SQ_M1 0.4`,
+  `CIRCLE_M1 0.4`. Section fields `parametrization_type`, `b`, `h`, `d` are read-only.
 - `crates/femcraft-aster`, `-results` placeholders.
 - egui / eframe 0.37 (panels are `egui::Panel`, `App::ui` instead of `update`).
 - CI: `.github/workflows/ci.yml` (Windows build + test).
@@ -102,6 +131,12 @@ Plan and milestone status: `docs/ROADMAP.md`.
 - New models: `build.rs` (template purge + prototype cloning, foreign-key cleanup) and
   `rf6-build <out-dir> <template.rf6> [donor.rf6 ...]` (portal frame + pit test models).
 - Solver data and results are under `!solver/` in the ZIP (`Data.RFemX`, `RN_*` folders).
+- FE mesh (after meshing / calculating in RFEM) only in `!solver/M/`: `Data.XYZ` (3 x f64 per
+  FE node), `Data.E2D` (4 x i32 per 2D element), `Data.GET` (surface no per element),
+  `Data.LIN` (text, FE nodes along each line); read by `femcraft-rfdb/src/mesh.rs`
+  (`RfDocument::fe_mesh`), shown in the 3D view (Display > Mesh) until the model is edited,
+  MCP `get_mesh`. Saving an edited model drops `!solver/`. Triangle encoding not seen yet.
+  Test: `tests/fe_mesh.rs` on `FemCraft pit 1 geometry-meshed.rf6`.
 - Saving strategy: start from a database RFEM saved, change only edited rows, keep all
   unknown tables and sidecars byte-identical.
 

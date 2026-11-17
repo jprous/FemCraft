@@ -402,6 +402,24 @@ fn derived_value(
             }
             Ok(None)
         }
+        Derived::SectionShape => {
+            let (Some(Sql::Text(lib)), Some(lib_id)) = (
+                get(impl_row, "librarySection_table"),
+                get(impl_row, "librarySection_id").and_then(int),
+            ) else {
+                return Ok(None);
+            };
+            if lib != "ParametricSection" || cat.table(lib).is_none() {
+                return Ok(None);
+            }
+            let Some(code) = lookup_int(conn, lib, "parametrizationShape", lib_id)? else {
+                return Ok(None);
+            };
+            Ok(Some(match mapping::parametric_shape(code) {
+                Some(name) => Sql::Text(name.to_owned()),
+                None => Sql::Integer(code),
+            }))
+        }
         Derived::SurfaceStiffness => {
             let Some((_, _, Sql::Text(t))) = part_value(
                 conn,
@@ -1187,9 +1205,18 @@ impl RfDocument {
         })
     }
 
+    /// FE mesh saved by RFEM (`!solver/M/`), if the file holds one. See [`crate::mesh`].
+    pub fn fe_mesh(&self) -> Result<Option<crate::FeMesh>, Error> {
+        crate::FeMesh::read(&self.archive)
+    }
+
     /// Saves to `path`: `.rf6` sources are re-zipped with unchanged sidecars; bare databases are
     /// copied. Unchanged models give a byte-identical `model.db`.
     pub fn save(&mut self, path: &Path) -> Result<(), Error> {
+        // Mesh and results under `!solver/` belong to the unedited model.
+        if self.model.is_modified() && !self.archive.drop_prefixes.iter().any(|p| p == "!solver/") {
+            self.archive.drop_prefixes.push("!solver/".into());
+        }
         self.insert_new_objects()?;
         self.apply_edits()?;
         match self.archive.format {

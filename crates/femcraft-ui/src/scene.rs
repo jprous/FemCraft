@@ -73,6 +73,8 @@ pub struct Visibility {
     pub load_values: bool,
     /// Local axis triads on members and surfaces.
     pub local_axes: bool,
+    /// FE mesh saved by RFEM, while the model is unedited.
+    pub fe_mesh: bool,
     /// Load case whose loads are shown.
     pub load_case: u32,
     /// Spacing of support glyphs along lines and surface edges (the grid spacing), metres.
@@ -91,6 +93,7 @@ impl Default for Visibility {
             loads: true,
             load_values: true,
             local_axes: false,
+            fe_mesh: true,
             load_case: 1,
             glyph_spacing: 1.0,
         }
@@ -213,6 +216,16 @@ fn kn(v: f64, unit: &str) -> String {
     format!("{:.3} {unit}", v / 1000.0)
         .replace(".000 ", " ")
         .replace("00 ", " ")
+}
+
+/// FE element edges (thin, dark grey) on top of the scene.
+pub fn add_fe_mesh(s: &mut Scene, mesh: &femcraft_rfdb::FeMesh) {
+    const MESH: [f32; 4] = [0.25, 0.25, 0.3, 0.9];
+    for (a, b) in mesh.edges() {
+        if let (Some(a), Some(b)) = (mesh.node(a), mesh.node(b)) {
+            s.line(to_world(a), to_world(b), MESH);
+        }
+    }
 }
 
 pub fn build(model: &Model, vis: &Visibility) -> Scene {
