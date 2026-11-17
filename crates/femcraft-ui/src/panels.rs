@@ -8,6 +8,9 @@ use std::collections::HashSet;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use femcraft_model::{FieldType, Group, Model, Object, ObjectId, ObjectKind, Value};
+use femcraft_rfdb::LibraryKind;
+
+use crate::library_dialog::{LibraryCache, LibraryDialog, Outcome};
 
 /// Objects listed per kind in the tree before "… more" (the tables show everything).
 const MAX_TREE_ITEMS: usize = 500;
@@ -171,6 +174,36 @@ pub struct TableState {
     focus_editor: bool,
     /// Why the last edit was refused.
     error: Option<String>,
+    /// Information about the last action (not an error).
+    notice: Option<String>,
+    /// The library dialog, while open.
+    library: Option<LibraryDialog>,
+    /// Libraries loaded by the dialog (kept for the session).
+    library_cache: LibraryCache,
+    /// A library item picked for (document id, object), applied by the caller.
+    pick: Option<(u64, ObjectId, femcraft_rfdb::LibraryItem)>,
+}
+
+impl TableState {
+    /// The library item picked in the dialog, to assign to the object
+    /// ([`femcraft_rfdb::RfDocument::assign_library_item`]).
+    pub fn take_pick(&mut self) -> Option<(u64, ObjectId, femcraft_rfdb::LibraryItem)> {
+        self.pick.take()
+    }
+
+    /// Reports how applying a pick went.
+    pub fn report(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(note) => {
+                self.notice = Some(note);
+                self.error = None;
+            }
+            Err(e) => {
+                self.error = Some(e);
+                self.notice = None;
+            }
+        }
+    }
 }
 
 impl Default for TableState {
@@ -180,6 +213,10 @@ impl Default for TableState {
             editing: None,
             focus_editor: false,
             error: None,
+            notice: None,
+            library: None,
+            library_cache: LibraryCache::default(),
+            pick: None,
         }
     }
 }
@@ -442,9 +479,12 @@ pub fn tables(
         .show(ui, |ui| {
             if let Some(err) = &state.error {
                 ui.colored_label(ui.visuals().error_fg_color, err);
+            } else if let Some(note) = &state.notice {
+                ui.label(note);
             }
             edit = object_table(ui, doc, model, load_case, state, selection);
         });
+    library_dialog(ui.ctx(), doc, state);
 
     // Apply an edit after drawing (the rows borrow the model while they are drawn). An edit in
     // the empty row adds the object first.
@@ -465,6 +505,33 @@ pub fn tables(
         Err(e) => {
             state.error = Some(format!("{} {}: {e}", singular(id.kind), id.no));
             false
+        }
+    }
+}
+
+/// Library behind the Name column's "…" button.
+fn library_kind(kind: ObjectKind) -> Option<LibraryKind> {
+    match kind {
+        ObjectKind::Material => Some(LibraryKind::Material),
+        ObjectKind::Section => Some(LibraryKind::Section),
+        _ => None,
+    }
+}
+
+/// Shows the open library dialog and handles its outcome.
+fn library_dialog(ctx: &egui::Context, doc: u64, state: &mut TableState) {
+    let Some(dialog) = &mut state.library else {
+        return;
+    };
+    match dialog.show(ctx, &mut state.library_cache) {
+        Outcome::Open => {}
+        Outcome::Cancelled => state.library = None,
+        Outcome::Picked(item) => {
+            let (d, id) = dialog.target;
+            if d == doc {
+                state.pick = Some((d, id, item));
+            }
+            state.library = None;
         }
     }
 }
@@ -629,10 +696,33 @@ fn object_table(
                                     }
                                     return;
                                 }
-                                let label = ui.add(
-                                    egui::Label::new(display_text(kind, f.key, value, f.ty))
-                                        .sense(egui::Sense::click()),
-                                );
+                                // Library items: RFEM stores no name; show the library's.
+                                let lib_name = (f.key == "name"
+                                    && value.as_str().is_none_or(str::is_empty))
+                                .then(|| {
+                                    let lib = library_kind(kind)?;
+                                    let key = match lib {
+                                        LibraryKind::Material => "database_material_id",
+                                        LibraryKind::Section => "database_section_id",
+                                    };
+                                    let rfem_id = obj.get(key).as_i64().filter(|i| *i > 0)?;
+                                    state.library_cache.name(lib, rfem_id)
+                                })
+                                .flatten();
+                                let label = match &lib_name {
+                                    Some(n) => ui
+                                        .add(
+                                            egui::Label::new(egui::RichText::new(n).italics())
+                                                .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(
+                                            "Library item: RFEM generates this name from its library",
+                                        ),
+                                    None => ui.add(
+                                        egui::Label::new(display_text(kind, f.key, value, f.ty))
+                                            .sense(egui::Sense::click()),
+                                    ),
+                                };
                                 // The whole cell reacts, so empty cells can be edited too.
                                 let cell = ui.interact(
                                     ui.max_rect(),
@@ -646,6 +736,28 @@ fn object_table(
                                 } else if label.clicked() && !is_new {
                                     let ctrl = label.ctx.input(|i| i.modifiers.ctrl);
                                     click_select(ctrl, selection, id);
+                                }
+                                // Name of a material / section: "…" opens the library.
+                                if f.key == "name"
+                                    && let Some(lib) = library_kind(kind)
+                                {
+                                    let r = ui.max_rect();
+                                    let button = egui::Rect::from_min_max(
+                                        egui::pos2(r.right() - 20.0, r.top() + 1.0),
+                                        egui::pos2(r.right() - 1.0, r.bottom() - 1.0),
+                                    );
+                                    if ui
+                                        .put(button, egui::Button::new("…").small())
+                                        .on_hover_text("Pick from the library")
+                                        .clicked()
+                                    {
+                                        let current = lib_name
+                                            .as_deref()
+                                            .or(value.as_str())
+                                            .unwrap_or("");
+                                        state.library =
+                                            Some(LibraryDialog::new(lib, (doc, id), current));
+                                    }
                                 }
                             });
                         }

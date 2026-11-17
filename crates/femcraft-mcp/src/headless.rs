@@ -98,7 +98,7 @@ impl Workspace for Headless {
                 name: title(p),
                 path: p.clone(),
                 active: self.active == Some(i),
-                modified: d.model.is_modified(),
+                modified: d.is_modified(),
             })
             .collect()
     }

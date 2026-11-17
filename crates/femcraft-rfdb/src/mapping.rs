@@ -245,6 +245,8 @@ pub enum Derived {
     /// Impl `librarySection_id` -> `ParametricSection.parametrizationShape`, as RFEM's
     /// API enum (see [`parametric_shape`]); other codes stay integers.
     SectionShape,
+    /// Impl `librarySection_id` -> `DatabaseSection.databaseSectionId`: RFEM's library id.
+    SectionLibraryId,
     /// `SurfaceSpecificImplPart.stiffness_table` (owner = surface impl), e.g.
     /// `SurfaceStiffnessWithoutThickness` -> `TYPE_WITHOUT_THICKNESS`.
     SurfaceStiffness,
@@ -255,6 +257,7 @@ pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
     use ObjectKind::*;
     Some(match (kind, key) {
         (Section, "parametrization_type") => SectionShape,
+        (Section, "database_section_id") => SectionLibraryId,
         (Section, "b") => SectionParameter(&["b"]),
         (Section, "h") => SectionParameter(&["h"]),
         (Section, "d") => SectionParameter(&["d", "D"]),

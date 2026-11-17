@@ -307,7 +307,7 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
             }
             let mut out = json!({
                 "mesh": true,
-                "stale": doc.model.is_modified(),
+                "stale": doc.is_modified(),
                 "node_count": mesh.nodes.len(),
                 "element_count": mesh.elements.len(),
                 "elements_per_surface": per_surface.iter()

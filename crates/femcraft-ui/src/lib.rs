@@ -3,6 +3,7 @@
 mod app;
 mod dock;
 mod document;
+mod library_dialog;
 mod panels;
 pub mod scene;
 

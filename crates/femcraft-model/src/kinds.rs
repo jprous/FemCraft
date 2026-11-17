@@ -115,6 +115,7 @@ const N_M2: &str = "N/m²";
 static MATERIAL: &[FieldSpec] = &[
     NAME,
     TYPE,
+    f("database_material_id", "RFEM library id", Int),
     f("elasticity_modulus", "Modulus of elasticity E", Float("Pa")),
     f("shear_modulus", "Shear modulus G", Float("Pa")),
     f("poisson_ratio", "Poisson's ratio ν", Float("")),
@@ -132,6 +133,7 @@ static SECTION: &[FieldSpec] = &[
     NAME,
     TYPE,
     f("material", "Material", Ref(K::Material)),
+    f("database_section_id", "RFEM library id", Int),
     f("parametrization_type", "Parametric shape", Enum),
     f("b", "Width b", Float("m")),
     f("h", "Depth h", Float("m")),

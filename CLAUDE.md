@@ -45,8 +45,18 @@ Plan and milestone status: `docs/ROADMAP.md`.
   `model.db` (RFEM layout; library link `MaterialImpl.databaseMaterialId` /
   `DatabaseSection.databaseSectionId`) + index tables `femcraft_library`,
   `femcraft_library_value`. Looked up in `FEMCRAFT_LIBRARY`, `%APPDATA%\FemCraft\data\library`,
-  `library/` next to the exe. MCP: `get_library_items`, `get_library_item`. Not yet: cloning a
-  library item into a model (`build::capture` must also follow `librarySection_*`). RFEM 6.16 has
+  `library/` next to the exe. MCP: `get_library_items`, `get_library_item`. UI: "…" in the Name column of
+  Materials / Sections opens `library_dialog.rs`; Select calls
+  `RfDocument::assign_library_item` (writes pending edits, `build::capture_library_item` +
+  `Builder::replace_with` copy the item's impl tree into the working db and repoint the
+  main row, so member refs stay; a section keeps its material; reload; `is_modified()`).
+  `tests/library_assign.rs`. Not yet: MCP `set_section({name})` from the library.
+  **RFEM calls a file corrupted** when a library section lacks its `value_id` lists
+  (`DatabaseSection_sectionMaterialCharacteristics`, `SectionTopology_outlines`): their
+  targets come from the declared SQLite foreign keys (`Schema::fk`). Replaced library rows
+  are deleted unless shared (copies within a model share `DatabaseSection` rows). Name
+  column shows the library name via `database_section_id` / `database_material_id`.
+  `rf6-catalog --assign OUT section|material NO NAME` makes test files (confirmed in RFEM). RFEM 6.16 has
   no SANS concrete / reinforcement; SA sections are manufacturer `Macsteel`; SA steel is
   `S355JR | SANS 50025-2`. API I deletes with `delete_object(type, no)`; a rejected
   `set_material` still leaves a user-defined object behind. The translator files map

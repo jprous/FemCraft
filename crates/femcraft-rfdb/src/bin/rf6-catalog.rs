@@ -112,6 +112,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             doc.save(Path::new(out))?;
             println!("saved {out}");
         }
+        Some("--assign") => {
+            // --assign OUT.rf6 material|section NO NAME [material|section NO NAME ...]
+            let (out, rest) = args[2..].split_first().ok_or("--assign needs OUT")?;
+            if rest.is_empty() || rest.len() % 3 != 0 {
+                return Err("usage: --assign OUT.rf6 material|section NO NAME [...]".into());
+            }
+            let lib = femcraft_rfdb::Library::find(&femcraft_rfdb::Library::default_dirs())
+                .ok_or("no FemCraft library found")?;
+            let mut doc = RfDocument::open(path)?;
+            for t in rest.chunks(3) {
+                let kind = femcraft_rfdb::LibraryKind::parse(&t[0]).ok_or("material or section")?;
+                let obj_kind = match kind {
+                    femcraft_rfdb::LibraryKind::Material => ObjectKind::Material,
+                    femcraft_rfdb::LibraryKind::Section => ObjectKind::Section,
+                };
+                let item = lib.get(kind, &t[2])?.ok_or("no such library item")?;
+                let id = femcraft_model::ObjectId::new(obj_kind, t[1].parse()?);
+                doc.assign_library_item(id, &lib, &item)?;
+                println!("{} {} -> {}", obj_kind.name(), t[1], item.name);
+            }
+            doc.save(Path::new(out))?;
+            println!("saved {out}");
+        }
         Some("--objects") => {
             let kind_name = args.get(2).ok_or("--objects needs a kind")?;
             let kind = ObjectKind::ALL

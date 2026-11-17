@@ -229,6 +229,37 @@ impl Library {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// The first value (`idx` 0) of each of `keys` for every item of `kind`, by `user_id`:
+    /// table columns in one query.
+    pub fn columns(
+        &self,
+        kind: LibraryKind,
+        keys: &[&str],
+    ) -> Result<std::collections::HashMap<i64, Vec<Option<f64>>>, Error> {
+        let conn = self.open(kind)?;
+        let marks: Vec<String> = (0..keys.len()).map(|i| format!("?{}", i + 2)).collect();
+        let sql = format!(
+            "SELECT user_id, key, value_si FROM femcraft_library_value \
+             WHERE kind = ?1 AND idx = 0 AND key IN ({})",
+            marks.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let kind_name = kind.name();
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&kind_name];
+        for k in keys {
+            params.push(k);
+        }
+        let mut out: std::collections::HashMap<i64, Vec<Option<f64>>> = Default::default();
+        let mut rows = stmt.query(params.as_slice())?;
+        while let Some(r) = rows.next()? {
+            let (id, key, v): (i64, String, Option<f64>) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            if let Some(i) = keys.iter().position(|k| *k == key) {
+                out.entry(id).or_insert_with(|| vec![None; keys.len()])[i] = v;
+            }
+        }
+        Ok(out)
+    }
+
     /// Number of items of each kind (0 when that database is missing).
     pub fn count(&self, kind: LibraryKind) -> usize {
         self.open(kind)

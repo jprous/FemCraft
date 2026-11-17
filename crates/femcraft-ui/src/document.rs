@@ -105,12 +105,12 @@ impl Document {
 
     /// Unsaved edits?
     pub fn is_modified(&self) -> bool {
-        self.rf.model.is_modified()
+        self.rf.is_modified()
     }
 
     /// Writes the model (with its edits) to `path` as `.rf6`; the document then refers to it.
     pub fn save_as(&mut self, path: &Path) -> Result<(), String> {
-        if self.rf.model.is_modified() {
+        if self.rf.is_modified() {
             // Saving an edited model drops RFEM's mesh (see `RfDocument::save`).
             self.fe_mesh = None;
         }
@@ -143,7 +143,7 @@ impl Document {
         }
         self.scene = scene::build(&self.rf.model, &self.vis);
         if let Some(mesh) = &self.fe_mesh {
-            if self.vis.fe_mesh && !self.rf.model.is_modified() {
+            if self.vis.fe_mesh && !self.rf.is_modified() {
                 scene::add_fe_mesh(&mut self.scene, mesh);
             }
         }

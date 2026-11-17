@@ -75,6 +75,8 @@ pub struct Schema {
     owner_tables: Vec<String>,
     /// Owner table -> its list tables.
     lists: HashMap<String, Vec<String>>,
+    /// Declared foreign keys: (table, column) -> referenced table.
+    fks: HashMap<(String, String), String>,
 }
 
 impl Schema {
@@ -116,11 +118,21 @@ impl Schema {
                 lists.entry(o.clone()).or_default().push(t.clone());
             }
         }
+        let mut fks = HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT m.name, f.\"from\", f.\"table\" \
+             FROM sqlite_master m, pragma_foreign_key_list(m.name) f WHERE m.type = 'table'",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            fks.insert((r.get(0)?, r.get(1)?), r.get(2)?);
+        }
         Ok(Self {
             columns,
             required,
             owner_tables,
             lists,
+            fks,
         })
     }
 
@@ -128,6 +140,16 @@ impl Schema {
         self.columns
             .get(table)
             .is_some_and(|c| c.iter().any(|x| x == col))
+    }
+
+    /// The table a column refers to, when the database declares it.
+    fn fk(&self, table: &str, col: &str) -> Option<&String> {
+        self.fks.get(&(table.to_owned(), col.to_owned()))
+    }
+
+    /// Model object tables (`userID`): a library item's capture never enters another one.
+    fn is_object_table(&self, table: &str) -> bool {
+        self.has_column(table, "userID")
     }
 }
 
@@ -181,6 +203,42 @@ pub fn capture(
     main_table: &str,
     main_id: i64,
 ) -> Result<Proto, Error> {
+    capture_tree(conn, schema, kind, main_table, main_id, false)
+}
+
+/// References a library item's rows follow besides `impl` / owners / lists:
+/// `<name>_id` columns without a `<name>_table` column, and their table.
+const LIBRARY_REFS: &[(&str, &str)] = &[
+    ("sectionData", "SectionData"),
+    ("topology", "SectionTopology"),
+    ("properties", "MaterialProperties"),
+];
+
+/// `<name>_id` + `<name>_table` pairs that point at other objects or back up the tree.
+const NOT_FOLLOWED: &[&str] = &["impl", "owner", "parent", "parentModelObject"];
+
+/// Like [`capture`], also following what a library material / section consists of:
+/// `<name>_id` + `<name>_table` pairs (`librarySection`, `sectionHybridImplPart`), the
+/// [`LIBRARY_REFS`] and rows that list entries refer to (`materialDataVector` -> `MaterialData`,
+/// property maps -> property rows). Meant for library databases, which hold nothing else.
+pub fn capture_library_item(
+    conn: &Connection,
+    schema: &Schema,
+    kind: ObjectKind,
+    main_table: &str,
+    main_id: i64,
+) -> Result<Proto, Error> {
+    capture_tree(conn, schema, kind, main_table, main_id, true)
+}
+
+fn capture_tree(
+    conn: &Connection,
+    schema: &Schema,
+    kind: ObjectKind,
+    main_table: &str,
+    main_id: i64,
+    deep: bool,
+) -> Result<Proto, Error> {
     let mut proto = Proto {
         kind,
         rows: Vec::new(),
@@ -204,6 +262,24 @@ pub fn capture(
         {
             queue.push((it.clone(), iid));
         }
+        if deep {
+            for (c, v) in &row {
+                let (Some(base), Sql::Integer(target)) = (c.strip_suffix("_id"), v) else {
+                    continue;
+                };
+                if *target <= 0 || NOT_FOLLOWED.contains(&base) {
+                    continue;
+                }
+                match get(&row, &format!("{base}_table")) {
+                    Some(Sql::Text(tt)) => queue.push((tt.clone(), *target)),
+                    _ => {
+                        if let Some((_, tt)) = LIBRARY_REFS.iter().find(|(b, _)| *b == base) {
+                            queue.push(((*tt).to_owned(), *target));
+                        }
+                    }
+                }
+            }
+        }
         for o in &schema.owner_tables {
             let sql = format!(
                 "SELECT id FROM {} WHERE owner_table = '{}' AND owner_id = ?1",
@@ -222,6 +298,21 @@ pub fn capture(
                 quote(l)
             );
             for r in select_rows(conn, &sql, id)? {
+                if deep {
+                    if let (Some(Sql::Text(rt)), Some(rid)) =
+                        (get(&r, "reference_table"), int(get(&r, "reference_id")))
+                    {
+                        if !schema.is_object_table(rt) {
+                            queue.push((rt.clone(), rid));
+                        }
+                    }
+                    if let (Some(rt), Some(rid)) =
+                        (schema.fk(l, "value_id"), int(get(&r, "value_id")))
+                        && !schema.is_object_table(rt)
+                    {
+                        queue.push((rt.clone(), rid));
+                    }
+                }
                 proto.lists.push((l.clone(), r));
             }
         }
@@ -457,6 +548,16 @@ impl Builder {
         user_id: i64,
         load_case: Option<i64>,
     ) -> Result<i64, Error> {
+        Ok(self.add_mapped(proto, user_id, load_case)?.0)
+    }
+
+    /// [`Builder::add`], also returning the new id of every copied row by (table, old id).
+    fn add_mapped(
+        &mut self,
+        proto: &Proto,
+        user_id: i64,
+        load_case: Option<i64>,
+    ) -> Result<(i64, HashMap<(String, i64), i64>), Error> {
         let mut map: HashMap<(String, i64), i64> = HashMap::new();
         for (t, row) in &proto.rows {
             let old = int(get(row, "id")).unwrap_or(0);
@@ -488,20 +589,49 @@ impl Builder {
                     let tcol = format!("{base}_table");
                     let target = match get(row, &tcol) {
                         Some(Sql::Text(tt)) => Some(tt.clone()),
+                        _ if self
+                            .schema
+                            .fk(t, c)
+                            .is_some_and(|ft| map.contains_key(&(ft.clone(), *val))) =>
+                        {
+                            self.schema.fk(t, c).cloned()
+                        }
                         _ if c == "parent_id" && *t != main_table => Some(main_table.clone()),
+                        // Library links with a known table; `impl_id` without `impl_table`
+                        // (on `MaterialData`) is the object's own impl row.
+                        _ if LIBRARY_REFS.iter().any(|(b, _)| *b == base) => LIBRARY_REFS
+                            .iter()
+                            .find(|(b, _)| *b == base)
+                            .map(|(_, tt)| (*tt).to_owned()),
+                        _ if base == "impl" && *t != main_table => {
+                            match get(&proto.rows[0].1, "impl_table") {
+                                Some(Sql::Text(tt)) => Some(tt.clone()),
+                                _ => None,
+                            }
+                        }
                         _ => {
-                            // Unique proto row whose table name contains the column base,
+                            // Unique proto row whose table name ends with the column base
+                            // (`properties_id` -> `MaterialProperties`, not
+                            // `MaterialTimeDependentPropertiesImplPart`), else contains it,
                             // else a unique owned child with that id.
                             let lb = base.to_lowercase();
-                            let by_name: Vec<&String> = proto
-                                .rows
-                                .iter()
-                                .map(|(pt, _)| pt)
-                                .filter(|pt| {
-                                    pt.to_lowercase().contains(&lb)
-                                        && map.contains_key(&((*pt).clone(), *val))
-                                })
-                                .collect();
+                            let tables = |pred: &dyn Fn(&str) -> bool| -> Vec<&String> {
+                                let mut v: Vec<&String> = proto
+                                    .rows
+                                    .iter()
+                                    .map(|(pt, _)| pt)
+                                    .filter(|pt| {
+                                        pred(&pt.to_lowercase())
+                                            && map.contains_key(&((*pt).clone(), *val))
+                                    })
+                                    .collect();
+                                v.dedup();
+                                v
+                            };
+                            let mut by_name = tables(&|n| n.ends_with(&lb));
+                            if by_name.len() != 1 {
+                                by_name = tables(&|n| n.contains(&lb));
+                            }
                             if by_name.len() == 1 {
                                 Some(by_name[0].clone())
                             } else {
@@ -550,8 +680,24 @@ impl Builder {
                     _ => keep = false,
                 }
             }
-            if matches!(get(row, "value_id"), Some(Sql::Integer(_))) {
-                keep = false;
+            if let Some(Sql::Integer(vid)) = get(row, "value_id") {
+                // Kept when it refers to a row of this copy (library item parts, e.g.
+                // `SectionTopology_outlines` -> `SectionOutlineDefinition`); references to
+                // other objects are dropped.
+                match self
+                    .schema
+                    .fk(l, "value_id")
+                    .and_then(|ft| map.get(&(ft.clone(), *vid)))
+                {
+                    Some(&new) => {
+                        for (c, v) in &mut out {
+                            if c == "value_id" {
+                                *v = Sql::Integer(new);
+                            }
+                        }
+                    }
+                    None => keep = false,
+                }
             }
             if keep {
                 kept.push((l.clone(), out));
@@ -607,7 +753,211 @@ impl Builder {
                 rusqlite::params![lc, main_new],
             )?;
         }
-        Ok(main_new)
+        Ok((main_new, map))
+    }
+
+    /// Makes the object in `main_table` row `main_id` a copy of library item `proto` (captured
+    /// with [`capture_library_item`]): the copy's impl tree is inserted and the object's main
+    /// row is pointed at it, so references to the object stay valid. A section keeps its
+    /// material. The old impl row and its owned rows and lists are deleted; library rows it
+    /// referred to (`DatabaseSection`, `SectionData`, ...) are left, as other objects copied
+    /// from it may share them.
+    pub(crate) fn replace_with(
+        &mut self,
+        proto: &Proto,
+        main_table: &str,
+        main_id: i64,
+    ) -> Result<(), Error> {
+        if let Some(m) = self.misfit(proto) {
+            return Err(Error::Unsupported(format!(
+                "this model's RFEM version does not fit the library item ({m})"
+            )));
+        }
+        let q = quote(main_table);
+        let (old_impl_table, old_impl_id): (String, i64) = self.conn.query_row(
+            &format!("SELECT impl_table, impl_id FROM {q} WHERE id = ?1"),
+            [main_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let old_material: Option<i64> = if self.schema.has_column(&old_impl_table, "material_id") {
+            self.conn.query_row(
+                &format!(
+                    "SELECT material_id FROM {} WHERE id = ?1",
+                    quote(&old_impl_table)
+                ),
+                [old_impl_id],
+                |r| r.get(0),
+            )?
+        } else {
+            None
+        };
+        // A temporary object number, gone with the copy's main row below.
+        let (new_main, map) = self.add_mapped(proto, -1, None)?;
+        let (impl_table, impl_id): (String, i64) = self.conn.query_row(
+            &format!("SELECT impl_table, impl_id FROM {q} WHERE id = ?1"),
+            [new_main],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        // Rows of the copy that point at its main row point at the object instead.
+        for ((t, _), &new) in &map {
+            if t == main_table {
+                continue;
+            }
+            let qt = quote(t);
+            if self.schema.has_column(t, "parent_id") {
+                self.conn.execute(
+                    &format!("UPDATE {qt} SET parent_id = ?1 WHERE id = ?2 AND parent_id = ?3"),
+                    rusqlite::params![main_id, new, new_main],
+                )?;
+            }
+            if self.schema.has_column(t, "owner_id") && self.schema.has_column(t, "owner_table") {
+                self.conn.execute(
+                    &format!(
+                        "UPDATE {qt} SET owner_id = ?1 WHERE id = ?2 AND owner_id = ?3 \
+                         AND owner_table = ?4"
+                    ),
+                    rusqlite::params![main_id, new, new_main, main_table],
+                )?;
+            }
+        }
+        for l in self.schema.lists.get(main_table).into_iter().flatten() {
+            self.conn.execute(
+                &format!("DELETE FROM {} WHERE id = ?1", quote(l)),
+                [new_main],
+            )?;
+        }
+        self.conn
+            .execute(&format!("DELETE FROM {q} WHERE id = ?1"), [new_main])?;
+        self.conn.execute(
+            &format!("UPDATE {q} SET impl_table = ?1, impl_id = ?2 WHERE id = ?3"),
+            rusqlite::params![impl_table, impl_id, main_id],
+        )?;
+        if let Some(m) = old_material
+            && self.schema.has_column(&impl_table, "material_id")
+        {
+            self.conn.execute(
+                &format!(
+                    "UPDATE {} SET material_id = ?1 WHERE id = ?2",
+                    quote(&impl_table)
+                ),
+                rusqlite::params![m, impl_id],
+            )?;
+        }
+        // The old impl with its owned parts and lists, and with what it refers to.
+        let old_deep = capture_tree(
+            &self.conn,
+            &self.schema,
+            proto.kind,
+            &old_impl_table,
+            old_impl_id,
+            true,
+        )?;
+        let old = capture(
+            &self.conn,
+            &self.schema,
+            proto.kind,
+            &old_impl_table,
+            old_impl_id,
+        )?;
+        // Rows its lists refer to that point back at it (`MaterialData.impl_id`) are its own.
+        for (_, row) in &old.lists {
+            let (Some(Sql::Text(rt)), Some(rid)) =
+                (get(row, "reference_table"), int(get(row, "reference_id")))
+            else {
+                continue;
+            };
+            if self.schema.has_column(rt, "impl_id") && !self.schema.has_column(rt, "impl_table") {
+                self.conn.execute(
+                    &format!("DELETE FROM {} WHERE id = ?1 AND impl_id = ?2", quote(rt)),
+                    [rid, old_impl_id],
+                )?;
+            }
+        }
+        for (t, row) in &old.rows {
+            if let Some(id) = int(get(row, "id")) {
+                self.conn
+                    .execute(&format!("DELETE FROM {} WHERE id = ?1", quote(t)), [id])?;
+            }
+        }
+        for (l, row) in &old.lists {
+            if let (Some(id), Some(order)) = (int(get(row, "id")), int(get(row, "container_order")))
+            {
+                self.conn.execute(
+                    &format!(
+                        "DELETE FROM {} WHERE id = ?1 AND container_order = ?2",
+                        quote(l)
+                    ),
+                    [id, order],
+                )?;
+            }
+        }
+        self.delete_unused_library_rows(&old_deep, &old)?;
+        Ok(())
+    }
+
+    /// After an impl row was deleted: the library rows it referred to (its deep capture minus
+    /// the impl's own rows) are deleted with their lists, unless another row still refers to
+    /// one of the rows the impl pointed at (`librarySection_id` / `_table`, ...): copies of an
+    /// object made within a model share them.
+    fn delete_unused_library_rows(&mut self, deep: &Proto, own: &Proto) -> Result<(), Error> {
+        let own_rows: HashSet<(&str, i64)> = own
+            .rows
+            .iter()
+            .filter_map(|(t, r)| Some((t.as_str(), int(get(r, "id"))?)))
+            .collect();
+        let Some((_, impl_row)) = deep.rows.first() else {
+            return Ok(());
+        };
+        // What the impl pointed at with `<name>_id` + `<name>_table`.
+        for (c, v) in impl_row {
+            let (Some(base), Sql::Integer(target)) = (c.strip_suffix("_id"), v) else {
+                continue;
+            };
+            if NOT_FOLLOWED.contains(&base) {
+                continue;
+            }
+            let tcol = format!("{base}_table");
+            let Some(Sql::Text(tt)) = get(impl_row, &tcol) else {
+                continue;
+            };
+            let referrers: Vec<String> = self
+                .schema
+                .columns
+                .iter()
+                .filter(|(_, cols)| cols.contains(c) && cols.contains(&tcol))
+                .map(|(t, _)| t.clone())
+                .collect();
+            for t in referrers {
+                let n: i64 = self.conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {} WHERE {} = ?1 AND {} = ?2",
+                        quote(&t),
+                        quote(c),
+                        quote(&tcol)
+                    ),
+                    rusqlite::params![target, tt],
+                    |r| r.get(0),
+                )?;
+                if n > 0 {
+                    return Ok(()); // shared: keep everything
+                }
+            }
+        }
+        for (t, row) in &deep.rows {
+            let Some(id) = int(get(row, "id")) else {
+                continue;
+            };
+            if own_rows.contains(&(t.as_str(), id)) {
+                continue;
+            }
+            self.conn
+                .execute(&format!("DELETE FROM {} WHERE id = ?1", quote(t)), [id])?;
+            for l in self.schema.lists.get(t).into_iter().flatten() {
+                self.conn
+                    .execute(&format!("DELETE FROM {} WHERE id = ?1", quote(l)), [id])?;
+            }
+        }
+        Ok(())
     }
 
     fn insert(&self, table: &str, row: &Row) -> Result<(), Error> {

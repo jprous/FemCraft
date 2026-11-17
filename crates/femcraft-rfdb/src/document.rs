@@ -107,6 +107,8 @@ pub struct RfDocument {
     /// RFEM files to copy new objects from when this model has no object of that kind yet
     /// (see [`crate::build::insert_new_objects`]).
     pub prototype_files: Vec<std::path::PathBuf>,
+    /// The working database was changed directly (library items assigned) since the last save.
+    db_changed: bool,
 }
 
 type Row = Vec<(String, Sql)>;
@@ -402,6 +404,35 @@ fn derived_value(
             }
             Ok(None)
         }
+        Derived::SectionLibraryId => {
+            let (Some(Sql::Text(lib)), Some(lib_id)) = (
+                get(impl_row, "librarySection_table"),
+                get(impl_row, "librarySection_id").and_then(int),
+            ) else {
+                return Ok(None);
+            };
+            if lib != "DatabaseSection"
+                || cat
+                    .table(lib)
+                    .and_then(|t| t.column("databaseSectionId"))
+                    .is_none()
+            {
+                return Ok(None);
+            }
+            // Any stored type (an integer in RFEM's files); a number when it reads as one.
+            let v: Option<Sql> = conn
+                .prepare_cached(&format!(
+                    "SELECT databaseSectionId FROM {} WHERE id = ?1",
+                    quote(lib)
+                ))?
+                .query_row([lib_id], |r| r.get(0))
+                .optional()?;
+            Ok(v.and_then(|v| match v {
+                Sql::Integer(i) => Some(Sql::Integer(i)),
+                Sql::Text(t) => t.trim().parse().ok().map(Sql::Integer),
+                _ => None,
+            }))
+        }
         Derived::SectionShape => {
             let (Some(Sql::Text(lib)), Some(lib_id)) = (
                 get(impl_row, "librarySection_table"),
@@ -518,9 +549,70 @@ impl RfDocument {
             ref_by_id: HashMap::new(),
             ids: HashMap::new(),
             prototype_files: Vec::new(),
+            db_changed: false,
         };
         doc.resolve(raws);
         Ok(doc)
+    }
+
+    /// Whether there is anything to save: model edits or library items assigned.
+    pub fn is_modified(&self) -> bool {
+        self.model.is_modified() || self.db_changed
+    }
+
+    /// Makes material / section `id` the library item `item` ([`crate::library`]): the item's
+    /// rows are copied from the library database and the object refers to them (members and
+    /// surfaces keep referring to the object; a section keeps its material). Pending edits are
+    /// written to the working database first and the model is reloaded, so the object shows
+    /// the library values. Saved with the next [`RfDocument::save`].
+    pub fn assign_library_item(
+        &mut self,
+        id: ObjectId,
+        lib: &crate::Library,
+        item: &crate::LibraryItem,
+    ) -> Result<(), Error> {
+        use crate::LibraryKind as L;
+        let main = match (id.kind, item.kind) {
+            (ObjectKind::Material, L::Material) => "Material",
+            (ObjectKind::Section, L::Section) => "Section",
+            _ => {
+                return Err(Error::Unsupported(format!(
+                    "a library {} for a {}",
+                    item.kind.name(),
+                    id.kind.name()
+                )));
+            }
+        };
+        // As saving does: new objects get rows, edits are written (the reload keeps them).
+        self.insert_new_objects()?;
+        self.apply_edits()?;
+        let (table, key) = self
+            .db_key(id)
+            .map(|(t, k)| (t.to_owned(), k))
+            .ok_or_else(|| {
+                Error::Format(format!(
+                    "{} {} is not in the database",
+                    id.kind.name(),
+                    id.no
+                ))
+            })?;
+        let lib_conn =
+            Connection::open_with_flags(lib.db_path(item.kind), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let lib_schema = crate::build::Schema::read(&lib_conn)?;
+        let lib_main: i64 = lib_conn.query_row(
+            &format!("SELECT id FROM {} WHERE userID = ?1", quote(main)),
+            [item.user_id],
+            |r| r.get(0),
+        )?;
+        let proto =
+            crate::build::capture_library_item(&lib_conn, &lib_schema, id.kind, main, lib_main)?;
+        let mut b = crate::build::Builder::on_db(self.archive.db_path())?;
+        b.begin()?;
+        b.replace_with(&proto, &table, key)?;
+        b.commit()?;
+        self.reload()?;
+        self.db_changed = true;
+        Ok(())
     }
 
     /// Loads the model again from the working database (after rows were inserted).
@@ -1214,7 +1306,7 @@ impl RfDocument {
     /// copied. Unchanged models give a byte-identical `model.db`.
     pub fn save(&mut self, path: &Path) -> Result<(), Error> {
         // Mesh and results under `!solver/` belong to the unedited model.
-        if self.model.is_modified() && !self.archive.drop_prefixes.iter().any(|p| p == "!solver/") {
+        if self.is_modified() && !self.archive.drop_prefixes.iter().any(|p| p == "!solver/") {
             self.archive.drop_prefixes.push("!solver/".into());
         }
         self.insert_new_objects()?;
@@ -1230,6 +1322,7 @@ impl RfDocument {
             }
         }
         self.model.clear_changes();
+        self.db_changed = false;
         Ok(())
     }
 }

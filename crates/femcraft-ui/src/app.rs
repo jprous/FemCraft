@@ -849,6 +849,11 @@ impl FemCraftApp {
                             // A load case may have been added or renamed.
                             d.load_cases = scene::load_cases(&d.rf.model);
                         }
+                        if let Some((doc, obj, item)) = tables.take_pick()
+                            && doc == d.id
+                        {
+                            tables.report(assign_library_item(d, obj, &item));
+                        }
                     }
                     None => {
                         panels::tables(ui, 0, None, 0, tables, &mut Default::default());
@@ -937,7 +942,7 @@ impl FemCraftApp {
             ui.checkbox(&mut v.loads, "Loads");
             ui.checkbox(&mut v.local_axes, "Local axes");
             ui.end_row();
-            let has_mesh = d.fe_mesh.is_some() && !d.rf.model.is_modified();
+            let has_mesh = d.fe_mesh.is_some() && !d.rf.is_modified();
             ui.add_enabled(has_mesh, egui::Checkbox::new(&mut v.fe_mesh, "Mesh"))
                 .on_hover_text("FE mesh saved by RFEM")
                 .on_disabled_hover_text(if d.fe_mesh.is_some() {
@@ -1459,6 +1464,48 @@ mod tests {
 }
 
 /// MCP methods act on the open models like the menu commands do.
+/// Makes material / section `obj` of `d` the picked library item; the text says what was done.
+fn assign_library_item(
+    d: &mut Document,
+    obj: femcraft_model::ObjectId,
+    item: &femcraft_rfdb::LibraryItem,
+) -> Result<String, String> {
+    use femcraft_model::{ObjectId, ObjectKind as K};
+    let lib = femcraft_rfdb::Library::find(&femcraft_rfdb::Library::default_dirs())
+        .ok_or("No FemCraft library found")?;
+    d.rf.assign_library_item(obj, &lib, item)
+        .map_err(|e| format!("{} {}: {e}", obj.kind.spec().label, obj.no))?;
+    d.revision += 1; // rebuild the 3D view
+    let mut note = format!(
+        "{} {} is now {} (save to keep it).",
+        obj.kind.name(),
+        obj.no,
+        item.name
+    );
+    // RFEM material type codes: 1 concrete, 10 steel.
+    let material_type = |no: Option<u32>| {
+        no.and_then(|n| d.rf.model.get(ObjectId::new(K::Material, n)))
+            .and_then(|m| m.get("type").as_i64())
+    };
+    if obj.kind == K::Section {
+        let sec = d.rf.model.get(obj);
+        let mat = sec.and_then(|s| s.get("material").as_ref_no());
+        let concrete_section = item.category == "concrete";
+        match material_type(mat) {
+            Some(1) if !concrete_section => note.push_str(&format!(
+                " Note: its material {} is concrete.",
+                mat.unwrap()
+            )),
+            Some(t) if t != 1 && concrete_section => note.push_str(&format!(
+                " Note: its material {} is not concrete.",
+                mat.unwrap()
+            )),
+            _ => {}
+        }
+    }
+    Ok(note)
+}
+
 impl femcraft_mcp::Workspace for FemCraftApp {
     fn new_model(&mut self, name: Option<&str>) -> Result<String, String> {
         let blank = Self::blank_model_path()
