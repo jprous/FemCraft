@@ -228,6 +228,8 @@ pub fn find_proto(
     let id: ObjectId = doc
         .model
         .iter_kind(kind)
+        // Saved objects only (new ones have no rows yet).
+        .filter(|(id, _)| doc.db_key(*id).is_some())
         .find(|(_, o)| want.iter().all(|(k, v)| o.get(k) == v))
         .map(|(id, _)| id)
         .ok_or_else(|| {
@@ -269,7 +271,9 @@ fn new_guid(seq: &mut u64) -> String {
 
 /// A model under construction: a purged template plus cloned objects.
 pub struct Builder {
-    archive: Archive,
+    /// None when working on a document's own database ([`Builder::on_db`]).
+    archive: Option<Archive>,
+    db: std::path::PathBuf,
     conn: Connection,
     schema: Schema,
     next: HashMap<String, i64>,
@@ -286,7 +290,8 @@ impl Builder {
         conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
         let schema = Schema::read(&conn)?;
         let mut b = Self {
-            archive,
+            db: archive.db_path().to_owned(),
+            archive: Some(archive),
             conn,
             schema,
             next: HashMap::new(),
@@ -300,6 +305,22 @@ impl Builder {
         tables.extend_from_slice(EXTRA_PURGE_TABLES);
         b.purge(&tables)?;
         Ok(b)
+    }
+
+    /// Works on an open document's database (adding objects to an existing model); nothing
+    /// is purged. [`Builder::finish`] is not available.
+    pub(crate) fn on_db(db: &Path) -> Result<Self, Error> {
+        let conn = Connection::open(db)?;
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let schema = Schema::read(&conn)?;
+        Ok(Self {
+            archive: None,
+            db: db.to_owned(),
+            conn,
+            schema,
+            next: HashMap::new(),
+            seq: 1,
+        })
     }
 
     /// Deletes all objects of `tables` with their impl, part and list rows, and list entries
@@ -706,7 +727,7 @@ impl Builder {
     /// Finishes the database and loads it as a document, ready for setting field values.
     pub fn finish(self) -> Result<RfDocument, Error> {
         drop(self.conn);
-        RfDocument::from_archive(self.archive)
+        RfDocument::from_archive(self.archive.expect("finish needs a template builder"))
     }
 }
 
@@ -726,7 +747,7 @@ pub fn foreign_key_problems(conn: &Connection) -> Result<Vec<(String, String, i6
 impl Builder {
     /// Path of the working database (for checks with another connection).
     pub fn db_path(&self) -> &Path {
-        self.archive.db_path()
+        &self.db
     }
 }
 

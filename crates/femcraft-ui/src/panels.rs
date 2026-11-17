@@ -204,8 +204,51 @@ pub fn is_editable(kind: ObjectKind, key: &str) -> bool {
             "boundary_lines" | "thickness" | "axes_rotation" | "axes_z_reversed"
         ),
         K::NodalSupport | K::LineSupport | K::MemberSupport | K::SurfaceSupport => true,
+        K::LoadCase => matches!(key, "name" | "self_weight_active" | "to_solve"),
+        K::NodalLoad | K::LineLoad | K::MemberLoad | K::SurfaceLoad => matches!(
+            key,
+            "nodes"
+                | "lines"
+                | "members"
+                | "surfaces"
+                | "magnitude"
+                | "magnitude_2"
+                | "uniform_magnitude"
+        ),
         _ => false,
     }
+}
+
+/// Tables ending in an empty row: typing into it adds an object (saved as a copy of a similar
+/// object, see `femcraft_rfdb`), loads going to the load case shown in the 3D view.
+pub const NEW_ROW_KINDS: [ObjectKind; 9] = [
+    ObjectKind::Node,
+    ObjectKind::Line,
+    ObjectKind::Member,
+    ObjectKind::Surface,
+    ObjectKind::LoadCase,
+    ObjectKind::NodalLoad,
+    ObjectKind::LineLoad,
+    ObjectKind::MemberLoad,
+    ObjectKind::SurfaceLoad,
+];
+
+/// Adds object `id` with starting values (node at the origin, load case without self-weight).
+fn add_object(model: &mut Model, id: ObjectId) -> Result<(), String> {
+    model.add(id).map_err(|e| e.to_string())?;
+    let defaults: &[(&str, Value)] = match id.kind {
+        ObjectKind::Node => &[
+            ("coordinate_1", Value::Float(0.0)),
+            ("coordinate_2", Value::Float(0.0)),
+            ("coordinate_3", Value::Float(0.0)),
+        ],
+        ObjectKind::LoadCase => &[("self_weight_active", Value::Bool(false))],
+        _ => &[],
+    };
+    for (k, v) in defaults {
+        model.set(id, k, v.clone()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Text put in the editor for a value (full precision, lists in RFEM notation).
@@ -310,6 +353,7 @@ pub fn tables(
     ui: &mut egui::Ui,
     doc: u64,
     model: Option<&mut Model>,
+    load_case: u32,
     state: &mut TableState,
     selection: &mut HashSet<ObjectId>,
 ) -> bool {
@@ -320,7 +364,7 @@ pub fn tables(
     let kinds: Vec<ObjectKind> = ObjectKind::ALL
         .iter()
         .copied()
-        .filter(|k| model.count(*k) > 0)
+        .filter(|k| model.count(*k) > 0 || NEW_ROW_KINDS.contains(k))
         .collect();
     if kinds.is_empty() {
         ui.weak("The model has no objects.");
@@ -357,14 +401,21 @@ pub fn tables(
             if let Some(err) = &state.error {
                 ui.colored_label(ui.visuals().error_fg_color, err);
             }
-            edit = object_table(ui, doc, model, state, selection);
+            edit = object_table(ui, doc, model, load_case, state, selection);
         });
 
-    // Apply an edit after drawing (the rows borrow the model while they are drawn).
+    // Apply an edit after drawing (the rows borrow the model while they are drawn). An edit in
+    // the empty row adds the object first.
     let Some((id, key, value)) = edit else {
         return false;
     };
-    match value.and_then(|v| model.set(id, key, v).map_err(|e| e.to_string())) {
+    let result = value.and_then(|v| {
+        if model.get(id).is_none() {
+            add_object(model, id)?;
+        }
+        model.set(id, key, v).map_err(|e| e.to_string())
+    });
+    match result {
         Ok(()) => {
             state.error = None;
             true
@@ -382,13 +433,28 @@ fn object_table(
     ui: &mut egui::Ui,
     doc: u64,
     model: &Model,
+    load_case: u32,
     state: &mut TableState,
     selection: &mut HashSet<ObjectId>,
 ) -> Option<(ObjectId, &'static str, Result<Value, String>)> {
     let kind = state.kind;
     let spec = kind.spec();
-    let rows: Vec<(ObjectId, &Object)> = model.iter_kind(kind).collect();
-    let is_load = spec.is_load();
+    let is_load = spec.is_load() && kind != ObjectKind::LoadCase;
+    let mut rows: Vec<(ObjectId, &Object)> = model.iter_kind(kind).collect();
+    // The empty row: the next free number (in the shown load case for loads).
+    let empty = Object::default();
+    let new_id = NEW_ROW_KINDS.contains(&kind).then(|| {
+        let lc = if is_load { load_case } else { 0 };
+        let no = model.next_no(kind, lc);
+        if is_load {
+            ObjectId::load(kind, lc, no)
+        } else {
+            ObjectId::new(kind, no)
+        }
+    });
+    if let Some(id) = new_id {
+        rows.push((id, &empty));
+    }
     let mut edit = None;
     let editable_color = ui.visuals().hyperlink_color;
     // The body scrolls within the space left above the sheet tabs (TableBuilder would
@@ -447,9 +513,15 @@ fn object_table(
                 .body(|body| {
                     body.rows(20.0, rows.len(), |mut row| {
                         let (id, obj) = rows[row.index()];
+                        let is_new = Some(id) == new_id;
                         row.set_selected(selection.contains(&id));
                         row.col(|ui| {
-                            ui.label(id.no.to_string());
+                            if is_new {
+                                ui.weak(id.no.to_string())
+                                    .on_hover_text("New row: type in a blue column to add");
+                            } else {
+                                ui.label(id.no.to_string());
+                            }
                         });
                         if is_load {
                             row.col(|ui| {
@@ -461,8 +533,8 @@ fn object_table(
                                 let value = obj.get(f.key);
                                 // Only fields the file stores for this object (e.g. a surface
                                 // without thickness has no thickness to edit).
-                                let editable =
-                                    is_editable(kind, f.key) && obj.values.contains_key(f.key);
+                                let editable = is_editable(kind, f.key)
+                                    && (is_new || obj.values.contains_key(f.key));
                                 // True / false: a checkbox, applied at once.
                                 if editable && f.ty == FieldType::Bool {
                                     let mut b = value.as_bool().unwrap_or(false);
@@ -510,14 +582,14 @@ fn object_table(
                                 if editable && label.double_clicked() {
                                     state.editing = Some((doc, id, f.key, edit_text(value)));
                                     state.focus_editor = true;
-                                } else if label.clicked() {
+                                } else if label.clicked() && !is_new {
                                     let ctrl = label.ctx.input(|i| i.modifiers.ctrl);
                                     click_select(ctrl, selection, id);
                                 }
                             });
                         }
                         let response = row.response();
-                        if response.clicked() {
+                        if response.clicked() && !is_new {
                             let ctrl = response.ctx.input(|i| i.modifiers.ctrl);
                             click_select(ctrl, selection, id);
                         }

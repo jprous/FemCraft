@@ -248,6 +248,7 @@ impl FemCraftApp {
                 let id = doc.id;
                 self.next_doc_id += 1;
                 doc.vis.take_toggles(&self.display);
+                doc.rf.prototype_files = Self::prototype_files();
                 doc.refresh(&self.grid, self.show_axes);
                 doc.zoom_to_model(&self.grid);
                 dock::add_document(&mut self.tree, id, self.active);
@@ -263,6 +264,23 @@ impl FemCraftApp {
     /// Where the blank model behind File > New is kept (next to the saved UI state).
     fn blank_model_path() -> Option<PathBuf> {
         eframe::storage_dir("FemCraft").map(|d| d.join("new model.rf6"))
+    }
+
+    /// RFEM files new objects are copied from when a model has none of that kind yet: the
+    /// `.rf6` files in `prototypes` next to the saved UI state.
+    fn prototype_files() -> Vec<PathBuf> {
+        let Some(dir) = eframe::storage_dir("FemCraft").map(|d| d.join("prototypes")) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rf6")))
+            .collect();
+        files.sort();
+        files
     }
 
     /// File > New: an untitled model from the blank model. The first time, the blank model is
@@ -302,6 +320,7 @@ impl FemCraftApp {
                 let id = doc.id;
                 self.next_doc_id += 1;
                 doc.vis.take_toggles(&self.display);
+                doc.rf.prototype_files = Self::prototype_files();
                 doc.refresh(&self.grid, self.show_axes);
                 doc.zoom_to_grid(&self.grid);
                 dock::add_document(&mut self.tree, id, self.active);
@@ -779,15 +798,18 @@ impl FemCraftApp {
                             ui,
                             d.id,
                             Some(&mut d.rf.model),
+                            d.vis.load_case,
                             tables,
                             &mut d.selection,
                         );
                         if changed {
                             d.revision += 1; // rebuild the 3D view
+                            // A load case may have been added or renamed.
+                            d.load_cases = scene::load_cases(&d.rf.model);
                         }
                     }
                     None => {
-                        panels::tables(ui, 0, None, tables, &mut Default::default());
+                        panels::tables(ui, 0, None, 0, tables, &mut Default::default());
                     }
                 }
             }

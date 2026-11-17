@@ -39,8 +39,15 @@ Plan and milestone status: `docs/ROADMAP.md`.
   every kind generically (main row -> impl row -> list / part tables -> derived maps), resolves
   db ids to object numbers, reports missing fields; `save` writes changed main / impl / part
   columns and list tables. Read-only: type, library section / material properties, fields with
-  no stored column (e.g. thickness of a surface without thickness). Not yet: adding / deleting
-  objects. `tests/editable_fields.rs` edits every UI-editable field on the private models.
+  no stored column (e.g. thickness of a surface without thickness). New objects (no binding) are
+  inserted on save as copies of a similar object (own db, else `prototype_files`), then the
+  model is reloaded and typed values re-applied (untyped refs cleared). Not yet: deleting.
+  `tests/editable_fields.rs` edits every UI-editable field on the private models;
+  `tests/new_objects.rs` builds a model from `blank_model` (`FEMCRAFT_KEEP=<path>` keeps it).
+- File > New: `build::blank_model` (template emptied, materials / sections kept, LC1 + 200 mm
+  thickness) cached as `%APPDATA%\FemCraft\data\new model.rf6`; prototypes from
+  `%APPDATA%\FemCraft\data\prototypes\*.rf6`. Tables in `panels::NEW_ROW_KINDS` end in an
+  empty row; typing adds the object (loads go to the load case shown in the 3D view).
 - UI editing (temporary test set, `panels::is_editable`): double-click a blue-headed table cell (comments in every table)
   (Enter commits, Escape cancels); File > Save (Ctrl+S) / Save As (Ctrl+Shift+S), `.rf6` only.
   No unsaved-changes prompt on close yet.

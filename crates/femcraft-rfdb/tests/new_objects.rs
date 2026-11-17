@@ -1,0 +1,153 @@
+//! Objects added in FemCraft are saved: copied from an object of the model itself or from
+//! prototype files. Uses local models in `testdata/private/` (never committed; skipped when
+//! absent).
+
+use std::path::{Path, PathBuf};
+
+use femcraft_model::{ObjectId, ObjectKind as K, Value};
+use femcraft_rfdb::RfDocument;
+use femcraft_rfdb::build::blank_model;
+
+fn private(name: &str) -> Option<PathBuf> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/private")
+        .join(name);
+    p.is_file().then_some(p).or_else(|| {
+        eprintln!("skipped: {name} not found");
+        None
+    })
+}
+
+fn add(doc: &mut RfDocument, id: ObjectId, fields: &[(&str, Value)]) {
+    doc.model.add(id).unwrap();
+    for (k, v) in fields {
+        doc.model.set(id, k, v.clone()).unwrap();
+    }
+}
+
+fn node(doc: &mut RfDocument, no: u32, x: f64, y: f64, z: f64) {
+    add(
+        doc,
+        ObjectId::new(K::Node, no),
+        &[
+            ("coordinate_1", Value::Float(x)),
+            ("coordinate_2", Value::Float(y)),
+            ("coordinate_3", Value::Float(z)),
+        ],
+    );
+}
+
+#[test]
+fn new_model_with_frame_slab_and_loads() {
+    let (Some(template), Some(portal), Some(pit)) = (
+        private("Solids_check_RBeam.rf6"),
+        private("FemCraft portal frame.rf6"),
+        private("FemCraft pit 3 loads.rf6"),
+    ) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let blank = dir.path().join("new model.rf6");
+    blank_model(&template, &blank).unwrap();
+    let mut doc = RfDocument::open(&blank).unwrap();
+    doc.prototype_files = vec![portal, pit];
+
+    // A cantilever column (member on line 1) and a 2 x 2 m slab (surface on lines 2-5).
+    node(&mut doc, 1, 0.0, 0.0, 0.0);
+    node(&mut doc, 2, 0.0, 0.0, -3.0);
+    node(&mut doc, 3, 2.0, 0.0, -3.0);
+    node(&mut doc, 4, 2.0, 2.0, -3.0);
+    node(&mut doc, 5, 0.0, 2.0, -3.0);
+    let lines: [&[u32]; 5] = [&[1, 2], &[2, 3], &[3, 4], &[4, 5], &[5, 2]];
+    for (i, l) in lines.iter().enumerate() {
+        add(
+            &mut doc,
+            ObjectId::new(K::Line, i as u32 + 1),
+            &[("definition_nodes", Value::RefList(l.to_vec()))],
+        );
+    }
+    add(
+        &mut doc,
+        ObjectId::new(K::Member, 1),
+        &[("line", Value::Ref(1)), ("section_start", Value::Ref(2))],
+    );
+    add(
+        &mut doc,
+        ObjectId::new(K::Surface, 1),
+        &[
+            ("boundary_lines", Value::RefList(vec![2, 3, 4, 5])),
+            ("thickness", Value::Ref(1)),
+        ],
+    );
+    add(
+        &mut doc,
+        ObjectId::new(K::LoadCase, 2),
+        &[("name", Value::Text("Imposed".into()))],
+    );
+    add(
+        &mut doc,
+        ObjectId::load(K::NodalLoad, 2, 1),
+        &[
+            ("nodes", Value::RefList(vec![3])),
+            ("magnitude", Value::Float(5_000.0)),
+        ],
+    );
+    add(
+        &mut doc,
+        ObjectId::load(K::SurfaceLoad, 2, 1),
+        &[
+            ("surfaces", Value::RefList(vec![1])),
+            ("uniform_magnitude", Value::Float(2_000.0)),
+        ],
+    );
+    let expected = doc.model.clone();
+
+    let out = dir.path().join("Model 1.rf6");
+    doc.save(&out).unwrap();
+    assert!(!doc.model.is_modified());
+    // FEMCRAFT_KEEP=<path>: keep the file, e.g. to open it in RFEM.
+    if let Ok(keep) = std::env::var("FEMCRAFT_KEEP") {
+        std::fs::copy(&out, keep).unwrap();
+    }
+    let back = RfDocument::open(&out).unwrap();
+    for (kind, n) in [
+        (K::Node, 5),
+        (K::Line, 5),
+        (K::Member, 1),
+        (K::Surface, 1),
+        (K::LoadCase, 2),
+        (K::NodalLoad, 1),
+        (K::SurfaceLoad, 1),
+    ] {
+        assert_eq!(back.model.count(kind), n, "{kind:?}");
+    }
+    // Every value typed in is read back.
+    for &kind in K::ALL {
+        for (id, o) in expected.iter_kind(kind) {
+            let got = back.model.get(id).unwrap();
+            for (k, v) in &o.values {
+                assert_eq!(got.get(k), v, "{id:?}.{k}");
+            }
+        }
+    }
+    // Untyped references of new objects are empty (not left pointing at the copied object's).
+    let m = back.model.get(ObjectId::new(K::Member, 1)).unwrap();
+    assert!(m.get("section_end").as_ref_no().is_none_or(|s| s == 2));
+}
+
+#[test]
+fn add_node_to_existing_model() {
+    let Some(src) = private("FemCraft portal frame.rf6") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = RfDocument::open(&src).unwrap();
+    let no = doc.model.next_no(K::Node, 0);
+    node(&mut doc, no, 3.0, 0.0, -6.0);
+    let out = dir.path().join("added.rf6");
+    doc.save(&out).unwrap();
+    let back = RfDocument::open(&out).unwrap();
+    assert_eq!(back.model.count(K::Node), no as usize);
+    assert_eq!(back.model.node_position(no), Some([3.0, 0.0, -6.0]));
+    assert_eq!(back.model.node_position(1), doc.model.node_position(1));
+}

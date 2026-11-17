@@ -21,6 +21,16 @@ fn editable(kind: K) -> Vec<&'static str> {
             "axes_z_reversed",
         ],
         K::NodalSupport | K::LineSupport | K::MemberSupport | K::SurfaceSupport => all(kind),
+        K::LoadCase => vec!["name", "self_weight_active", "to_solve"],
+        K::NodalLoad | K::LineLoad | K::MemberLoad | K::SurfaceLoad => vec![
+            "nodes",
+            "lines",
+            "members",
+            "surfaces",
+            "magnitude",
+            "magnitude_2",
+            "uniform_magnitude",
+        ],
         _ => vec![],
     };
     // Every table: comments (mostly empty in the file).
