@@ -188,6 +188,9 @@ impl Default for TableState {
 /// support kinds is editable.
 pub fn is_editable(kind: ObjectKind, key: &str) -> bool {
     use ObjectKind as K;
+    if key == "comment" {
+        return true;
+    }
     match kind {
         K::Thickness => matches!(key, "material" | "uniform_thickness"),
         K::Node => matches!(key, "coordinate_1" | "coordinate_2" | "coordinate_3"),
@@ -497,6 +500,13 @@ fn object_table(
                                     egui::Label::new(cell_text(value, f.ty))
                                         .sense(egui::Sense::click()),
                                 );
+                                // The whole cell reacts, so empty cells can be edited too.
+                                let cell = ui.interact(
+                                    ui.max_rect(),
+                                    ui.id().with(("cell", f.key)),
+                                    egui::Sense::click(),
+                                );
+                                let label = label.union(cell);
                                 if editable && label.double_clicked() {
                                     state.editing = Some((doc, id, f.key, edit_text(value)));
                                     state.focus_editor = true;

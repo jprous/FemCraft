@@ -1,4 +1,4 @@
-# FemCraft - notes for Claude Code
+﻿# FemCraft - notes for Claude Code
 
 Read this instead of re-researching the project. Keep sessions short and focused: the owner
 has a limited credit budget (see "Credit budget" in `docs/ROADMAP.md`).
@@ -41,7 +41,7 @@ Plan and milestone status: `docs/ROADMAP.md`.
   columns and list tables. Read-only: type, library section / material properties, fields with
   no stored column (e.g. thickness of a surface without thickness). Not yet: adding / deleting
   objects. `tests/editable_fields.rs` edits every UI-editable field on the private models.
-- UI editing (temporary test set, `panels::is_editable`): double-click a blue-headed table cell
+- UI editing (temporary test set, `panels::is_editable`): double-click a blue-headed table cell (comments in every table)
   (Enter commits, Escape cancels); File > Save (Ctrl+S) / Save As (Ctrl+Shift+S), `.rf6` only.
   No unsaved-changes prompt on close yet.
 - `rf6-catalog` research tool: `cargo run -p femcraft-rfdb --bin rf6-catalog -- file.rf6`

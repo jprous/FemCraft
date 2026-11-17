@@ -9,7 +9,7 @@ use femcraft_rfdb::RfDocument;
 /// Mirrors `femcraft_ui::panels::is_editable` (kept separate: rfdb does not depend on the UI).
 fn editable(kind: K) -> Vec<&'static str> {
     let all = |k: K| k.spec().fields.iter().map(|f| f.key).collect::<Vec<_>>();
-    match kind {
+    let mut keys = match kind {
         K::Thickness => vec!["material", "uniform_thickness"],
         K::Node => vec!["coordinate_1", "coordinate_2", "coordinate_3"],
         K::Line => vec!["definition_nodes"],
@@ -22,7 +22,12 @@ fn editable(kind: K) -> Vec<&'static str> {
         ],
         K::NodalSupport | K::LineSupport | K::MemberSupport | K::SurfaceSupport => all(kind),
         _ => vec![],
+    };
+    // Every table: comments (mostly empty in the file).
+    if !keys.contains(&"comment") && kind.spec().field("comment").is_some() {
+        keys.push("comment");
     }
+    keys
 }
 
 fn private(name: &str) -> Option<PathBuf> {
