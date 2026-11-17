@@ -2,6 +2,7 @@
 
 mod app;
 mod dock;
+mod document;
 mod panels;
 pub mod scene;
 
