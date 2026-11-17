@@ -260,6 +260,59 @@ impl FemCraftApp {
         }
     }
 
+    /// Where the blank model behind File > New is kept (next to the saved UI state).
+    fn blank_model_path() -> Option<PathBuf> {
+        eframe::storage_dir("FemCraft").map(|d| d.join("new model.rf6"))
+    }
+
+    /// File > New: an untitled model from the blank model. The first time, the blank model is
+    /// made from an RFEM file the user picks (settings, materials and sections are kept).
+    fn new_model(&mut self) {
+        let Some(blank) = Self::blank_model_path() else {
+            self.message = Some("No folder for FemCraft's data was found".into());
+            return;
+        };
+        if !blank.is_file() {
+            let Some(template) = rfd::FileDialog::new()
+                .set_title(
+                    "New model: choose an RFEM 6 model to take settings, materials and sections from",
+                )
+                .add_filter("RFEM 6 model", &["rf6"])
+                .pick_file()
+            else {
+                return;
+            };
+            if let Some(dir) = blank.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = femcraft_rfdb::build::blank_model(&template, &blank) {
+                let _ = std::fs::remove_file(&blank);
+                self.message = Some(format!(
+                    "Could not make a blank model from {}: {e}",
+                    template.display()
+                ));
+                return;
+            }
+        }
+        let n = (1..)
+            .find(|n| !self.docs.iter().any(|d| d.title() == format!("Model {n}")))
+            .unwrap_or(1);
+        match Document::new_untitled(self.next_doc_id, &blank, &format!("Model {n}")) {
+            Ok(mut doc) => {
+                let id = doc.id;
+                self.next_doc_id += 1;
+                doc.vis.take_toggles(&self.display);
+                doc.refresh(&self.grid, self.show_axes);
+                doc.zoom_to_grid(&self.grid);
+                dock::add_document(&mut self.tree, id, self.active);
+                self.docs.push(doc);
+                self.active = Some(id);
+                self.message = None;
+            }
+            Err(e) => self.message = Some(format!("Could not start a new model: {e}")),
+        }
+    }
+
     /// File > Save: writes the active model back to its file (`.rf6`).
     fn save(&mut self) {
         let Some(path) = self.active_doc().map(|d| d.path.clone()) else {
@@ -380,6 +433,13 @@ impl FemCraftApp {
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    if ui
+                        .add(egui::Button::new("New").shortcut_text("Ctrl+N"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.new_model();
+                    }
                     if ui.button("Open…").clicked() {
                         ui.close();
                         self.open_dialog();
@@ -1035,6 +1095,9 @@ impl eframe::App for FemCraftApp {
             self.save_as_dialog();
         } else if save {
             self.save();
+        }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
+            self.new_model();
         }
         // Escape releases the selection of the active model (unless a menu / popup is open,
         // where Escape closes that instead).

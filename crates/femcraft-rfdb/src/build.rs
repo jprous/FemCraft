@@ -730,6 +730,53 @@ impl Builder {
     }
 }
 
+/// Writes a blank model to `out`: `template` emptied of all objects (its settings, materials
+/// and sections kept), plus load case 1 "Self-weight" and, if the template has a uniform
+/// thickness, thickness 1 (200 mm, material 1). The basis of File > New.
+pub fn blank_model(template: &Path, out: &Path) -> Result<(), Error> {
+    let src = RfDocument::open(template)?;
+    let lc = find_proto(&src, ObjectKind::LoadCase, &[])?;
+    let thickness = find_proto(
+        &src,
+        ObjectKind::Thickness,
+        &[("type", Value::Text("TYPE_UNIFORM".into()))],
+    )
+    .ok();
+    let first_material = src
+        .model
+        .iter_kind(ObjectKind::Material)
+        .next()
+        .map(|(id, _)| id.no);
+    drop(src);
+
+    let mut b = Builder::from_template(template)?;
+    b.add(&lc, 1, None)?;
+    if let Some(t) = &thickness {
+        b.add(t, 1, None)?;
+    }
+    b.clear_dangling_references()?;
+    let mut doc = b.finish()?;
+    let set = |doc: &mut RfDocument, id: ObjectId, k: &str, v: Value| {
+        doc.model
+            .set(id, k, v)
+            .map_err(|e| Error::Format(format!("{id:?}.{k}: {e}")))
+    };
+    let lc1 = ObjectId::new(ObjectKind::LoadCase, 1);
+    set(&mut doc, lc1, "name", Value::Text("Self-weight".into()))?;
+    set(&mut doc, lc1, "self_weight_active", Value::Bool(true))?;
+    if thickness.is_some() {
+        let t1 = ObjectId::new(ObjectKind::Thickness, 1);
+        set(&mut doc, t1, "name", Value::Text("Slab 200".into()))?;
+        set(&mut doc, t1, "uniform_thickness", Value::Float(0.2))?;
+        if let Some(m) = first_material {
+            set(&mut doc, t1, "material", Value::Ref(m))?;
+        }
+    }
+    update_general_data(&mut doc)?;
+    placeholder_previews(&mut doc)?;
+    doc.save(out)
+}
+
 /// Updates `general_data.xml` for a newly built model: object counts, no results, new model id.
 pub fn update_general_data(doc: &mut RfDocument) -> Result<(), Error> {
     let Ok(bytes) = doc.archive.read_entry("general_data.xml") else {

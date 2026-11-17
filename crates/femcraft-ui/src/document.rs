@@ -83,6 +83,14 @@ impl Document {
         })
     }
 
+    /// A new, unsaved model from the blank model `template`, titled `name` (no extension, so
+    /// File > Save asks where to save it).
+    pub fn new_untitled(id: u64, template: &Path, name: &str) -> Result<Self, String> {
+        let mut doc = Self::open(id, template)?;
+        doc.path = PathBuf::from(name);
+        Ok(doc)
+    }
+
     pub fn model(&self) -> &Model {
         &self.rf.model
     }
