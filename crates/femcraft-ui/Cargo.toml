@@ -14,3 +14,9 @@ femcraft-render.workspace = true
 femcraft-model.workspace = true
 femcraft-rfdb.workspace = true
 rfd = "0.18.0"
+egui_extras = "0.37"
+egui_tiles = "0.18"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+ron = "0.12"

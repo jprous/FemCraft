@@ -11,3 +11,6 @@ publish.workspace = true
 eframe.workspace = true
 femcraft-ui.workspace = true
 femcraft-render.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0.12"
