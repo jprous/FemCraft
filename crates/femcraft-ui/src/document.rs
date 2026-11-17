@@ -79,6 +79,12 @@ impl Document {
         })
     }
 
+    /// Releases the selection and cancels a box selection in progress (Escape).
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.drag_box = None;
+    }
+
     /// File name, for tab titles and menus.
     pub fn title(&self) -> String {
         self.path.file_name().map_or_else(

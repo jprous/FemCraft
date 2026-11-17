@@ -829,6 +829,15 @@ impl eframe::App for FemCraftApp {
         for path in dropped {
             self.open(&path);
         }
+        // Escape releases the selection of the active model (unless a menu / popup is open,
+        // where Escape closes that instead).
+        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if escape
+            && !egui::Popup::is_any_open(ui.ctx())
+            && let Some(d) = self.active_doc_mut()
+        {
+            d.clear_selection();
+        }
         self.menu_bar(ui);
         self.ribbon(ui);
         self.status_bar(ui);

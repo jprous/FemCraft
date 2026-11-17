@@ -222,25 +222,46 @@ pub fn tables(
     if !kinds.contains(&state.kind) {
         state.kind = kinds[0];
     }
-    egui::ScrollArea::horizontal()
-        .id_salt("table_tabs")
+    // Sheet tabs along the bottom (wrapping onto a second row instead of scrolling), the table
+    // filling the space above them.
+    egui::Panel::bottom("table_sheet_tabs")
+        .resizable(false)
+        .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 4)))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 for k in &kinds {
                     ui.selectable_value(&mut state.kind, *k, k.spec().label);
                 }
             });
         });
-    ui.separator();
+    // The table fills the inner central panel: exactly the space above the sheet tabs.
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE)
+        .show(ui, |ui| object_table(ui, model, state.kind, selection));
+}
 
-    let spec = state.kind.spec();
-    let rows: Vec<(ObjectId, &Object)> = model.iter_kind(state.kind).collect();
+/// The rows of one object kind; clicking a row selects the object.
+fn object_table(
+    ui: &mut egui::Ui,
+    model: &Model,
+    kind: ObjectKind,
+    selection: &mut HashSet<ObjectId>,
+) {
+    let spec = kind.spec();
+    let rows: Vec<(ObjectId, &Object)> = model.iter_kind(kind).collect();
     let is_load = spec.is_load();
+    // The body scrolls within the space left above the sheet tabs (TableBuilder would
+    // otherwise grow up to its default 800 px and run underneath them). Leave room for the
+    // header row and the horizontal scroll bar.
+    let body_height = (ui.available_height() - 22.0 - 14.0).max(40.0);
     egui::ScrollArea::horizontal()
-        .id_salt(("table", state.kind))
+        .id_salt(("table", kind))
         .show(ui, |ui| {
             let mut table = TableBuilder::new(ui)
-                .id_salt(("table", state.kind))
+                .id_salt(("table", kind))
+                .max_scroll_height(body_height)
+                .min_scrolled_height(body_height)
+                .auto_shrink([false, true])
                 .striped(true)
                 .resizable(true)
                 .sense(egui::Sense::click())
