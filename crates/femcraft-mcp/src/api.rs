@@ -384,6 +384,10 @@ fn from_json(ty: FieldType, v: &Json) -> Result<Value, String> {
         (FieldType::Bool, Json::Bool(b)) => Value::Bool(*b),
         (FieldType::Int, Json::Number(n)) => Value::Int(n.as_i64().ok_or_else(bad)?),
         (FieldType::Float(_), Json::Number(n)) => Value::Float(n.as_f64().ok_or_else(bad)?),
+        // JSON has no infinity: "inf" = fixed / rigid, "-inf" = not set (RFEM's codes).
+        (FieldType::Float(_), Json::String(s)) if s.trim_start_matches('-') == "inf" => {
+            Value::Float(s.parse().map_err(|_| bad())?)
+        }
         (FieldType::Text, Json::String(s)) => Value::Text(s.clone()),
         (FieldType::Enum, Json::String(s)) => Value::Text(s.clone()),
         (FieldType::Enum, Json::Number(n)) => Value::Int(n.as_i64().ok_or_else(bad)?),
