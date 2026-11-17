@@ -15,7 +15,7 @@ use femcraft_render::viewport;
 use crate::dock::{self, Pane};
 use crate::document::Document;
 use crate::panels;
-use crate::scene;
+use crate::scene::{self, Visibility};
 
 const SPACING_PRESETS: [f32; 7] = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0];
 
@@ -32,11 +32,78 @@ struct Persisted {
     tree: egui_tiles::Tree<Pane>,
     recent: Vec<PathBuf>,
     ribbon_minimized: bool,
+    /// Display settings (absent in files from older versions).
+    #[serde(default)]
+    display: Option<SavedDisplay>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedDisplay {
+    vis: Visibility,
+    show_axes: bool,
+    grid: SavedGrid,
+}
+
+/// `GridSettings` as saved (the render crate has no serde).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct SavedGrid {
+    visible: bool,
+    /// "XY", "XZ" or "YZ".
+    plane: String,
+    spacing: f32,
+    extent: f32,
+    major_every: u32,
+    offset: f32,
+}
+
+impl Default for SavedGrid {
+    fn default() -> Self {
+        SavedGrid::from(&GridSettings::default())
+    }
+}
+
+impl From<&GridSettings> for SavedGrid {
+    fn from(g: &GridSettings) -> Self {
+        Self {
+            visible: g.visible,
+            plane: format!("{:?}", g.plane),
+            spacing: g.spacing,
+            extent: g.extent,
+            major_every: g.major_every,
+            offset: g.offset,
+        }
+    }
+}
+
+impl From<SavedGrid> for GridSettings {
+    fn from(s: SavedGrid) -> Self {
+        let d = GridSettings::default();
+        let ok = |v: f32| v.is_finite() && v > 0.0;
+        Self {
+            visible: s.visible,
+            plane: GridPlane::ALL
+                .into_iter()
+                .find(|p| format!("{p:?}") == s.plane)
+                .unwrap_or(d.plane),
+            spacing: if ok(s.spacing) { s.spacing } else { d.spacing },
+            extent: if ok(s.extent) { s.extent } else { d.extent },
+            major_every: s.major_every.max(1),
+            offset: if s.offset.is_finite() {
+                s.offset
+            } else {
+                d.offset
+            },
+        }
+    }
 }
 
 pub struct FemCraftApp {
     grid: GridSettings,
     show_axes: bool,
+    /// Display toggles remembered for newly opened models and the next session (follows the
+    /// active model).
+    display: Visibility,
 
     /// Open models, in opening order.
     docs: Vec<Document>,
@@ -54,13 +121,18 @@ pub struct FemCraftApp {
     recent: Vec<PathBuf>,
     /// Ribbon shows only its tab row (saved between sessions).
     ribbon_minimized: bool,
+    /// Last error (open / save), shown in red.
     message: Option<String>,
+    /// Last confirmation (e.g. saved), shown in the status bar.
+    notice: Option<String>,
 
     /// Dockable layout of the model tabs and panels.
     tree: egui_tiles::Tree<Pane>,
     ribbon_tab: RibbonTab,
     tables: panels::TableState,
     render_state: Option<eframe::egui_wgpu::RenderState>,
+    /// MCP requests from the HTTP listener (see `femcraft_mcp::http`).
+    mcp: Option<std::sync::mpsc::Receiver<femcraft_mcp::http::Request>>,
 }
 
 impl FemCraftApp {
@@ -75,6 +147,7 @@ impl FemCraftApp {
         let mut app = Self {
             grid: GridSettings::default(),
             show_axes: true,
+            display: Visibility::default(),
             docs: Vec::new(),
             active: None,
             next_doc_id: 1,
@@ -84,11 +157,23 @@ impl FemCraftApp {
             recent: Vec::new(),
             ribbon_minimized: false,
             message: None,
+            notice: None,
             tree: dock::default_tree(),
             ribbon_tab: RibbonTab::Home,
             tables: panels::TableState::default(),
             render_state: Some(render_state),
+            mcp: None,
         };
+        // Built-in MCP server on 127.0.0.1 (FEMCRAFT_MCP_PORT, 0 = off). A second instance
+        // finds the port taken and runs without it.
+        let port = std::env::var("FEMCRAFT_MCP_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(femcraft_mcp::DEFAULT_PORT);
+        if port != 0 {
+            let ctx = cc.egui_ctx.clone();
+            app.mcp = femcraft_mcp::http::serve(port, move || ctx.request_repaint()).ok();
+        }
         // Layout, recent files and ribbon state from the previous session.
         if let Some(saved) = cc
             .storage
@@ -99,6 +184,11 @@ impl FemCraftApp {
             }
             app.recent = saved.recent;
             app.ribbon_minimized = saved.ribbon_minimized;
+            if let Some(d) = saved.display {
+                app.display = d.vis;
+                app.show_axes = d.show_axes;
+                app.grid = d.grid.into();
+            }
         }
         // `femcraft a.rf6 [b.rf6 ...] [--lc=N] [--local-axes]` opens the files directly.
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -155,6 +245,13 @@ impl FemCraftApp {
             self.to_open.push(path.to_owned());
             return;
         }
+        if let Err(e) = self.try_open(path) {
+            self.message = Some(e);
+        }
+    }
+
+    /// [`Self::open`] returning the error (MCP); the model's id when opened.
+    fn try_open(&mut self, path: &Path) -> Result<u64, String> {
         let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
         if let Some(id) = self
             .docs
@@ -164,12 +261,14 @@ impl FemCraftApp {
         {
             self.activate(id);
             self.remember_recent(&abs);
-            return;
+            return Ok(id);
         }
         match Document::open(self.next_doc_id, path) {
             Ok(mut doc) => {
                 let id = doc.id;
                 self.next_doc_id += 1;
+                doc.vis.take_toggles(&self.display);
+                doc.rf.prototype_files = Self::prototype_files();
                 doc.refresh(&self.grid, self.show_axes);
                 doc.zoom_to_model(&self.grid);
                 dock::add_document(&mut self.tree, id, self.active);
@@ -177,8 +276,151 @@ impl FemCraftApp {
                 self.active = Some(id);
                 self.message = None;
                 self.remember_recent(&abs);
+                Ok(id)
             }
-            Err(e) => self.message = Some(format!("Could not open {}: {e}", path.display())),
+            Err(e) => Err(format!("Could not open {}: {e}", path.display())),
+        }
+    }
+
+    /// Where the blank model behind File > New is kept (next to the saved UI state).
+    pub fn blank_model_path() -> Option<PathBuf> {
+        eframe::storage_dir("FemCraft").map(|d| d.join("new model.rf6"))
+    }
+
+    /// RFEM files new objects are copied from when a model has none of that kind yet: the
+    /// `.rf6` files in `prototypes` next to the saved UI state.
+    /// Also the `prototypes` folder next to the executable.
+    pub fn prototype_files() -> Vec<PathBuf> {
+        let dirs = [
+            eframe::storage_dir("FemCraft").map(|d| d.join("prototypes")),
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| d.join("prototypes"))),
+        ];
+        let mut files: Vec<PathBuf> = Vec::new();
+        for dir in dirs.into_iter().flatten() {
+            let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rf6")))
+                .collect();
+            found.sort();
+            files.extend(found);
+        }
+        files
+    }
+
+    /// File > New: an untitled model from the template model. The first time, the user picks
+    /// the template: an RFEM model without geometry, copied as it is.
+    fn new_model(&mut self) {
+        let Some(blank) = Self::blank_model_path() else {
+            self.message = Some("No folder for FemCraft's data was found".into());
+            return;
+        };
+        if !blank.is_file() {
+            let Some(template) = rfd::FileDialog::new()
+                .set_title("New model: choose the template (an RFEM 6 model without geometry)")
+                .add_filter("RFEM 6 model", &["rf6"])
+                .pick_file()
+            else {
+                return;
+            };
+            if let Some(dir) = blank.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            // Used as it is: a model saved by RFEM (no geometry, with the materials, sections,
+            // supports and load cases new models should start with) opens in RFEM for sure.
+            if let Err(e) = std::fs::copy(&template, &blank) {
+                self.message = Some(format!("Could not copy {}: {e}", template.display()));
+                return;
+            }
+        }
+        if let Err(e) = self.new_from(&blank, None) {
+            self.message = Some(e);
+        }
+    }
+
+    /// An untitled model from the blank model `blank`, named `name` or "Model N".
+    fn new_from(&mut self, blank: &Path, name: Option<&str>) -> Result<String, String> {
+        let name = name.map_or_else(
+            || {
+                let n = (1..)
+                    .find(|n| !self.docs.iter().any(|d| d.title() == format!("Model {n}")))
+                    .unwrap_or(1);
+                format!("Model {n}")
+            },
+            str::to_owned,
+        );
+        match Document::new_untitled(self.next_doc_id, blank, &name) {
+            Ok(mut doc) => {
+                let id = doc.id;
+                self.next_doc_id += 1;
+                doc.vis.take_toggles(&self.display);
+                doc.rf.prototype_files = Self::prototype_files();
+                doc.refresh(&self.grid, self.show_axes);
+                doc.zoom_to_grid(&self.grid);
+                dock::add_document(&mut self.tree, id, self.active);
+                self.docs.push(doc);
+                self.active = Some(id);
+                self.message = None;
+                Ok(name)
+            }
+            Err(e) => Err(format!("Could not start a new model: {e}")),
+        }
+    }
+
+    /// File > Save: writes the active model back to its file (`.rf6`).
+    fn save(&mut self) {
+        let Some(path) = self.active_doc().map(|d| d.path.clone()) else {
+            return;
+        };
+        let is_rf6 = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rf6"));
+        if is_rf6 {
+            let _ = self.save_to(&path);
+        } else {
+            self.save_as_dialog();
+        }
+    }
+
+    /// File > Save As: asks for a new `.rf6` path and saves the active model there.
+    fn save_as_dialog(&mut self) {
+        let Some(d) = self.active_doc() else { return };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save RFEM model as")
+            .add_filter("RFEM 6 model", &["rf6"])
+            .set_file_name(d.title());
+        if let Some(dir) = d.path.parent().filter(|p| p.is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(mut path) = dialog.save_file() {
+            if path.extension().is_none() {
+                path.set_extension("rf6");
+            }
+            let _ = self.save_to(&path);
+        }
+    }
+
+    fn save_to(&mut self, path: &Path) -> Result<(), String> {
+        let Some(d) = self.active_doc_mut() else {
+            return Err("no model is open".into());
+        };
+        match d.save_as(path) {
+            Ok(()) => {
+                self.message = None;
+                self.notice = Some(format!("Saved {}", path.display()));
+                self.remember_recent(path);
+                Ok(())
+            }
+            Err(e) => {
+                let e = format!("Could not save {}: {e}", path.display());
+                self.notice = None;
+                self.message = Some(e.clone());
+                Err(e)
+            }
         }
     }
 
@@ -252,11 +494,37 @@ impl FemCraftApp {
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    if ui
+                        .add(egui::Button::new("New").shortcut_text("Ctrl+N"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.new_model();
+                    }
                     if ui.button("Open…").clicked() {
                         ui.close();
                         self.open_dialog();
                     }
                     ui.menu_button("Open Recent", |ui| self.recent_menu(ui));
+                    ui.separator();
+                    let has_doc = self.active.is_some();
+                    if ui
+                        .add_enabled(has_doc, egui::Button::new("Save").shortcut_text("Ctrl+S"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.save();
+                    }
+                    if ui
+                        .add_enabled(
+                            has_doc,
+                            egui::Button::new("Save As…").shortcut_text("Ctrl+Shift+S"),
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                        self.save_as_dialog();
+                    }
                     ui.separator();
                     let active = self.active;
                     if ui
@@ -284,6 +552,14 @@ impl FemCraftApp {
                         self.reset_layout();
                         ui.close();
                     }
+                    if ui
+                        .button("Reset Display")
+                        .on_hover_text("Default display toggles, grid and global axes")
+                        .clicked()
+                    {
+                        self.reset_display();
+                        ui.close();
+                    }
                     ui.separator();
                     ui.checkbox(&mut self.ribbon_minimized, "Minimise ribbon");
                 });
@@ -304,7 +580,8 @@ impl FemCraftApp {
         }
         let mut switch_to = None;
         for (i, d) in self.docs.iter().enumerate() {
-            let label = format!("{}  {}", i + 1, d.title());
+            let star = if d.is_modified() { " *" } else { "" };
+            let label = format!("{}  {}{star}", i + 1, d.title());
             let r = ui
                 .selectable_label(self.active == Some(d.id), label)
                 .on_hover_text(d.path.display().to_string());
@@ -335,6 +612,16 @@ impl FemCraftApp {
     }
 
     /// Default layout, with the open models put back in the model space.
+    /// View > Reset Display: default display toggles, grid and axes, for every open model.
+    fn reset_display(&mut self) {
+        self.display = Visibility::default();
+        self.grid = GridSettings::default();
+        self.show_axes = true;
+        for d in &mut self.docs {
+            d.vis.take_toggles(&self.display);
+        }
+    }
+
     fn reset_layout(&mut self) {
         self.tree = dock::default_tree();
         let mut prev = None;
@@ -539,15 +826,38 @@ impl FemCraftApp {
                     .show(ui, |ui| self.settings_contents(ui));
             }
             Pane::Navigator => match self.active_doc_mut() {
-                Some(d) => panels::navigator(ui, Some(&d.model), &d.load_cases, &mut d.selection),
+                Some(d) => {
+                    panels::navigator(ui, Some(&d.rf.model), &d.load_cases, &mut d.selection)
+                }
                 None => panels::navigator(ui, None, &[], &mut Default::default()),
             },
             Pane::Tables => {
                 let tables = &mut self.tables;
                 let id = self.active;
                 match id.and_then(|id| self.docs.iter_mut().find(|d| d.id == id)) {
-                    Some(d) => panels::tables(ui, Some(&d.model), tables, &mut d.selection),
-                    None => panels::tables(ui, None, tables, &mut Default::default()),
+                    Some(d) => {
+                        let changed = panels::tables(
+                            ui,
+                            d.id,
+                            Some(&mut d.rf.model),
+                            d.vis.load_case,
+                            tables,
+                            &mut d.selection,
+                        );
+                        if changed {
+                            d.revision += 1; // rebuild the 3D view
+                            // A load case may have been added or renamed.
+                            d.load_cases = scene::load_cases(&d.rf.model);
+                        }
+                        if let Some((doc, obj, item)) = tables.take_pick()
+                            && doc == d.id
+                        {
+                            tables.report(assign_library_item(d, obj, &item));
+                        }
+                    }
+                    None => {
+                        panels::tables(ui, 0, None, 0, tables, &mut Default::default());
+                    }
                 }
             }
         }
@@ -604,7 +914,7 @@ impl FemCraftApp {
         };
         ui.label(d.title())
             .on_hover_text(d.path.display().to_string());
-        let count = |k| d.model.count(k);
+        let count = |k| d.model().count(k);
         ui.weak(format!(
             "{} nodes · {} lines · {} members · {} surfaces · {} solids",
             count(ObjectKind::Node),
@@ -620,12 +930,27 @@ impl FemCraftApp {
             ui.checkbox(&mut v.lines, "Lines");
             ui.end_row();
             ui.checkbox(&mut v.members, "Members");
+            ui.add_enabled(
+                v.members,
+                egui::Checkbox::new(&mut v.member_profiles, "Profile"),
+            )
+            .on_hover_text("Draw members with their section; off: as a thick line");
+            ui.end_row();
             ui.checkbox(&mut v.surfaces, "Surfaces");
-            ui.end_row();
             ui.checkbox(&mut v.supports, "Supports");
-            ui.checkbox(&mut v.loads, "Loads");
             ui.end_row();
+            ui.checkbox(&mut v.loads, "Loads");
             ui.checkbox(&mut v.local_axes, "Local axes");
+            ui.end_row();
+            let has_mesh = d.fe_mesh.is_some() && !d.rf.is_modified();
+            ui.add_enabled(has_mesh, egui::Checkbox::new(&mut v.fe_mesh, "Mesh"))
+                .on_hover_text("FE mesh saved by RFEM")
+                .on_disabled_hover_text(if d.fe_mesh.is_some() {
+                    "The mesh no longer matches the edited model; mesh it again in RFEM"
+                } else {
+                    "No mesh in this file; mesh or calculate the model in RFEM"
+                });
+            ui.end_row();
             ui.add_enabled(
                 v.loads,
                 egui::Checkbox::new(&mut v.load_values, "Load values"),
@@ -778,6 +1103,10 @@ impl FemCraftApp {
                     self.grid.plane.label(),
                     self.grid.spacing
                 ));
+                if let Some(n) = &self.notice {
+                    ui.separator();
+                    ui.label(n);
+                }
                 if let Some(d) = doc {
                     ui.separator();
                     ui.label(d.title());
@@ -819,6 +1148,13 @@ fn load_case_combo(ui: &mut egui::Ui, id: &str, d: &mut Document) {
 
 impl eframe::App for FemCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Requests from MCP clients (the HTTP listener queues them for this thread).
+        if let Some(rx) = self.mcp.take() {
+            while let Ok(req) = rx.try_recv() {
+                req.answer(self);
+            }
+            self.mcp = Some(rx);
+        }
         let dropped: Vec<PathBuf> = ui.input(|i| {
             i.raw
                 .dropped_files
@@ -828,6 +1164,25 @@ impl eframe::App for FemCraftApp {
         });
         for path in dropped {
             self.open(&path);
+        }
+        // Ctrl+S saves, Ctrl+Shift+S saves as.
+        let (save, save_as) = ui.input_mut(|i| {
+            let save_as = i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::S,
+            );
+            (
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
+                save_as,
+            )
+        });
+        if save_as {
+            self.save_as_dialog();
+        } else if save {
+            self.save();
+        }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
+            self.new_model();
         }
         // Escape releases the selection of the active model (unless a menu / popup is open,
         // where Escape closes that instead).
@@ -847,6 +1202,11 @@ impl eframe::App for FemCraftApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.docks(ui));
+        // The active model's display toggles are the ones remembered for the next model and
+        // the next session.
+        if let Some(v) = self.active_doc().map(|d| d.vis.clone()) {
+            self.display.take_toggles(&v);
+        }
     }
 
     /// Called by eframe on exit (and periodically): keeps layout, recent files and ribbon
@@ -856,6 +1216,11 @@ impl eframe::App for FemCraftApp {
             tree: dock::for_saving(&self.tree),
             recent: self.recent.clone(),
             ribbon_minimized: self.ribbon_minimized,
+            display: Some(SavedDisplay {
+                vis: self.display.clone(),
+                show_axes: self.show_axes,
+                grid: SavedGrid::from(&self.grid),
+            }),
         };
         eframe::set_value(storage, PERSIST_KEY, &state);
     }
@@ -891,12 +1256,17 @@ impl egui_tiles::Behavior<Pane> for TileBehavior<'_> {
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
         match pane {
             Pane::Document(id) => {
-                let title = self
-                    .app
-                    .docs
-                    .iter()
-                    .find(|d| d.id == *id)
-                    .map_or_else(|| "(closed)".to_owned(), |d| d.title());
+                let title = self.app.docs.iter().find(|d| d.id == *id).map_or_else(
+                    || "(closed)".to_owned(),
+                    |d| {
+                        // "*" marks unsaved edits.
+                        if d.is_modified() {
+                            format!("{} *", d.title())
+                        } else {
+                            d.title()
+                        }
+                    },
+                );
                 if self.app.active == Some(*id) && self.app.docs.len() > 1 {
                     egui::RichText::new(title).strong().into()
                 } else {
@@ -1060,4 +1430,139 @@ fn ribbon_model(ui: &mut egui::Ui) {
     ribbon_group(ui, "Edit", |ui| {
         coming_soon(ui, "Delete");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_settings_read_back() {
+        let grid = GridSettings {
+            plane: GridPlane::XZ,
+            spacing: 0.5,
+            ..GridSettings::default()
+        };
+        let vis = Visibility {
+            member_profiles: false,
+            loads: false,
+            ..Visibility::default()
+        };
+        let saved = SavedDisplay {
+            vis: vis.clone(),
+            show_axes: false,
+            grid: SavedGrid::from(&grid),
+        };
+        let back: SavedDisplay = ron::from_str(&ron::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(back.vis, vis);
+        assert!(!back.show_axes);
+        assert_eq!(GridSettings::from(back.grid), grid);
+        // A toggle added in a later version falls back to its default.
+        let old: Visibility = ron::from_str("(nodes: false)").unwrap();
+        assert!(!old.nodes && old.member_profiles);
+    }
+}
+
+/// MCP methods act on the open models like the menu commands do.
+/// Makes material / section `obj` of `d` the picked library item; the text says what was done.
+fn assign_library_item(
+    d: &mut Document,
+    obj: femcraft_model::ObjectId,
+    item: &femcraft_rfdb::LibraryItem,
+) -> Result<String, String> {
+    use femcraft_model::{ObjectId, ObjectKind as K};
+    let lib = femcraft_rfdb::Library::find(&femcraft_rfdb::Library::default_dirs())
+        .ok_or("No FemCraft library found")?;
+    d.rf.assign_library_item(obj, &lib, item)
+        .map_err(|e| format!("{} {}: {e}", obj.kind.spec().label, obj.no))?;
+    d.revision += 1; // rebuild the 3D view
+    let mut note = format!(
+        "{} {} is now {} (save to keep it).",
+        obj.kind.name(),
+        obj.no,
+        item.name
+    );
+    // RFEM material type codes: 1 concrete, 10 steel.
+    let material_type = |no: Option<u32>| {
+        no.and_then(|n| d.rf.model.get(ObjectId::new(K::Material, n)))
+            .and_then(|m| m.get("type").as_i64())
+    };
+    if obj.kind == K::Section {
+        let sec = d.rf.model.get(obj);
+        let mat = sec.and_then(|s| s.get("material").as_ref_no());
+        let concrete_section = item.category == "concrete";
+        match material_type(mat) {
+            Some(1) if !concrete_section => note.push_str(&format!(
+                " Note: its material {} is concrete.",
+                mat.unwrap()
+            )),
+            Some(t) if t != 1 && concrete_section => note.push_str(&format!(
+                " Note: its material {} is not concrete.",
+                mat.unwrap()
+            )),
+            _ => {}
+        }
+    }
+    Ok(note)
+}
+
+impl femcraft_mcp::Workspace for FemCraftApp {
+    fn new_model(&mut self, name: Option<&str>) -> Result<String, String> {
+        let blank = Self::blank_model_path()
+            .filter(|p| p.is_file())
+            .ok_or("no blank model: use File > New once in FemCraft to choose the template")?;
+        self.new_from(&blank, name)
+    }
+
+    fn open_model(&mut self, path: &Path) -> Result<String, String> {
+        let id = self.try_open(path)?;
+        Ok(self
+            .docs
+            .iter()
+            .find(|d| d.id == id)
+            .map(Document::title)
+            .unwrap_or_default())
+    }
+
+    fn save_model(&mut self, path: Option<&Path>) -> Result<PathBuf, String> {
+        let own = self
+            .active_doc()
+            .map(|d| d.path.clone())
+            .ok_or("no model is open")?;
+        let path = match path {
+            Some(p) => std::path::absolute(p).unwrap_or_else(|_| p.to_owned()),
+            None if own
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("rf6")) =>
+            {
+                own
+            }
+            None => return Err("the model is untitled; use save_as".into()),
+        };
+        self.save_to(&path)?;
+        Ok(path)
+    }
+
+    fn models(&self) -> Vec<femcraft_mcp::ModelInfo> {
+        self.docs
+            .iter()
+            .map(|d| femcraft_mcp::ModelInfo {
+                name: d.title(),
+                path: d.path.clone(),
+                active: self.active == Some(d.id),
+                modified: d.is_modified(),
+            })
+            .collect()
+    }
+
+    fn active(&mut self) -> Option<&mut femcraft_rfdb::RfDocument> {
+        self.active_doc_mut().map(|d| &mut d.rf)
+    }
+
+    fn changed(&mut self) {
+        if let Some(d) = self.active_doc_mut() {
+            d.revision += 1; // rebuild the 3D view
+            d.load_cases = scene::load_cases(&d.rf.model);
+        }
+    }
 }

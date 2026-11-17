@@ -104,6 +104,11 @@ pub struct RfDocument {
     ref_by_id: HashMap<(ObjectKind, &'static str), bool>,
     /// Object number -> database id, per referenced kind.
     ids: HashMap<ObjectKind, HashMap<u32, i64>>,
+    /// RFEM files to copy new objects from when this model has no object of that kind yet
+    /// (see [`crate::build::insert_new_objects`]).
+    pub prototype_files: Vec<std::path::PathBuf>,
+    /// The working database was changed directly (library items assigned) since the last save.
+    db_changed: bool,
 }
 
 type Row = Vec<(String, Sql)>;
@@ -399,6 +404,53 @@ fn derived_value(
             }
             Ok(None)
         }
+        Derived::SectionLibraryId => {
+            let (Some(Sql::Text(lib)), Some(lib_id)) = (
+                get(impl_row, "librarySection_table"),
+                get(impl_row, "librarySection_id").and_then(int),
+            ) else {
+                return Ok(None);
+            };
+            if lib != "DatabaseSection"
+                || cat
+                    .table(lib)
+                    .and_then(|t| t.column("databaseSectionId"))
+                    .is_none()
+            {
+                return Ok(None);
+            }
+            // Any stored type (an integer in RFEM's files); a number when it reads as one.
+            let v: Option<Sql> = conn
+                .prepare_cached(&format!(
+                    "SELECT databaseSectionId FROM {} WHERE id = ?1",
+                    quote(lib)
+                ))?
+                .query_row([lib_id], |r| r.get(0))
+                .optional()?;
+            Ok(v.and_then(|v| match v {
+                Sql::Integer(i) => Some(Sql::Integer(i)),
+                Sql::Text(t) => t.trim().parse().ok().map(Sql::Integer),
+                _ => None,
+            }))
+        }
+        Derived::SectionShape => {
+            let (Some(Sql::Text(lib)), Some(lib_id)) = (
+                get(impl_row, "librarySection_table"),
+                get(impl_row, "librarySection_id").and_then(int),
+            ) else {
+                return Ok(None);
+            };
+            if lib != "ParametricSection" || cat.table(lib).is_none() {
+                return Ok(None);
+            }
+            let Some(code) = lookup_int(conn, lib, "parametrizationShape", lib_id)? else {
+                return Ok(None);
+            };
+            Ok(Some(match mapping::parametric_shape(code) {
+                Some(name) => Sql::Text(name.to_owned()),
+                None => Sql::Integer(code),
+            }))
+        }
         Derived::SurfaceStiffness => {
             let Some((_, _, Sql::Text(t))) = part_value(
                 conn,
@@ -488,6 +540,94 @@ impl RfDocument {
     /// Loads the model from an already opened archive (for example one prepared by
     /// [`crate::build`]).
     pub fn from_archive(archive: Archive) -> Result<Self, Error> {
+        let (raws, report) = Self::read(&archive)?;
+        let mut doc = Self {
+            archive,
+            model: Model::new(),
+            report,
+            bindings: HashMap::new(),
+            ref_by_id: HashMap::new(),
+            ids: HashMap::new(),
+            prototype_files: Vec::new(),
+            db_changed: false,
+        };
+        doc.resolve(raws);
+        Ok(doc)
+    }
+
+    /// Whether there is anything to save: model edits or library items assigned.
+    pub fn is_modified(&self) -> bool {
+        self.model.is_modified() || self.db_changed
+    }
+
+    /// Makes material / section `id` the library item `item` ([`crate::library`]): the item's
+    /// rows are copied from the library database and the object refers to them (members and
+    /// surfaces keep referring to the object; a section keeps its material). Pending edits are
+    /// written to the working database first and the model is reloaded, so the object shows
+    /// the library values. Saved with the next [`RfDocument::save`].
+    pub fn assign_library_item(
+        &mut self,
+        id: ObjectId,
+        lib: &crate::Library,
+        item: &crate::LibraryItem,
+    ) -> Result<(), Error> {
+        use crate::LibraryKind as L;
+        let main = match (id.kind, item.kind) {
+            (ObjectKind::Material, L::Material) => "Material",
+            (ObjectKind::Section, L::Section) => "Section",
+            _ => {
+                return Err(Error::Unsupported(format!(
+                    "a library {} for a {}",
+                    item.kind.name(),
+                    id.kind.name()
+                )));
+            }
+        };
+        // As saving does: new objects get rows, edits are written (the reload keeps them).
+        self.insert_new_objects()?;
+        self.apply_edits()?;
+        let (table, key) = self
+            .db_key(id)
+            .map(|(t, k)| (t.to_owned(), k))
+            .ok_or_else(|| {
+                Error::Format(format!(
+                    "{} {} is not in the database",
+                    id.kind.name(),
+                    id.no
+                ))
+            })?;
+        let lib_conn =
+            Connection::open_with_flags(lib.db_path(item.kind), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let lib_schema = crate::build::Schema::read(&lib_conn)?;
+        let lib_main: i64 = lib_conn.query_row(
+            &format!("SELECT id FROM {} WHERE userID = ?1", quote(main)),
+            [item.user_id],
+            |r| r.get(0),
+        )?;
+        let proto =
+            crate::build::capture_library_item(&lib_conn, &lib_schema, id.kind, main, lib_main)?;
+        let mut b = crate::build::Builder::on_db(self.archive.db_path())?;
+        b.begin()?;
+        b.replace_with(&proto, &table, key)?;
+        b.commit()?;
+        self.reload()?;
+        self.db_changed = true;
+        Ok(())
+    }
+
+    /// Loads the model again from the working database (after rows were inserted).
+    fn reload(&mut self) -> Result<(), Error> {
+        let (raws, report) = Self::read(&self.archive)?;
+        self.model = Model::new();
+        self.report = report;
+        self.bindings.clear();
+        self.ref_by_id.clear();
+        self.ids.clear();
+        self.resolve(raws);
+        Ok(())
+    }
+
+    fn read(archive: &Archive) -> Result<(Vec<Raw>, LoadReport), Error> {
         let conn =
             Connection::open_with_flags(archive.db_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let cat = Catalog::read(&conn)?;
@@ -672,16 +812,7 @@ impl RfDocument {
             });
         }
 
-        let mut doc = Self {
-            archive,
-            model: Model::new(),
-            report,
-            bindings: HashMap::new(),
-            ref_by_id: HashMap::new(),
-            ids: HashMap::new(),
-        };
-        doc.resolve(raws);
-        Ok(doc)
+        Ok((raws, report))
     }
 
     /// Converts references to object numbers, deciding per field whether the database
@@ -723,8 +854,9 @@ impl RfDocument {
         }
         self.ref_by_id = votes
             .into_iter()
-            // RFEM stores db ids; ties (ids equal to numbers) count as ids.
-            .map(|(k, (by_id, by_no))| (k, by_id > 0 && by_id >= by_no))
+            // RFEM stores db ids; ties (ids equal to numbers) and fields with no values
+            // (e.g. an empty list, filled in later by an edit) count as ids.
+            .map(|(k, (by_id, by_no))| (k, by_id >= by_no))
             .collect();
 
         let map = |by_id: bool, target: ObjectKind, n: u32| -> u32 {
@@ -773,6 +905,206 @@ impl RfDocument {
             self.bindings.insert(id, r.binding.clone());
             self.model.insert_loaded(id, std::mem::take(&mut r.obj));
         }
+    }
+
+    /// Objects added in the model get database rows: each is a copy of a matching object (from
+    /// this model, else from [`Self::prototype_files`]) with a new number. The model is then
+    /// reloaded and the typed values set again, so [`Self::apply_edits`] writes them; fields left
+    /// empty keep the copied values, except references, which are cleared.
+    fn insert_new_objects(&mut self) -> Result<(), Error> {
+        let mut new: Vec<ObjectId> = self
+            .model
+            .dirty()
+            .iter()
+            .filter(|id| !self.bindings.contains_key(id))
+            .copied()
+            .collect();
+        if new.is_empty() {
+            return Ok(());
+        }
+        // Load cases first: loads need their database ids.
+        new.sort_by_key(|id| (id.kind != ObjectKind::LoadCase, *id));
+        // One transaction: nothing is inserted unless every new object can be.
+        let mut b = crate::build::Builder::on_db(self.archive.db_path())?;
+        let mut donors: Vec<Option<RfDocument>> = Vec::new();
+        let files = self.prototype_files.clone();
+        // A copy must suit this database (a file from another RFEM version may lack columns).
+        let mut why: Vec<String> = Vec::new();
+        let pick = |b: &crate::build::Builder,
+                    donors: &mut Vec<Option<RfDocument>>,
+                    why: &mut Vec<String>,
+                    own: Option<&RfDocument>,
+                    get: &dyn Fn(&RfDocument) -> Option<crate::build::Proto>|
+         -> Option<crate::build::Proto> {
+            let fits =
+                |p: crate::build::Proto, from: &str, why: &mut Vec<String>| match b.misfit(&p) {
+                    None => Some(p),
+                    Some(m) => {
+                        why.push(format!("{from}: {m}"));
+                        None
+                    }
+                };
+            // The model's own objects match its database; else the prototype with the fewest
+            // missing columns (none: same RFEM version), missing ones getting defaults.
+            if let Some(own) = own {
+                match get(own) {
+                    Some(p) => {
+                        if let Some(p) = fits(p, "this model", why) {
+                            return Some(p);
+                        }
+                    }
+                    None => why.push("this model: none".into()),
+                }
+            }
+            if files.is_empty() {
+                why.push("no prototype files given".into());
+            }
+            let mut best: Option<(usize, crate::build::Proto)> = None;
+            for (i, f) in files.iter().enumerate() {
+                let name = f
+                    .file_name()
+                    .map_or(String::new(), |n| n.to_string_lossy().into());
+                if donors.len() <= i {
+                    donors.push(match RfDocument::open(f) {
+                        Ok(d) => Some(d),
+                        Err(e) => {
+                            why.push(format!("{name}: could not open ({e})"));
+                            None
+                        }
+                    });
+                }
+                let Some(d) = donors[i].as_ref() else {
+                    continue;
+                };
+                match get(d) {
+                    Some(p) => {
+                        if let Some(p) = fits(p, &name, why) {
+                            let missing = b.missing_columns(&p);
+                            if missing == 0 {
+                                return Some(p);
+                            }
+                            if best.as_ref().is_none_or(|(m, _)| missing < *m) {
+                                best = Some((missing, p));
+                            }
+                        }
+                    }
+                    None => why.push(format!("{name}: none")),
+                }
+            }
+            best.map(|(_, p)| p)
+        };
+        // Keyed by kind and prototype filter (a nodal load with components needs another copy).
+        let mut protos: HashMap<(ObjectKind, String), crate::build::Proto> = HashMap::new();
+        let key_of = |id: &ObjectId, model: &Model| {
+            let want = prototype_filter(id.kind, model.get(*id).expect("new objects exist"));
+            ((id.kind, format!("{want:?}")), want)
+        };
+        for id in &new {
+            let (key, want) = key_of(id, &self.model);
+            if protos.contains_key(&key) {
+                continue;
+            }
+            why.clear();
+            let get = |d: &RfDocument| crate::build::find_proto(d, id.kind, &want).ok();
+            let p = pick(&b, &mut donors, &mut why, Some(&*self), &get).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "adding {}: no usable example in this model or the prototype files{}",
+                    id.kind.name(),
+                    if why.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", why.join("; "))
+                    }
+                ))
+            })?;
+            protos.insert(key, p);
+        }
+        // New surfaces need the objects RFEM makes with the first surface.
+        let mut extra = Vec::new();
+        if new.iter().any(|id| id.kind == ObjectKind::Surface) {
+            for table in crate::build::SURFACE_SUPPORT_TABLES {
+                if b.count_rows(table)? > 0 {
+                    continue;
+                }
+                why.clear();
+                let get = |d: &RfDocument| crate::build::first_of_table(d, table).ok().flatten();
+                let p = pick(&b, &mut donors, &mut why, None, &get).ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "adding surfaces: no usable {table} in the prototype files{}",
+                        if why.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", why.join("; "))
+                        }
+                    ))
+                })?;
+                extra.push(p);
+            }
+        }
+        drop(donors);
+
+        let mut lc_ids = self
+            .ids
+            .get(&ObjectKind::LoadCase)
+            .cloned()
+            .unwrap_or_default();
+        {
+            b.begin()?;
+            for p in &extra {
+                b.add(p, 1, None)?;
+            }
+            for id in &new {
+                let lc = if id.kind.spec().is_load() {
+                    Some(*lc_ids.get(&id.load_case).ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "{} {}: load case {} does not exist",
+                            id.kind.name(),
+                            id.no,
+                            id.load_case
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                let main = b.add(&protos[&key_of(id, &self.model).0], id.no as i64, lc)?;
+                match id.kind {
+                    ObjectKind::Surface => b.make_surface_standard(main)?,
+                    ObjectKind::LoadCase => {
+                        lc_ids.insert(id.no, main);
+                    }
+                    _ => {}
+                }
+            }
+            // References a copy brought from another file that point nowhere.
+            b.clear_dangling_references()?;
+            b.commit()?;
+        }
+
+        let old = std::mem::replace(&mut self.model, Model::new());
+        self.reload()?;
+        for id in old.dirty() {
+            let (Some(o), Some(fresh)) = (old.get(*id), self.model.get(*id).cloned()) else {
+                continue;
+            };
+            let is_new = new.contains(id);
+            for f in id.kind.spec().fields {
+                if !fresh.values.contains_key(f.key) {
+                    continue;
+                }
+                let v = match (o.get(f.key), f.ty) {
+                    (Value::Null, FieldType::Ref(_)) if is_new => Value::Null,
+                    (Value::Null, FieldType::RefList(_)) if is_new => Value::RefList(Vec::new()),
+                    (Value::Null, _) => continue,
+                    (v, _) => v.clone(),
+                };
+                if fresh.get(f.key) != &v {
+                    self.model
+                        .set(*id, f.key, v)
+                        .map_err(|e| Error::Format(format!("{id:?}.{}: {e}", f.key)))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Writes edited fields into the working database. All-or-nothing.
@@ -965,9 +1297,19 @@ impl RfDocument {
         })
     }
 
+    /// FE mesh saved by RFEM (`!solver/M/`), if the file holds one. See [`crate::mesh`].
+    pub fn fe_mesh(&self) -> Result<Option<crate::FeMesh>, Error> {
+        crate::FeMesh::read(&self.archive)
+    }
+
     /// Saves to `path`: `.rf6` sources are re-zipped with unchanged sidecars; bare databases are
     /// copied. Unchanged models give a byte-identical `model.db`.
     pub fn save(&mut self, path: &Path) -> Result<(), Error> {
+        // Mesh and results under `!solver/` belong to the unedited model.
+        if self.is_modified() && !self.archive.drop_prefixes.iter().any(|p| p == "!solver/") {
+            self.archive.drop_prefixes.push("!solver/".into());
+        }
+        self.insert_new_objects()?;
         self.apply_edits()?;
         match self.archive.format {
             SourceFormat::Rf6 => self.archive.save_rf6(path)?,
@@ -980,6 +1322,31 @@ impl RfDocument {
             }
         }
         self.model.clear_changes();
+        self.db_changed = false;
         Ok(())
+    }
+}
+
+/// Which object a new object of `kind` is copied from (the simplest type of each kind).
+fn prototype_filter(kind: ObjectKind, obj: &Object) -> Vec<(&'static str, Value)> {
+    use ObjectKind as K;
+    let t = |k: &'static str, v: &str| vec![(k, Value::Text(v.into()))];
+    match kind {
+        K::Node => t("type", "TYPE_STANDARD"),
+        K::Line => t("type", "TYPE_POLYLINE"),
+        K::Member => t("type", "TYPE_BEAM"),
+        K::Surface => t("geometry", "GEOMETRY_PLANE"),
+        K::Thickness => t("type", "TYPE_UNIFORM"),
+        // Nodal loads by components (PX ... MZ) are their own load type.
+        K::NodalLoad
+            if obj
+                .values
+                .iter()
+                .any(|(k, v)| k.starts_with("components_") && !matches!(v, Value::Null)) =>
+        {
+            t("load_type", "LOAD_TYPE_COMPONENTS")
+        }
+        k if k.spec().is_load() && k != K::LoadCase => t("load_type", "LOAD_TYPE_FORCE"),
+        _ => Vec::new(),
     }
 }

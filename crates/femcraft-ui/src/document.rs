@@ -30,7 +30,12 @@ pub struct Document {
     /// Unique per session; names the tab and the GPU buffers.
     pub id: u64,
     pub path: PathBuf,
-    pub model: Model,
+    /// The file as loaded (model plus how it maps to the database), kept for saving.
+    pub rf: RfDocument,
+    /// FE mesh RFEM saved in the file (shown until the model is edited).
+    pub fe_mesh: Option<femcraft_rfdb::FeMesh>,
+    /// Bumped on every edit, so the 3D view is rebuilt.
+    pub revision: u64,
     pub load_cases: Vec<(u32, String)>,
     /// Problems reported while loading.
     pub warnings: Vec<String>,
@@ -44,7 +49,7 @@ pub struct Document {
     lines: Arc<Vec<LineVertex>>,
     triangles: Arc<Vec<LineVertex>>,
     version: u64,
-    built_from: Option<(GridSettings, bool, Visibility)>,
+    built_from: Option<(GridSettings, bool, Visibility, u64)>,
     /// Box drag in progress: button and start position.
     drag_box: Option<(egui::PointerButton, Pos2)>,
 }
@@ -54,6 +59,11 @@ impl Document {
     pub fn open(id: u64, path: &Path) -> Result<Self, String> {
         let doc = RfDocument::open(path).map_err(|e| e.to_string())?;
         let load_cases = scene::load_cases(&doc.model);
+        let mut warnings = doc.report.warnings.clone();
+        let fe_mesh = doc.fe_mesh().unwrap_or_else(|e| {
+            warnings.push(format!("FE mesh not read: {e}"));
+            None
+        });
         let vis = Visibility {
             load_case: scene::first_loaded_case(&doc.model)
                 .or(load_cases.first().map(|(n, _)| *n))
@@ -64,8 +74,10 @@ impl Document {
             id,
             path: path.to_owned(),
             load_cases,
-            warnings: doc.report.warnings.clone(),
-            model: doc.model,
+            warnings,
+            rf: doc,
+            fe_mesh,
+            revision: 0,
             vis,
             scene: Scene::default(),
             camera: OrbitCamera::default(),
@@ -77,6 +89,34 @@ impl Document {
             built_from: None,
             drag_box: None,
         })
+    }
+
+    /// A new, unsaved model from the blank model `template`, titled `name` (no extension, so
+    /// File > Save asks where to save it).
+    pub fn new_untitled(id: u64, template: &Path, name: &str) -> Result<Self, String> {
+        let mut doc = Self::open(id, template)?;
+        doc.path = PathBuf::from(name);
+        Ok(doc)
+    }
+
+    pub fn model(&self) -> &Model {
+        &self.rf.model
+    }
+
+    /// Unsaved edits?
+    pub fn is_modified(&self) -> bool {
+        self.rf.is_modified()
+    }
+
+    /// Writes the model (with its edits) to `path` as `.rf6`; the document then refers to it.
+    pub fn save_as(&mut self, path: &Path) -> Result<(), String> {
+        if self.rf.is_modified() {
+            // Saving an edited model drops RFEM's mesh (see `RfDocument::save`).
+            self.fe_mesh = None;
+        }
+        self.rf.save(path).map_err(|e| e.to_string())?;
+        self.path = path.to_owned();
+        Ok(())
     }
 
     /// Releases the selection and cancels a box selection in progress (Escape).
@@ -97,11 +137,16 @@ impl Document {
     pub fn refresh(&mut self, grid: &GridSettings, show_axes: bool) {
         // Support glyphs along lines / surface edges follow the grid spacing.
         self.vis.glyph_spacing = grid.spacing;
-        let key = (grid.clone(), show_axes, self.vis.clone());
+        let key = (grid.clone(), show_axes, self.vis.clone(), self.revision);
         if self.built_from.as_ref() == Some(&key) {
             return;
         }
-        self.scene = scene::build(&self.model, &self.vis);
+        self.scene = scene::build(&self.rf.model, &self.vis);
+        if let Some(mesh) = &self.fe_mesh {
+            if self.vis.fe_mesh && !self.rf.is_modified() {
+                scene::add_fe_mesh(&mut self.scene, mesh);
+            }
+        }
 
         let mut v = Vec::new();
         if grid.visible {
@@ -333,6 +378,13 @@ impl Document {
 
     /// Nodes, support symbols and load labels, drawn in screen space over the GPU geometry.
     fn paint_model_marks(&self, painter: &egui::Painter, to_screen: &dyn Fn(Vec3) -> Option<Pos2>) {
+        // Members without profile: 2 px, one more than a line element.
+        let member = Stroke::new(2.0_f32, rgba(scene::MEMBER));
+        for (a, b) in &self.scene.member_lines {
+            if let (Some(a), Some(b)) = (to_screen(*a), to_screen(*b)) {
+                painter.line_segment([a, b], member);
+            }
+        }
         let node = rgba(scene::NODE);
         for p in self.scene.nodes.iter().filter_map(|p| to_screen(*p)) {
             painter.circle_filled(p, 2.5, node);

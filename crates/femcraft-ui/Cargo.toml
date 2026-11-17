@@ -13,6 +13,7 @@ glam.workspace = true
 femcraft-render.workspace = true
 femcraft-model.workspace = true
 femcraft-rfdb.workspace = true
+femcraft-mcp.workspace = true
 rfd = "0.18.0"
 egui_extras = "0.37"
 egui_tiles = "0.18"

@@ -7,11 +7,15 @@ pub mod archive;
 pub mod build;
 pub mod catalog;
 pub mod document;
+pub mod library;
 pub mod mapping;
+pub mod mesh;
 
 pub use archive::{Archive, SourceFormat};
 pub use catalog::Catalog;
 pub use document::{KindReport, LoadReport, RfDocument};
+pub use library::{Library, LibraryFilter, LibraryItem, LibraryKind, LibraryValue};
+pub use mesh::FeMesh;
 
 #[derive(Debug)]
 pub enum Error {

@@ -115,6 +115,7 @@ const N_M2: &str = "N/m²";
 static MATERIAL: &[FieldSpec] = &[
     NAME,
     TYPE,
+    f("database_material_id", "RFEM library id", Int),
     f("elasticity_modulus", "Modulus of elasticity E", Float("Pa")),
     f("shear_modulus", "Shear modulus G", Float("Pa")),
     f("poisson_ratio", "Poisson's ratio ν", Float("")),
@@ -132,6 +133,11 @@ static SECTION: &[FieldSpec] = &[
     NAME,
     TYPE,
     f("material", "Material", Ref(K::Material)),
+    f("database_section_id", "RFEM library id", Int),
+    f("parametrization_type", "Parametric shape", Enum),
+    f("b", "Width b", Float("m")),
+    f("h", "Depth h", Float("m")),
+    f("d", "Diameter d", Float("m")),
     f("A", "Area A", Float("m²")),
     f("I_y", "Moment of inertia Iy", Float("m⁴")),
     f("I_z", "Moment of inertia Iz", Float("m⁴")),
@@ -172,6 +178,8 @@ static MEMBER: &[FieldSpec] = &[
     f("line", "Line", Ref(K::Line)),
     f("section_start", "Section start", Ref(K::Section)),
     f("section_end", "Section end", Ref(K::Section)),
+    // 0 = uniform.
+    f("section_distribution", "Cross-section distribution", Enum),
     f("rotation_angle", "Rotation β", Float("rad")),
     f("member_hinge_start", "Hinge start", Int),
     f("member_hinge_end", "Hinge end", Int),

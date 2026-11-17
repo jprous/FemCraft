@@ -47,6 +47,14 @@ fn main() {
 
 fn run() -> Res<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `rf6-build --blank <out.rf6> <template.rf6>`: the blank model behind File > New.
+    if let [flag, out, template] = &args[..]
+        && flag == "--blank"
+    {
+        femcraft_rfdb::build::blank_model(Path::new(template), Path::new(out))?;
+        println!("wrote {out}");
+        return Ok(());
+    }
     let [out, template, donors @ ..] = &args[..] else {
         return Err("usage: rf6-build <out-dir> <template.rf6> [donor.rf6 ...]".into());
     };

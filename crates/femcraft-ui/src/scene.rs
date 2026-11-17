@@ -11,7 +11,7 @@ use glam::Vec3;
 
 pub const NODE: [f32; 4] = [0.95, 0.20, 0.20, 1.0];
 const LINE: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
-const MEMBER: [f32; 4] = [0.45, 0.72, 1.0, 1.0];
+pub const MEMBER: [f32; 4] = [0.45, 0.72, 1.0, 1.0];
 const SURFACE_FILL: [f32; 4] = [0.30, 0.62, 0.70, 0.28];
 const SUPPORTED_FILL: [f32; 4] = [0.62, 0.48, 0.28, 0.32];
 pub const SUPPORT: [f32; 4] = [0.35, 0.85, 0.40, 1.0];
@@ -58,11 +58,14 @@ pub fn to_model(p: Vec3) -> Vec3 {
 /// The model's global axes in viewport world coordinates.
 pub const GLOBAL_AXES: [(Vec3, &str); 3] = [(Vec3::X, "X"), (Vec3::NEG_Y, "Y"), (Vec3::NEG_Z, "Z")];
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Visibility {
     pub nodes: bool,
     pub lines: bool,
     pub members: bool,
+    /// Members drawn with their section profile; off: a line 1 px thicker than a line element.
+    pub member_profiles: bool,
     pub surfaces: bool,
     pub supports: bool,
     pub loads: bool,
@@ -70,6 +73,8 @@ pub struct Visibility {
     pub load_values: bool,
     /// Local axis triads on members and surfaces.
     pub local_axes: bool,
+    /// FE mesh saved by RFEM, while the model is unedited.
+    pub fe_mesh: bool,
     /// Load case whose loads are shown.
     pub load_case: u32,
     /// Spacing of support glyphs along lines and surface edges (the grid spacing), metres.
@@ -82,14 +87,27 @@ impl Default for Visibility {
             nodes: true,
             lines: true,
             members: true,
+            member_profiles: true,
             surfaces: true,
             supports: true,
             loads: true,
             load_values: true,
             local_axes: false,
+            fe_mesh: true,
             load_case: 1,
             glyph_spacing: 1.0,
         }
+    }
+}
+
+impl Visibility {
+    /// Takes the display toggles of `other`, keeping this model's load case and glyph spacing.
+    pub fn take_toggles(&mut self, other: &Visibility) {
+        *self = Visibility {
+            load_case: self.load_case,
+            glyph_spacing: self.glyph_spacing,
+            ..other.clone()
+        };
     }
 }
 
@@ -129,6 +147,8 @@ pub struct Scene {
     pub lines: Vec<LineVertex>,
     pub triangles: Vec<LineVertex>,
     pub nodes: Vec<Vec3>,
+    /// Members without profile: segments painted in screen space, thicker than GPU lines.
+    pub member_lines: Vec<(Vec3, Vec3)>,
     /// Selectable objects with their world points (node: 1 point, line / member: polyline,
     /// surface: boundary polygon).
     pub pick: Vec<(ObjectId, Vec<Vec3>)>,
@@ -196,6 +216,16 @@ fn kn(v: f64, unit: &str) -> String {
     format!("{:.3} {unit}", v / 1000.0)
         .replace(".000 ", " ")
         .replace("00 ", " ")
+}
+
+/// FE element edges (thin, dark grey) on top of the scene.
+pub fn add_fe_mesh(s: &mut Scene, mesh: &femcraft_rfdb::FeMesh) {
+    const MESH: [f32; 4] = [0.25, 0.25, 0.3, 0.9];
+    for (a, b) in mesh.edges() {
+        if let (Some(a), Some(b)) = (mesh.node(a), mesh.node(b)) {
+            s.line(to_world(a), to_world(b), MESH);
+        }
+    }
 }
 
 pub fn build(model: &Model, vis: &Visibility) -> Scene {
@@ -272,7 +302,11 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
                     .push(format!("Member {}: line {line} has no nodes", id.no));
             }
             for w in pts.windows(2) {
-                member_box(&mut s, w[0], w[1], b, h, beta);
+                if vis.member_profiles {
+                    member_box(&mut s, w[0], w[1], b, h, beta);
+                } else {
+                    s.member_lines.push((to_world(w[0]), to_world(w[1])));
+                }
             }
             if pts.len() >= 2 {
                 s.pick
@@ -1011,6 +1045,51 @@ mod tests {
             pts.iter()
                 .all(|p| p.x > 0.1 && p.x < 2.9 && p.y > 0.1 && p.y < 2.9)
         );
+    }
+
+    #[test]
+    fn members_with_and_without_profile() {
+        let mut m = Model::new();
+        for (no, x) in [(1, 0.0), (2, 6.0)] {
+            let id = ObjectId::new(K::Node, no);
+            m.add(id).unwrap();
+            m.set(id, "coordinate_1", Value::Float(x)).unwrap();
+            m.set(id, "coordinate_2", Value::Float(0.0)).unwrap();
+            m.set(id, "coordinate_3", Value::Float(0.0)).unwrap();
+        }
+        let line = ObjectId::new(K::Line, 1);
+        m.add(line).unwrap();
+        m.set(line, "definition_nodes", Value::RefList(vec![1, 2]))
+            .unwrap();
+        let member = ObjectId::new(K::Member, 1);
+        m.add(member).unwrap();
+        m.set(member, "line", Value::Ref(1)).unwrap();
+
+        let vis = Visibility {
+            lines: false,
+            ..Visibility::default()
+        };
+        let profile = build(&m, &vis);
+        assert!(!profile.lines.is_empty() && profile.member_lines.is_empty());
+
+        let plain = build(
+            &m,
+            &Visibility {
+                member_profiles: false,
+                ..vis.clone()
+            },
+        );
+        assert_eq!(plain.member_lines.len(), 1);
+        assert!(plain.lines.is_empty() && plain.triangles.is_empty());
+
+        let hidden = build(
+            &m,
+            &Visibility {
+                members: false,
+                ..vis
+            },
+        );
+        assert!(hidden.member_lines.is_empty() && hidden.lines.is_empty());
     }
 
     #[test]
