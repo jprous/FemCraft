@@ -113,6 +113,10 @@ all of them. Lessons: concrete surfaces need a `ConcreteExposureCondition` and a
 
 ### M4 - Application layout (can run alongside M1-M3)
 
+Skeleton done: ribbon bar on top (File menu, Home / View / Model / Loads tabs, tool groups with
+placeholders), left / right / bottom docks with panes as tabs (Display, Navigator tree, object
+Tables), panes movable between docks and reopenable from View > Panels.
+
 - Dockable panels (`egui_dock`), layout remembered between sessions:
   - Navigator on the left with tabs: Data, Display, Views, Results
   - Tables at the bottom, one tab per object type (`egui_table`, virtualised)

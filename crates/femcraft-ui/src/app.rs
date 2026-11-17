@@ -14,6 +14,8 @@ use femcraft_render::grid::{GridPlane, GridSettings};
 use femcraft_render::viewport::{self, LineVertex, LinesCallback};
 use femcraft_rfdb::RfDocument;
 
+use crate::dock::{Dock, DockLayout, Pane};
+use crate::panels;
 use crate::scene::{self, Scene, SupportSymbol, Visibility};
 
 /// An opened model file.
@@ -59,6 +61,11 @@ pub struct FemCraftApp {
     selection: HashSet<ObjectId>,
     /// Box drag in progress: button and start position.
     drag_box: Option<(egui::PointerButton, Pos2)>,
+
+    /// Docks around the model space and the panes in them.
+    layout: DockLayout,
+    ribbon_tab: RibbonTab,
+    tables: panels::TableState,
 }
 
 /// Does the segment `a`-`b` touch the rectangle?
@@ -112,6 +119,9 @@ impl FemCraftApp {
             message: None,
             selection: HashSet::new(),
             drag_box: None,
+            layout: DockLayout::default(),
+            ribbon_tab: RibbonTab::Home,
+            tables: panels::TableState::default(),
         };
         // `femcraft model.rf6 [--lc=N] [--local-axes]` opens the file directly.
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -228,10 +238,12 @@ impl FemCraftApp {
         self.camera.set_view(view);
     }
 
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+    /// Ribbon bar across the top: File menu, ribbon tabs and their tool groups.
+    fn ribbon(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        egui::Panel::top("menu").show(ui, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
+        egui::Panel::top("ribbon").show(ui, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open…").clicked() {
                         ui.close();
@@ -242,39 +254,170 @@ impl FemCraftApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
-                ui.menu_button("View", |ui| {
-                    for (label, view) in [
-                        ("Isometric", StandardView::Iso),
-                        ("Top (XY)", StandardView::Top),
-                        ("Front (XZ)", StandardView::Front),
-                        ("Right (YZ)", StandardView::Right),
-                    ] {
-                        if ui.button(label).clicked() {
-                            self.set_view(view);
-                            ui.close();
-                        }
-                    }
-                    ui.separator();
-                    if ui.button("Zoom to model").clicked() {
-                        self.zoom_to_model();
-                        ui.close();
-                    }
-                    if ui.button("Zoom to grid").clicked() {
-                        self.zoom_to_grid();
-                        ui.close();
-                    }
-                });
+                ui.separator();
+                for tab in RibbonTab::ALL {
+                    ui.selectable_value(&mut self.ribbon_tab, tab, tab.title());
+                }
             });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.set_min_height(58.0);
+                match self.ribbon_tab {
+                    RibbonTab::Home => self.ribbon_home(ui),
+                    RibbonTab::View => self.ribbon_view(ui),
+                    RibbonTab::Model => ribbon_model(ui),
+                    RibbonTab::Loads => self.ribbon_loads(ui),
+                }
+            });
+            ui.add_space(2.0);
         });
     }
 
-    fn settings_panel(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("settings")
-            .resizable(true)
-            .default_size(250.0)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.settings_contents(ui));
+    fn ribbon_home(&mut self, ui: &mut egui::Ui) {
+        ribbon_group(ui, "File", |ui| {
+            if ui.button("Open…").clicked() {
+                self.open_dialog();
+            }
+            coming_soon(ui, "Save");
+        });
+        ribbon_group(ui, "View", |ui| {
+            if ui.button("Zoom extents").clicked() {
+                self.zoom_to_model();
+            }
+            if ui.button("Iso").clicked() {
+                self.set_view(StandardView::Iso);
+            }
+        });
+    }
+
+    fn ribbon_view(&mut self, ui: &mut egui::Ui) {
+        ribbon_group(ui, "Views", |ui| {
+            for (label, view) in [
+                ("Iso", StandardView::Iso),
+                ("Top", StandardView::Top),
+                ("Front", StandardView::Front),
+                ("Right", StandardView::Right),
+            ] {
+                if ui.button(label).clicked() {
+                    self.set_view(view);
+                }
+            }
+        });
+        ribbon_group(ui, "Zoom", |ui| {
+            if ui.button("Model").clicked() {
+                self.zoom_to_model();
+            }
+            if ui.button("Grid").clicked() {
+                self.zoom_to_grid();
+            }
+        });
+        ribbon_group(ui, "Projection", |ui| {
+            ui.radio_value(
+                &mut self.camera.projection,
+                Projection::Perspective,
+                "Perspective",
+            );
+            ui.radio_value(
+                &mut self.camera.projection,
+                Projection::Orthographic,
+                "Orthographic",
+            );
+        });
+        ribbon_group(ui, "Panels", |ui| {
+            for pane in Pane::ALL {
+                let mut open = self.layout.is_open(pane);
+                let hint = format!(
+                    "Docked {}. Right-click its tab to move or close it.",
+                    self.layout.dock_of(pane).label()
+                );
+                if ui
+                    .toggle_value(&mut open, pane.title())
+                    .on_hover_text(hint)
+                    .changed()
+                {
+                    self.layout.set_open(pane, open);
+                }
+            }
+            if ui.button("Reset layout").clicked() {
+                self.layout.reset();
+            }
+        });
+    }
+
+    fn ribbon_loads(&mut self, ui: &mut egui::Ui) {
+        ribbon_group(ui, "Load case", |ui| match &self.model {
+            Some(m) => {
+                let current = m
+                    .load_cases
+                    .iter()
+                    .find(|(n, _)| *n == self.vis.load_case)
+                    .map_or_else(
+                        || format!("LC{}", self.vis.load_case),
+                        |(n, name)| format!("LC{n} {name}"),
+                    );
+                egui::ComboBox::from_id_salt("ribbon_lc")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for (n, name) in &m.load_cases {
+                            ui.selectable_value(
+                                &mut self.vis.load_case,
+                                *n,
+                                format!("LC{n} {name}"),
+                            );
+                        }
+                    });
+            }
+            None => {
+                ui.weak("no model");
+            }
+        });
+        ribbon_group(ui, "Insert", |ui| {
+            for name in ["Nodal load", "Line load", "Member load", "Surface load"] {
+                coming_soon(ui, name);
+            }
+        });
+    }
+
+    /// The docks around the model space and the panes in them.
+    fn docks(&mut self, ui: &mut egui::Ui) {
+        for dock in Dock::ALL {
+            if self.layout.panes_in(dock).is_empty() {
+                continue;
+            }
+            let panel = match dock {
+                Dock::Left => egui::Panel::left("dock_left").default_size(270.0),
+                Dock::Right => egui::Panel::right("dock_right").default_size(290.0),
+                Dock::Bottom => egui::Panel::bottom("dock_bottom").default_size(230.0),
+            };
+            panel.resizable(true).show(ui, |ui| {
+                let active = self.layout.tab_strip(ui, dock);
+                ui.separator();
+                if let Some(pane) = active {
+                    self.pane_ui(ui, pane);
+                }
             });
+        }
+    }
+
+    fn pane_ui(&mut self, ui: &mut egui::Ui, pane: Pane) {
+        match pane {
+            Pane::Display => {
+                egui::ScrollArea::vertical()
+                    .id_salt("display_pane")
+                    .show(ui, |ui| self.settings_contents(ui));
+            }
+            Pane::Navigator => {
+                let (model, lcs) = match &self.model {
+                    Some(m) => (Some(&m.model), m.load_cases.as_slice()),
+                    None => (None, &[][..]),
+                };
+                panels::navigator(ui, model, lcs, &mut self.selection);
+            }
+            Pane::Tables => {
+                let model = self.model.as_ref().map(|m| &m.model);
+                panels::tables(ui, model, &mut self.tables, &mut self.selection);
+            }
+        }
     }
 
     /// Model summary, display toggles and load case selector.
@@ -778,14 +921,79 @@ impl eframe::App for FemCraftApp {
         if let Some(path) = dropped {
             self.open(&path);
         }
-        self.menu_bar(ui);
-        self.settings_panel(ui);
+        self.ribbon(ui);
         self.status_bar(ui);
+        self.docks(ui);
         self.refresh_lines();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.viewport_ui(ui));
     }
+}
+
+/// Ribbon tabs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RibbonTab {
+    Home,
+    View,
+    Model,
+    Loads,
+}
+
+impl RibbonTab {
+    const ALL: [RibbonTab; 4] = [
+        RibbonTab::Home,
+        RibbonTab::View,
+        RibbonTab::Model,
+        RibbonTab::Loads,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            RibbonTab::Home => "Home",
+            RibbonTab::View => "View",
+            RibbonTab::Model => "Model",
+            RibbonTab::Loads => "Loads",
+        }
+    }
+}
+
+/// A titled group of ribbon tools.
+fn ribbon_group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.group(|ui| {
+        ui.vertical(|ui| {
+            ui.horizontal(add);
+            ui.add_space(2.0);
+            ui.weak(egui::RichText::new(title).small());
+        });
+    });
+}
+
+/// Placeholder ribbon button for a tool that is not implemented yet.
+fn coming_soon(ui: &mut egui::Ui, label: &str) {
+    ui.add_enabled(false, egui::Button::new(label))
+        .on_disabled_hover_text("Coming later");
+}
+
+fn ribbon_model(ui: &mut egui::Ui) {
+    ribbon_group(ui, "Insert", |ui| {
+        for name in ["Node", "Line", "Member", "Surface", "Opening", "Solid"] {
+            coming_soon(ui, name);
+        }
+    });
+    ribbon_group(ui, "Basic objects", |ui| {
+        for name in ["Material", "Section", "Thickness"] {
+            coming_soon(ui, name);
+        }
+    });
+    ribbon_group(ui, "Supports", |ui| {
+        for name in ["Nodal", "Line", "Member", "Surface"] {
+            coming_soon(ui, name);
+        }
+    });
+    ribbon_group(ui, "Edit", |ui| {
+        coming_soon(ui, "Delete");
+    });
 }
 
 fn rgba(c: [f32; 4]) -> Color32 {
