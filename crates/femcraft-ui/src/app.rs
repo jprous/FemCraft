@@ -15,7 +15,7 @@ use femcraft_render::viewport;
 use crate::dock::{self, Pane};
 use crate::document::Document;
 use crate::panels;
-use crate::scene;
+use crate::scene::{self, Visibility};
 
 const SPACING_PRESETS: [f32; 7] = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0];
 
@@ -32,11 +32,78 @@ struct Persisted {
     tree: egui_tiles::Tree<Pane>,
     recent: Vec<PathBuf>,
     ribbon_minimized: bool,
+    /// Display settings (absent in files from older versions).
+    #[serde(default)]
+    display: Option<SavedDisplay>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedDisplay {
+    vis: Visibility,
+    show_axes: bool,
+    grid: SavedGrid,
+}
+
+/// `GridSettings` as saved (the render crate has no serde).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct SavedGrid {
+    visible: bool,
+    /// "XY", "XZ" or "YZ".
+    plane: String,
+    spacing: f32,
+    extent: f32,
+    major_every: u32,
+    offset: f32,
+}
+
+impl Default for SavedGrid {
+    fn default() -> Self {
+        SavedGrid::from(&GridSettings::default())
+    }
+}
+
+impl From<&GridSettings> for SavedGrid {
+    fn from(g: &GridSettings) -> Self {
+        Self {
+            visible: g.visible,
+            plane: format!("{:?}", g.plane),
+            spacing: g.spacing,
+            extent: g.extent,
+            major_every: g.major_every,
+            offset: g.offset,
+        }
+    }
+}
+
+impl From<SavedGrid> for GridSettings {
+    fn from(s: SavedGrid) -> Self {
+        let d = GridSettings::default();
+        let ok = |v: f32| v.is_finite() && v > 0.0;
+        Self {
+            visible: s.visible,
+            plane: GridPlane::ALL
+                .into_iter()
+                .find(|p| format!("{p:?}") == s.plane)
+                .unwrap_or(d.plane),
+            spacing: if ok(s.spacing) { s.spacing } else { d.spacing },
+            extent: if ok(s.extent) { s.extent } else { d.extent },
+            major_every: s.major_every.max(1),
+            offset: if s.offset.is_finite() {
+                s.offset
+            } else {
+                d.offset
+            },
+        }
+    }
 }
 
 pub struct FemCraftApp {
     grid: GridSettings,
     show_axes: bool,
+    /// Display toggles remembered for newly opened models and the next session (follows the
+    /// active model).
+    display: Visibility,
 
     /// Open models, in opening order.
     docs: Vec<Document>,
@@ -78,6 +145,7 @@ impl FemCraftApp {
         let mut app = Self {
             grid: GridSettings::default(),
             show_axes: true,
+            display: Visibility::default(),
             docs: Vec::new(),
             active: None,
             next_doc_id: 1,
@@ -103,6 +171,11 @@ impl FemCraftApp {
             }
             app.recent = saved.recent;
             app.ribbon_minimized = saved.ribbon_minimized;
+            if let Some(d) = saved.display {
+                app.display = d.vis;
+                app.show_axes = d.show_axes;
+                app.grid = d.grid.into();
+            }
         }
         // `femcraft a.rf6 [b.rf6 ...] [--lc=N] [--local-axes]` opens the files directly.
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -174,6 +247,7 @@ impl FemCraftApp {
             Ok(mut doc) => {
                 let id = doc.id;
                 self.next_doc_id += 1;
+                doc.vis.take_toggles(&self.display);
                 doc.refresh(&self.grid, self.show_axes);
                 doc.zoom_to_model(&self.grid);
                 dock::add_document(&mut self.tree, id, self.active);
@@ -357,6 +431,14 @@ impl FemCraftApp {
                         self.reset_layout();
                         ui.close();
                     }
+                    if ui
+                        .button("Reset Display")
+                        .on_hover_text("Default display toggles, grid and global axes")
+                        .clicked()
+                    {
+                        self.reset_display();
+                        ui.close();
+                    }
                     ui.separator();
                     ui.checkbox(&mut self.ribbon_minimized, "Minimise ribbon");
                 });
@@ -409,6 +491,16 @@ impl FemCraftApp {
     }
 
     /// Default layout, with the open models put back in the model space.
+    /// View > Reset Display: default display toggles, grid and axes, for every open model.
+    fn reset_display(&mut self) {
+        self.display = Visibility::default();
+        self.grid = GridSettings::default();
+        self.show_axes = true;
+        for d in &mut self.docs {
+            d.vis.take_toggles(&self.display);
+        }
+    }
+
     fn reset_layout(&mut self) {
         self.tree = dock::default_tree();
         let mut prev = None;
@@ -962,6 +1054,11 @@ impl eframe::App for FemCraftApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.docks(ui));
+        // The active model's display toggles are the ones remembered for the next model and
+        // the next session.
+        if let Some(v) = self.active_doc().map(|d| d.vis.clone()) {
+            self.display.take_toggles(&v);
+        }
     }
 
     /// Called by eframe on exit (and periodically): keeps layout, recent files and ribbon
@@ -971,6 +1068,11 @@ impl eframe::App for FemCraftApp {
             tree: dock::for_saving(&self.tree),
             recent: self.recent.clone(),
             ribbon_minimized: self.ribbon_minimized,
+            display: Some(SavedDisplay {
+                vis: self.display.clone(),
+                show_axes: self.show_axes,
+                grid: SavedGrid::from(&self.grid),
+            }),
         };
         eframe::set_value(storage, PERSIST_KEY, &state);
     }
@@ -1180,4 +1282,35 @@ fn ribbon_model(ui: &mut egui::Ui) {
     ribbon_group(ui, "Edit", |ui| {
         coming_soon(ui, "Delete");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_settings_read_back() {
+        let grid = GridSettings {
+            plane: GridPlane::XZ,
+            spacing: 0.5,
+            ..GridSettings::default()
+        };
+        let vis = Visibility {
+            member_profiles: false,
+            loads: false,
+            ..Visibility::default()
+        };
+        let saved = SavedDisplay {
+            vis: vis.clone(),
+            show_axes: false,
+            grid: SavedGrid::from(&grid),
+        };
+        let back: SavedDisplay = ron::from_str(&ron::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(back.vis, vis);
+        assert!(!back.show_axes);
+        assert_eq!(GridSettings::from(back.grid), grid);
+        // A toggle added in a later version falls back to its default.
+        let old: Visibility = ron::from_str("(nodes: false)").unwrap();
+        assert!(!old.nodes && old.member_profiles);
+    }
 }

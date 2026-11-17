@@ -58,7 +58,8 @@ pub fn to_model(p: Vec3) -> Vec3 {
 /// The model's global axes in viewport world coordinates.
 pub const GLOBAL_AXES: [(Vec3, &str); 3] = [(Vec3::X, "X"), (Vec3::NEG_Y, "Y"), (Vec3::NEG_Z, "Z")];
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Visibility {
     pub nodes: bool,
     pub lines: bool,
@@ -93,6 +94,17 @@ impl Default for Visibility {
             load_case: 1,
             glyph_spacing: 1.0,
         }
+    }
+}
+
+impl Visibility {
+    /// Takes the display toggles of `other`, keeping this model's load case and glyph spacing.
+    pub fn take_toggles(&mut self, other: &Visibility) {
+        *self = Visibility {
+            load_case: self.load_case,
+            glyph_spacing: self.glyph_spacing,
+            ..other.clone()
+        };
     }
 }
 
