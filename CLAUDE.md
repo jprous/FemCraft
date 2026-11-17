@@ -1,4 +1,4 @@
-﻿# FemCraft - notes for Claude Code
+# FemCraft - notes for Claude Code
 
 Read this instead of re-researching the project. Keep sessions short and focused: the owner
 has a limited credit budget (see "Credit budget" in `docs/ROADMAP.md`).
