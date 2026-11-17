@@ -50,7 +50,9 @@ Plan and milestone status: `docs/ROADMAP.md`.
   `RfDocument::assign_library_item` (writes pending edits, `build::capture_library_item` +
   `Builder::replace_with` copy the item's impl tree into the working db and repoint the
   main row, so member refs stay; a section keeps its material; reload; `is_modified()`).
-  `tests/library_assign.rs`. Not yet: MCP `set_section({name})` from the library.
+  `tests/library_assign.rs`. MCP `set_section` / `set_material`: `name` is a library name
+  (full RFEM name or unique designation), assigned after the other fields
+  (`femcraft-mcp/tests/library_names.rs`).
   **RFEM calls a file corrupted** when a library section lacks its `value_id` lists
   (`DatabaseSection_sectionMaterialCharacteristics`, `SectionTopology_outlines`): their
   targets come from the declared SQLite foreign keys (`Schema::fk`). Replaced library rows

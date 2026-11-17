@@ -228,15 +228,32 @@ pub fn methods() -> Vec<MethodInfo> {
             get_req.push(LC_NO);
         }
         let label = kind.spec().label.to_lowercase();
+        if library_kind(kind).is_some() {
+            set_props["value"]["properties"]["name"] = json!({"type": "string",
+                "description": "RFEM library name, e.g. 'IPE 200 | DIN 1025:1965 | Macsteel' or \
+                 'S355JR | SANS 50025-2' (get_library_items lists them); a designation such as \
+                 'UB 203x133x25' when only one item has it"});
+        }
         out.push(MethodInfo {
             name: format!("set_{suffix}"),
             description: format!(
                 "Creates or changes one of the {label} of the active model. Only the fields \
-                 given are set; a new object starts from a similar object when saved.{}",
+                 given are set; a new object starts from a similar object when saved.{}{}",
                 if load {
                     " Loads are numbered per load case."
                 } else {
                     ""
+                },
+                match kind {
+                    K::Section => {
+                        " 'name' picks a library section (copied into the model with its \
+                         properties; members keep referring to it; 'material' sets its material)."
+                    }
+                    K::Material => {
+                        " 'name' picks a library material (copied into the model with its \
+                         properties)."
+                    }
+                    _ => "",
                 }
             ),
             schema: obj(set_props, &set_req),
@@ -403,6 +420,28 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
                     from_json(spec.ty, v).map_err(|e| format!("{k}: {e}"))?,
                 ));
             }
+            // Materials and sections: `name` is an RFEM library name (as RFEM's API takes it);
+            // the library item is copied into the model after the other fields are set.
+            let mut library = None;
+            if let Some(lib_kind) = library_kind(kind)
+                && let Some(i) = fields.iter().position(|(k, _)| *k == "name")
+            {
+                let (_, v) = fields.remove(i);
+                let wanted = v.as_str().unwrap_or("").to_owned();
+                let lib = Library::find(&Library::default_dirs())
+                    .ok_or("no FemCraft library found (materials.db / sections.db)")?;
+                let item = lib
+                    .get(lib_kind, &wanted)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "no library {} named '{wanted}'; get_library_items lists them \
+                             (RFEM's full name, or a designation only one item has)",
+                            lib_kind.name()
+                        )
+                    })?;
+                library = Some((lib, item));
+            }
             let doc = active(ws)?;
             let no = match value.get("no") {
                 Some(n) => n
@@ -424,10 +463,26 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
             for (k, v) in fields {
                 doc.model.set(id, k, v).map_err(|e| e.to_string())?;
             }
+            let mut out = json!({"no": no, "created": created});
+            if let Some((lib, item)) = library {
+                doc.assign_library_item(id, &lib, &item)
+                    .map_err(|e| format!("{} {no}: {e}", kind.name()))?;
+                out["library_item"] = json!(item.name);
+                out["rfem_library_id"] = json!(item.rfem_library_id);
+            }
             ws.changed();
-            Ok(json!({"no": no, "created": created}))
+            Ok(out)
         }
         _ => Err(format!("unknown method '{name}'")),
+    }
+}
+
+/// The library behind an object kind's `name` (materials, sections).
+fn library_kind(kind: K) -> Option<LibraryKind> {
+    match kind {
+        K::Material => Some(LibraryKind::Material),
+        K::Section => Some(LibraryKind::Section),
+        _ => None,
     }
 }
 
