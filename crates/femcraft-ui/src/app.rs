@@ -54,7 +54,10 @@ pub struct FemCraftApp {
     model_version: u64,
     vis: Visibility,
     scene: Scene,
-    open_path: String,
+    /// Recently opened models, most recent first (saved between sessions).
+    recent: Vec<PathBuf>,
+    /// Ribbon shows only its tab row (saved between sessions).
+    ribbon_minimized: bool,
     message: Option<String>,
 
     /// Selected objects (box selection).
@@ -66,6 +69,21 @@ pub struct FemCraftApp {
     tree: egui_tiles::Tree<Pane>,
     ribbon_tab: RibbonTab,
     tables: panels::TableState,
+}
+
+/// Recent files kept in File > Open Recent.
+const MAX_RECENT: usize = 10;
+
+/// Storage key of the saved UI state; bump the version if `Persisted` changes incompatibly
+/// (an unreadable value is ignored and defaults are used).
+const PERSIST_KEY: &str = "femcraft.ui.v1";
+
+/// UI state kept from one session to the next (eframe storage, in the user's app data).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Persisted {
+    tree: egui_tiles::Tree<Pane>,
+    recent: Vec<PathBuf>,
+    ribbon_minimized: bool,
 }
 
 /// Does the segment `a`-`b` touch the rectangle?
@@ -115,7 +133,8 @@ impl FemCraftApp {
             model_version: 0,
             vis: Visibility::default(),
             scene: Scene::default(),
-            open_path: String::new(),
+            recent: Vec::new(),
+            ribbon_minimized: false,
             message: None,
             selection: HashSet::new(),
             drag_box: None,
@@ -123,6 +142,17 @@ impl FemCraftApp {
             ribbon_tab: RibbonTab::Home,
             tables: panels::TableState::default(),
         };
+        // Layout, recent files and ribbon state from the previous session.
+        if let Some(saved) = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Persisted>(s, PERSIST_KEY))
+        {
+            if dock::is_complete(&saved.tree) {
+                app.tree = saved.tree;
+            }
+            app.recent = saved.recent;
+            app.ribbon_minimized = saved.ribbon_minimized;
+        }
         // `femcraft model.rf6 [--lc=N] [--local-axes]` opens the file directly.
         let args: Vec<String> = std::env::args().skip(1).collect();
         if let Some(path) = args.iter().find(|a| !a.starts_with("--")) {
@@ -145,7 +175,12 @@ impl FemCraftApp {
             .set_title("Open RFEM model")
             .add_filter("RFEM 6 model", &["rf6"])
             .add_filter("All files", &["*"]);
-        if let Some(dir) = Path::new(&self.open_path).parent().filter(|d| d.is_dir()) {
+        if let Some(dir) = self
+            .recent
+            .first()
+            .and_then(|p| p.parent())
+            .filter(|d| d.is_dir())
+        {
             dialog = dialog.set_directory(dir);
         }
         if let Some(path) = dialog.pick_file() {
@@ -170,12 +205,20 @@ impl FemCraftApp {
                 self.model_version += 1;
                 self.selection.clear();
                 self.message = None;
-                self.open_path = path.display().to_string();
+                self.remember_recent(path);
                 self.refresh_lines();
                 self.zoom_to_model();
             }
             Err(e) => self.message = Some(format!("Could not open {}: {e}", path.display())),
         }
+    }
+
+    /// Puts a successfully opened file at the top of the recent list.
+    fn remember_recent(&mut self, path: &Path) {
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+        self.recent.retain(|p| *p != path);
+        self.recent.insert(0, path);
+        self.recent.truncate(MAX_RECENT);
     }
 
     /// Rebuild the GPU geometry only when the grid, axes, display settings or model changed.
@@ -238,27 +281,118 @@ impl FemCraftApp {
         self.camera.set_view(view);
     }
 
-    /// Ribbon bar across the top: File menu, ribbon tabs and their tool groups.
-    fn ribbon(&mut self, ui: &mut egui::Ui) {
+    /// Menu bar at the very top: File (with Open Recent), View, Help.
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        egui::Panel::top("ribbon").show(ui, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
+        egui::Panel::top("menu_bar").show(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open…").clicked() {
                         ui.close();
                         self.open_dialog();
                     }
+                    ui.menu_button("Open Recent", |ui| self.recent_menu(ui));
                     ui.separator();
                     if ui.button("Exit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
-                ui.separator();
-                for tab in RibbonTab::ALL {
-                    ui.selectable_value(&mut self.ribbon_tab, tab, tab.title());
-                }
+                ui.menu_button("View", |ui| {
+                    ui.label("Panels");
+                    for pane in Pane::CLOSABLE {
+                        let mut open = dock::is_open(&self.tree, pane);
+                        if ui.checkbox(&mut open, pane.title()).changed() {
+                            dock::set_open(&mut self.tree, pane, open);
+                        }
+                    }
+                    if ui.button("Reset layout").clicked() {
+                        self.tree = dock::default_tree();
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut self.ribbon_minimized, "Minimise ribbon");
+                });
+                ui.menu_button("Help", |ui| {
+                    ui.label(format!("FemCraft {}", env!("CARGO_PKG_VERSION")));
+                    ui.weak("Open / edit RFEM 6 models");
+                });
             });
+        });
+    }
+
+    /// File > Open Recent: the last opened models (missing files greyed out).
+    fn recent_menu(&mut self, ui: &mut egui::Ui) {
+        if self.recent.is_empty() {
+            ui.weak("No recent files");
+            return;
+        }
+        let mut chosen: Option<PathBuf> = None;
+        for (i, path) in self.recent.iter().enumerate() {
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let label = format!("{}  {name}", i + 1);
+            let exists = path.is_file();
+            let hover = if exists {
+                path.display().to_string()
+            } else {
+                format!("{} (not found)", path.display())
+            };
+            let button = ui.add_enabled(exists, egui::Button::new(label));
+            if button
+                .on_hover_text(&hover)
+                .on_disabled_hover_text(&hover)
+                .clicked()
+            {
+                chosen = Some(path.clone());
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.button("Clear list").clicked() {
+            self.recent.clear();
+            ui.close();
+        }
+        if let Some(path) = chosen {
+            self.open(&path);
+        }
+    }
+
+    /// Ribbon below the menu bar: tabs, and their tool groups unless minimised.
+    /// The ⏶ / ⏷ button or a double-click on a tab minimises / expands it; clicking a tab
+    /// while minimised expands it.
+    fn ribbon(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("ribbon").show(ui, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                for tab in RibbonTab::ALL {
+                    let r = ui.selectable_label(self.ribbon_tab == tab, tab.title());
+                    if r.double_clicked() {
+                        self.ribbon_minimized = !self.ribbon_minimized;
+                    } else if r.clicked() {
+                        self.ribbon_tab = tab;
+                        self.ribbon_minimized = false;
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let tip = if self.ribbon_minimized {
+                        "Expand the ribbon"
+                    } else {
+                        "Minimise the ribbon (double-click a tab also toggles)"
+                    };
+                    if chevron_button(ui, self.ribbon_minimized)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        self.ribbon_minimized = !self.ribbon_minimized;
+                    }
+                });
+            });
+            if self.ribbon_minimized {
+                ui.add_space(2.0);
+                return;
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 ui.set_min_height(58.0);
@@ -905,12 +1039,23 @@ impl eframe::App for FemCraftApp {
         if let Some(path) = dropped {
             self.open(&path);
         }
+        self.menu_bar(ui);
         self.ribbon(ui);
         self.status_bar(ui);
         self.refresh_lines();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.docks(ui));
+    }
+
+    /// Called by eframe on exit (and periodically): keeps layout, recent files and ribbon state.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let state = Persisted {
+            tree: self.tree.clone(),
+            recent: self.recent.clone(),
+            ribbon_minimized: self.ribbon_minimized,
+        };
+        eframe::set_value(storage, PERSIST_KEY, &state);
     }
 }
 
@@ -1003,6 +1148,37 @@ impl RibbonTab {
             RibbonTab::Loads => "Loads",
         }
     }
+}
+
+/// Small button with a painted chevron (the default font has no arrow glyphs):
+/// pointing down when `down` (expand), up otherwise (minimise).
+fn chevron_button(ui: &mut egui::Ui, down: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 18.0), egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+    }
+    let c = rect.center();
+    let (w, h) = (5.0, 3.0);
+    let points = if down {
+        vec![
+            c + egui::vec2(-w, -h),
+            c + egui::vec2(w, -h),
+            c + egui::vec2(0.0, h),
+        ]
+    } else {
+        vec![
+            c + egui::vec2(-w, h),
+            c + egui::vec2(w, h),
+            c + egui::vec2(0.0, -h),
+        ]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        visuals.fg_stroke.color,
+        Stroke::NONE,
+    ));
+    response
 }
 
 /// A titled group of ribbon tools.

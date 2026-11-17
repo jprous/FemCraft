@@ -10,7 +10,7 @@ use eframe::egui;
 use egui_tiles::{Container, Tile, TileId, Tiles, Tree};
 
 /// The panes of the main window.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Pane {
     /// The 3D model space.
     Viewport,
@@ -23,6 +23,8 @@ pub enum Pane {
 }
 
 impl Pane {
+    pub const ALL: [Pane; 4] = [Pane::Viewport, Pane::Display, Pane::Navigator, Pane::Tables];
+
     /// Panes that can be closed and reopened (all but the model view).
     pub const CLOSABLE: [Pane; 3] = [Pane::Display, Pane::Navigator, Pane::Tables];
 
@@ -67,6 +69,12 @@ pub fn default_tree() -> Tree<Pane> {
     Tree::new(egui::Id::unique("femcraft_dock"), root, tiles)
 }
 
+/// A layout restored from a previous session is usable if it still holds every pane
+/// (a newer FemCraft may have added panes) and the model view is visible.
+pub fn is_complete(tree: &Tree<Pane>) -> bool {
+    Pane::ALL.iter().all(|p| tree.tiles.find_pane(p).is_some()) && is_open(tree, Pane::Viewport)
+}
+
 /// Is the pane shown (present and not closed)?
 pub fn is_open(tree: &Tree<Pane>, pane: Pane) -> bool {
     tree.tiles
@@ -103,5 +111,20 @@ mod tests {
         assert!(!is_open(&tree, Pane::Tables));
         set_open(&mut tree, Pane::Tables, true);
         assert!(is_open(&tree, Pane::Tables));
+        assert!(is_complete(&tree));
+    }
+
+    #[test]
+    fn layout_survives_a_save_and_load() {
+        let mut tree = default_tree();
+        set_open(&mut tree, Pane::Navigator, false);
+        let text = to_ron(&tree);
+        let back: Tree<Pane> = ron::from_str(&text).expect("layout reads back");
+        assert!(is_complete(&back));
+        assert!(!is_open(&back, Pane::Navigator));
+    }
+
+    fn to_ron(tree: &Tree<Pane>) -> String {
+        ron::to_string(tree).expect("layout serialises")
     }
 }
