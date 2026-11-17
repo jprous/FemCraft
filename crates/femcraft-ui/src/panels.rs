@@ -503,7 +503,7 @@ fn object_table(
                                 // The whole cell reacts, so empty cells can be edited too.
                                 let cell = ui.interact(
                                     ui.max_rect(),
-                                    ui.id().with(("cell", f.key)),
+                                    ui.scope_id().with(("cell", f.key)),
                                     egui::Sense::click(),
                                 );
                                 let label = label.union(cell);
