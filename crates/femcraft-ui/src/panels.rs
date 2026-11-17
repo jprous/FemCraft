@@ -162,17 +162,118 @@ pub fn navigator(
         });
 }
 
-/// Which table is shown.
+/// Which table is shown, and the cell being edited.
 pub struct TableState {
     pub kind: ObjectKind,
+    /// Cell being edited: (document id, object, field key, text typed so far).
+    editing: Option<(u64, ObjectId, &'static str, String)>,
+    /// The editor was just opened (focus it once).
+    focus_editor: bool,
+    /// Why the last edit was refused.
+    error: Option<String>,
 }
 
 impl Default for TableState {
     fn default() -> Self {
         Self {
             kind: ObjectKind::Node,
+            editing: None,
+            focus_editor: false,
+            error: None,
         }
     }
+}
+
+/// Fields that can be edited in the tables (a first, temporary set). Every field of the
+/// support kinds is editable.
+pub fn is_editable(kind: ObjectKind, key: &str) -> bool {
+    use ObjectKind as K;
+    match kind {
+        K::Thickness => matches!(key, "material" | "uniform_thickness"),
+        K::Node => matches!(key, "coordinate_1" | "coordinate_2" | "coordinate_3"),
+        K::Line => key == "definition_nodes",
+        K::Member => matches!(
+            key,
+            "line" | "section_start" | "section_end" | "rotation_angle"
+        ),
+        K::Surface => matches!(
+            key,
+            "boundary_lines" | "thickness" | "axes_rotation" | "axes_z_reversed"
+        ),
+        K::NodalSupport | K::LineSupport | K::MemberSupport | K::SurfaceSupport => true,
+        _ => false,
+    }
+}
+
+/// Text put in the editor for a value (full precision, lists in RFEM notation).
+fn edit_text(v: &Value) -> String {
+    match v {
+        Value::Float(f) if f.is_infinite() => {
+            if *f > 0.0 {
+                "inf".into()
+            } else {
+                "-inf".into()
+            }
+        }
+        Value::Float(f) => f.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Reads typed text as a value of the field's type; references must name existing objects.
+fn parse_cell(model: &Model, ty: FieldType, text: &str) -> Result<Value, String> {
+    let t = text.trim();
+    let exists = |kind: ObjectKind, no: u32| -> Result<(), String> {
+        if model.get(ObjectId::new(kind, no)).is_some() {
+            Ok(())
+        } else {
+            Err(format!("{} {no} does not exist", singular(kind)))
+        }
+    };
+    Ok(match ty {
+        FieldType::Float(_) => match t.to_ascii_lowercase().as_str() {
+            "" => return Err("a number is required".into()),
+            "inf" | "∞" | "+inf" => Value::Float(f64::INFINITY),
+            "-inf" | "-" => Value::Float(f64::NEG_INFINITY),
+            s => Value::Float(
+                s.replace(',', ".")
+                    .parse()
+                    .map_err(|_| format!("'{t}' is not a number"))?,
+            ),
+        },
+        FieldType::Int => Value::Int(
+            t.parse()
+                .map_err(|_| format!("'{t}' is not a whole number"))?,
+        ),
+        FieldType::Enum => match t.parse::<i64>() {
+            Ok(i) => Value::Int(i),
+            Err(_) => Value::Text(t.to_owned()),
+        },
+        FieldType::Text => Value::Text(t.to_owned()),
+        FieldType::Bool => Value::Bool(matches!(
+            t.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "y" | "✔"
+        )),
+        FieldType::Ref(kind) if t.is_empty() => {
+            let _ = kind;
+            Value::Null
+        }
+        FieldType::Ref(kind) => {
+            let no: u32 = t
+                .parse()
+                .map_err(|_| format!("'{t}' is not an object number"))?;
+            exists(kind, no)?;
+            Value::Ref(no)
+        }
+        FieldType::RefList(kind) => {
+            let list = femcraft_model::list::parse_list(t)
+                .ok_or_else(|| format!("'{t}' is not a list such as 1-4,7"))?;
+            for no in &list {
+                exists(kind, *no)?;
+            }
+            Value::RefList(list)
+        }
+    })
 }
 
 fn cell_text(v: &Value, ty: FieldType) -> String {
@@ -200,15 +301,18 @@ fn cell_text(v: &Value, ty: FieldType) -> String {
 }
 
 /// Object tables: one tab per kind present in the model, columns from the field descriptions.
+/// Editable cells (coloured headers) are edited with a double-click. `doc` identifies the
+/// model. Returns true when the model was changed.
 pub fn tables(
     ui: &mut egui::Ui,
-    model: Option<&Model>,
+    doc: u64,
+    model: Option<&mut Model>,
     state: &mut TableState,
     selection: &mut HashSet<ObjectId>,
-) {
+) -> bool {
     let Some(model) = model else {
         ui.weak("No model open.");
-        return;
+        return false;
     };
     let kinds: Vec<ObjectKind> = ObjectKind::ALL
         .iter()
@@ -217,10 +321,18 @@ pub fn tables(
         .collect();
     if kinds.is_empty() {
         ui.weak("The model has no objects.");
-        return;
+        return false;
     }
     if !kinds.contains(&state.kind) {
         state.kind = kinds[0];
+    }
+    // An editor left open on another model or table is dropped.
+    if state
+        .editing
+        .as_ref()
+        .is_some_and(|(d, id, ..)| *d != doc || id.kind != state.kind)
+    {
+        state.editing = None;
     }
     // Sheet tabs along the bottom (wrapping onto a second row instead of scrolling), the table
     // filling the space above them.
@@ -235,21 +347,47 @@ pub fn tables(
             });
         });
     // The table fills the inner central panel: exactly the space above the sheet tabs.
+    let mut edit: Option<(ObjectId, &'static str, Result<Value, String>)> = None;
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
-        .show(ui, |ui| object_table(ui, model, state.kind, selection));
+        .show(ui, |ui| {
+            if let Some(err) = &state.error {
+                ui.colored_label(ui.visuals().error_fg_color, err);
+            }
+            edit = object_table(ui, doc, model, state, selection);
+        });
+
+    // Apply an edit after drawing (the rows borrow the model while they are drawn).
+    let Some((id, key, value)) = edit else {
+        return false;
+    };
+    match value.and_then(|v| model.set(id, key, v).map_err(|e| e.to_string())) {
+        Ok(()) => {
+            state.error = None;
+            true
+        }
+        Err(e) => {
+            state.error = Some(format!("{} {}: {e}", singular(id.kind), id.no));
+            false
+        }
+    }
 }
 
-/// The rows of one object kind; clicking a row selects the object.
+/// The rows of one object kind; clicking a row selects the object, double-clicking an editable
+/// cell edits it. Returns an edit to apply: (object, field, parsed value or error).
 fn object_table(
     ui: &mut egui::Ui,
+    doc: u64,
     model: &Model,
-    kind: ObjectKind,
+    state: &mut TableState,
     selection: &mut HashSet<ObjectId>,
-) {
+) -> Option<(ObjectId, &'static str, Result<Value, String>)> {
+    let kind = state.kind;
     let spec = kind.spec();
     let rows: Vec<(ObjectId, &Object)> = model.iter_kind(kind).collect();
     let is_load = spec.is_load();
+    let mut edit = None;
+    let editable_color = ui.visuals().hyperlink_color;
     // The body scrolls within the space left above the sheet tabs (TableBuilder would
     // otherwise grow up to its default 800 px and run underneath them). Leave room for the
     // header row and the horizontal scroll bar.
@@ -291,7 +429,15 @@ fn object_table(
                                 }
                                 _ => f.label.to_owned(),
                             };
-                            ui.strong(text).on_hover_text(f.key);
+                            if is_editable(kind, f.key) {
+                                ui.label(egui::RichText::new(text).strong().color(editable_color))
+                                    .on_hover_text(format!(
+                                        "{} - double-click a cell to edit (Enter to apply, Esc to cancel)",
+                                        f.key
+                                    ));
+                            } else {
+                                ui.strong(text).on_hover_text(f.key);
+                            }
                         });
                     }
                 })
@@ -309,7 +455,55 @@ fn object_table(
                         }
                         for f in spec.fields {
                             row.col(|ui| {
-                                ui.label(cell_text(obj.get(f.key), f.ty));
+                                let value = obj.get(f.key);
+                                // Only fields the file stores for this object (e.g. a surface
+                                // without thickness has no thickness to edit).
+                                let editable =
+                                    is_editable(kind, f.key) && obj.values.contains_key(f.key);
+                                // True / false: a checkbox, applied at once.
+                                if editable && f.ty == FieldType::Bool {
+                                    let mut b = value.as_bool().unwrap_or(false);
+                                    if ui.checkbox(&mut b, "").changed() {
+                                        edit = Some((id, f.key, Ok(Value::Bool(b))));
+                                    }
+                                    return;
+                                }
+                                let this_cell = state
+                                    .editing
+                                    .as_ref()
+                                    .is_some_and(|(_, e, k, _)| *e == id && *k == f.key);
+                                if this_cell {
+                                    let (enter, escape) = ui.input(|i| {
+                                        (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape))
+                                    });
+                                    let text = &mut state.editing.as_mut().unwrap().3;
+                                    let r = ui.add(
+                                        egui::TextEdit::singleline(text)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    if state.focus_editor {
+                                        r.request_focus();
+                                        state.focus_editor = false;
+                                    }
+                                    if escape {
+                                        state.editing = None;
+                                    } else if r.lost_focus() || enter {
+                                        let typed = state.editing.take().unwrap().3;
+                                        edit = Some((id, f.key, parse_cell(model, f.ty, &typed)));
+                                    }
+                                    return;
+                                }
+                                let label = ui.add(
+                                    egui::Label::new(cell_text(value, f.ty))
+                                        .sense(egui::Sense::click()),
+                                );
+                                if editable && label.double_clicked() {
+                                    state.editing = Some((doc, id, f.key, edit_text(value)));
+                                    state.focus_editor = true;
+                                } else if label.clicked() {
+                                    let ctrl = label.ctx.input(|i| i.modifiers.ctrl);
+                                    click_select(ctrl, selection, id);
+                                }
                             });
                         }
                         let response = row.response();
@@ -320,4 +514,5 @@ fn object_table(
                     });
                 });
         });
+    edit
 }

@@ -723,8 +723,9 @@ impl RfDocument {
         }
         self.ref_by_id = votes
             .into_iter()
-            // RFEM stores db ids; ties (ids equal to numbers) count as ids.
-            .map(|(k, (by_id, by_no))| (k, by_id > 0 && by_id >= by_no))
+            // RFEM stores db ids; ties (ids equal to numbers) and fields with no values
+            // (e.g. an empty list, filled in later by an edit) count as ids.
+            .map(|(k, (by_id, by_no))| (k, by_id >= by_no))
             .collect();
 
         let map = |by_id: bool, target: ObjectKind, n: u32| -> u32 {

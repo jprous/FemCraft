@@ -38,8 +38,12 @@ Plan and milestone status: `docs/ROADMAP.md`.
   header; entries marked "guess" are unconfirmed). `document.rs`: `RfDocument::open` loads
   every kind generically (main row -> impl row -> list / part tables -> derived maps), resolves
   db ids to object numbers, reports missing fields; `save` writes changed main / impl / part
-  columns. Read-only for now: list fields, type, library section / material properties.
-  Not yet: adding / deleting objects.
+  columns and list tables. Read-only: type, library section / material properties, fields with
+  no stored column (e.g. thickness of a surface without thickness). Not yet: adding / deleting
+  objects. `tests/editable_fields.rs` edits every UI-editable field on the private models.
+- UI editing (temporary test set, `panels::is_editable`): double-click a blue-headed table cell
+  (Enter commits, Escape cancels); File > Save (Ctrl+S) / Save As (Ctrl+Shift+S), `.rf6` only.
+  No unsaved-changes prompt on close yet.
 - `rf6-catalog` research tool: `cargo run -p femcraft-rfdb --bin rf6-catalog -- file.rf6`
   (load report), `--kinds [KIND..]`, `--tables [FILTER..]`, `--rows TABLE [N]`,
   `--sql "SELECT .."`, `--objects KIND [N]`, `--edit OUT KIND NO[@LC] FIELD VALUE`.

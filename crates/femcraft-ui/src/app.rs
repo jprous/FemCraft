@@ -54,7 +54,10 @@ pub struct FemCraftApp {
     recent: Vec<PathBuf>,
     /// Ribbon shows only its tab row (saved between sessions).
     ribbon_minimized: bool,
+    /// Last error (open / save), shown in red.
     message: Option<String>,
+    /// Last confirmation (e.g. saved), shown in the status bar.
+    notice: Option<String>,
 
     /// Dockable layout of the model tabs and panels.
     tree: egui_tiles::Tree<Pane>,
@@ -84,6 +87,7 @@ impl FemCraftApp {
             recent: Vec::new(),
             ribbon_minimized: false,
             message: None,
+            notice: None,
             tree: dock::default_tree(),
             ribbon_tab: RibbonTab::Home,
             tables: panels::TableState::default(),
@@ -182,6 +186,56 @@ impl FemCraftApp {
         }
     }
 
+    /// File > Save: writes the active model back to its file (`.rf6`).
+    fn save(&mut self) {
+        let Some(path) = self.active_doc().map(|d| d.path.clone()) else {
+            return;
+        };
+        let is_rf6 = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rf6"));
+        if is_rf6 {
+            self.save_to(&path);
+        } else {
+            self.save_as_dialog();
+        }
+    }
+
+    /// File > Save As: asks for a new `.rf6` path and saves the active model there.
+    fn save_as_dialog(&mut self) {
+        let Some(d) = self.active_doc() else { return };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save RFEM model as")
+            .add_filter("RFEM 6 model", &["rf6"])
+            .set_file_name(d.title());
+        if let Some(dir) = d.path.parent().filter(|p| p.is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(mut path) = dialog.save_file() {
+            if path.extension().is_none() {
+                path.set_extension("rf6");
+            }
+            self.save_to(&path);
+        }
+    }
+
+    fn save_to(&mut self, path: &Path) {
+        let Some(d) = self.active_doc_mut() else {
+            return;
+        };
+        match d.save_as(path) {
+            Ok(()) => {
+                self.message = None;
+                self.notice = Some(format!("Saved {}", path.display()));
+                self.remember_recent(path);
+            }
+            Err(e) => {
+                self.notice = None;
+                self.message = Some(format!("Could not save {}: {e}", path.display()));
+            }
+        }
+    }
+
     /// Makes a model active and brings its tab to the front.
     fn activate(&mut self, id: u64) {
         self.active = Some(id);
@@ -258,6 +312,25 @@ impl FemCraftApp {
                     }
                     ui.menu_button("Open Recent", |ui| self.recent_menu(ui));
                     ui.separator();
+                    let has_doc = self.active.is_some();
+                    if ui
+                        .add_enabled(has_doc, egui::Button::new("Save").shortcut_text("Ctrl+S"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.save();
+                    }
+                    if ui
+                        .add_enabled(
+                            has_doc,
+                            egui::Button::new("Save As…").shortcut_text("Ctrl+Shift+S"),
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                        self.save_as_dialog();
+                    }
+                    ui.separator();
                     let active = self.active;
                     if ui
                         .add_enabled(active.is_some(), egui::Button::new("Close"))
@@ -304,7 +377,8 @@ impl FemCraftApp {
         }
         let mut switch_to = None;
         for (i, d) in self.docs.iter().enumerate() {
-            let label = format!("{}  {}", i + 1, d.title());
+            let star = if d.is_modified() { " *" } else { "" };
+            let label = format!("{}  {}{star}", i + 1, d.title());
             let r = ui
                 .selectable_label(self.active == Some(d.id), label)
                 .on_hover_text(d.path.display().to_string());
@@ -539,15 +613,30 @@ impl FemCraftApp {
                     .show(ui, |ui| self.settings_contents(ui));
             }
             Pane::Navigator => match self.active_doc_mut() {
-                Some(d) => panels::navigator(ui, Some(&d.model), &d.load_cases, &mut d.selection),
+                Some(d) => {
+                    panels::navigator(ui, Some(&d.rf.model), &d.load_cases, &mut d.selection)
+                }
                 None => panels::navigator(ui, None, &[], &mut Default::default()),
             },
             Pane::Tables => {
                 let tables = &mut self.tables;
                 let id = self.active;
                 match id.and_then(|id| self.docs.iter_mut().find(|d| d.id == id)) {
-                    Some(d) => panels::tables(ui, Some(&d.model), tables, &mut d.selection),
-                    None => panels::tables(ui, None, tables, &mut Default::default()),
+                    Some(d) => {
+                        let changed = panels::tables(
+                            ui,
+                            d.id,
+                            Some(&mut d.rf.model),
+                            tables,
+                            &mut d.selection,
+                        );
+                        if changed {
+                            d.revision += 1; // rebuild the 3D view
+                        }
+                    }
+                    None => {
+                        panels::tables(ui, 0, None, tables, &mut Default::default());
+                    }
                 }
             }
         }
@@ -604,7 +693,7 @@ impl FemCraftApp {
         };
         ui.label(d.title())
             .on_hover_text(d.path.display().to_string());
-        let count = |k| d.model.count(k);
+        let count = |k| d.model().count(k);
         ui.weak(format!(
             "{} nodes · {} lines · {} members · {} surfaces · {} solids",
             count(ObjectKind::Node),
@@ -778,6 +867,10 @@ impl FemCraftApp {
                     self.grid.plane.label(),
                     self.grid.spacing
                 ));
+                if let Some(n) = &self.notice {
+                    ui.separator();
+                    ui.label(n);
+                }
                 if let Some(d) = doc {
                     ui.separator();
                     ui.label(d.title());
@@ -828,6 +921,22 @@ impl eframe::App for FemCraftApp {
         });
         for path in dropped {
             self.open(&path);
+        }
+        // Ctrl+S saves, Ctrl+Shift+S saves as.
+        let (save, save_as) = ui.input_mut(|i| {
+            let save_as = i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::S,
+            );
+            (
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
+                save_as,
+            )
+        });
+        if save_as {
+            self.save_as_dialog();
+        } else if save {
+            self.save();
         }
         // Escape releases the selection of the active model (unless a menu / popup is open,
         // where Escape closes that instead).
@@ -891,12 +1000,17 @@ impl egui_tiles::Behavior<Pane> for TileBehavior<'_> {
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
         match pane {
             Pane::Document(id) => {
-                let title = self
-                    .app
-                    .docs
-                    .iter()
-                    .find(|d| d.id == *id)
-                    .map_or_else(|| "(closed)".to_owned(), |d| d.title());
+                let title = self.app.docs.iter().find(|d| d.id == *id).map_or_else(
+                    || "(closed)".to_owned(),
+                    |d| {
+                        // "*" marks unsaved edits.
+                        if d.is_modified() {
+                            format!("{} *", d.title())
+                        } else {
+                            d.title()
+                        }
+                    },
+                );
                 if self.app.active == Some(*id) && self.app.docs.len() > 1 {
                     egui::RichText::new(title).strong().into()
                 } else {

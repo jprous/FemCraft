@@ -30,7 +30,10 @@ pub struct Document {
     /// Unique per session; names the tab and the GPU buffers.
     pub id: u64,
     pub path: PathBuf,
-    pub model: Model,
+    /// The file as loaded (model plus how it maps to the database), kept for saving.
+    pub rf: RfDocument,
+    /// Bumped on every edit, so the 3D view is rebuilt.
+    pub revision: u64,
     pub load_cases: Vec<(u32, String)>,
     /// Problems reported while loading.
     pub warnings: Vec<String>,
@@ -44,7 +47,7 @@ pub struct Document {
     lines: Arc<Vec<LineVertex>>,
     triangles: Arc<Vec<LineVertex>>,
     version: u64,
-    built_from: Option<(GridSettings, bool, Visibility)>,
+    built_from: Option<(GridSettings, bool, Visibility, u64)>,
     /// Box drag in progress: button and start position.
     drag_box: Option<(egui::PointerButton, Pos2)>,
 }
@@ -65,7 +68,8 @@ impl Document {
             path: path.to_owned(),
             load_cases,
             warnings: doc.report.warnings.clone(),
-            model: doc.model,
+            rf: doc,
+            revision: 0,
             vis,
             scene: Scene::default(),
             camera: OrbitCamera::default(),
@@ -77,6 +81,22 @@ impl Document {
             built_from: None,
             drag_box: None,
         })
+    }
+
+    pub fn model(&self) -> &Model {
+        &self.rf.model
+    }
+
+    /// Unsaved edits?
+    pub fn is_modified(&self) -> bool {
+        self.rf.model.is_modified()
+    }
+
+    /// Writes the model (with its edits) to `path` as `.rf6`; the document then refers to it.
+    pub fn save_as(&mut self, path: &Path) -> Result<(), String> {
+        self.rf.save(path).map_err(|e| e.to_string())?;
+        self.path = path.to_owned();
+        Ok(())
     }
 
     /// Releases the selection and cancels a box selection in progress (Escape).
@@ -97,11 +117,11 @@ impl Document {
     pub fn refresh(&mut self, grid: &GridSettings, show_axes: bool) {
         // Support glyphs along lines / surface edges follow the grid spacing.
         self.vis.glyph_spacing = grid.spacing;
-        let key = (grid.clone(), show_axes, self.vis.clone());
+        let key = (grid.clone(), show_axes, self.vis.clone(), self.revision);
         if self.built_from.as_ref() == Some(&key) {
             return;
         }
-        self.scene = scene::build(&self.model, &self.vis);
+        self.scene = scene::build(&self.rf.model, &self.vis);
 
         let mut v = Vec::new();
         if grid.visible {
