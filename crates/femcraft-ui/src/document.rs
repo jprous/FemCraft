@@ -353,6 +353,13 @@ impl Document {
 
     /// Nodes, support symbols and load labels, drawn in screen space over the GPU geometry.
     fn paint_model_marks(&self, painter: &egui::Painter, to_screen: &dyn Fn(Vec3) -> Option<Pos2>) {
+        // Members without profile: 2 px, one more than a line element.
+        let member = Stroke::new(2.0_f32, rgba(scene::MEMBER));
+        for (a, b) in &self.scene.member_lines {
+            if let (Some(a), Some(b)) = (to_screen(*a), to_screen(*b)) {
+                painter.line_segment([a, b], member);
+            }
+        }
         let node = rgba(scene::NODE);
         for p in self.scene.nodes.iter().filter_map(|p| to_screen(*p)) {
             painter.circle_filled(p, 2.5, node);

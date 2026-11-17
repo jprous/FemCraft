@@ -709,12 +709,18 @@ impl FemCraftApp {
             ui.checkbox(&mut v.lines, "Lines");
             ui.end_row();
             ui.checkbox(&mut v.members, "Members");
+            ui.add_enabled(
+                v.members,
+                egui::Checkbox::new(&mut v.member_profiles, "Profile"),
+            )
+            .on_hover_text("Draw members with their section; off: as a thick line");
+            ui.end_row();
             ui.checkbox(&mut v.surfaces, "Surfaces");
-            ui.end_row();
             ui.checkbox(&mut v.supports, "Supports");
-            ui.checkbox(&mut v.loads, "Loads");
             ui.end_row();
+            ui.checkbox(&mut v.loads, "Loads");
             ui.checkbox(&mut v.local_axes, "Local axes");
+            ui.end_row();
             ui.add_enabled(
                 v.loads,
                 egui::Checkbox::new(&mut v.load_values, "Load values"),

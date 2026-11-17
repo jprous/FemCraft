@@ -11,7 +11,7 @@ use glam::Vec3;
 
 pub const NODE: [f32; 4] = [0.95, 0.20, 0.20, 1.0];
 const LINE: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
-const MEMBER: [f32; 4] = [0.45, 0.72, 1.0, 1.0];
+pub const MEMBER: [f32; 4] = [0.45, 0.72, 1.0, 1.0];
 const SURFACE_FILL: [f32; 4] = [0.30, 0.62, 0.70, 0.28];
 const SUPPORTED_FILL: [f32; 4] = [0.62, 0.48, 0.28, 0.32];
 pub const SUPPORT: [f32; 4] = [0.35, 0.85, 0.40, 1.0];
@@ -63,6 +63,8 @@ pub struct Visibility {
     pub nodes: bool,
     pub lines: bool,
     pub members: bool,
+    /// Members drawn with their section profile; off: a line 1 px thicker than a line element.
+    pub member_profiles: bool,
     pub surfaces: bool,
     pub supports: bool,
     pub loads: bool,
@@ -82,6 +84,7 @@ impl Default for Visibility {
             nodes: true,
             lines: true,
             members: true,
+            member_profiles: true,
             surfaces: true,
             supports: true,
             loads: true,
@@ -129,6 +132,8 @@ pub struct Scene {
     pub lines: Vec<LineVertex>,
     pub triangles: Vec<LineVertex>,
     pub nodes: Vec<Vec3>,
+    /// Members without profile: segments painted in screen space, thicker than GPU lines.
+    pub member_lines: Vec<(Vec3, Vec3)>,
     /// Selectable objects with their world points (node: 1 point, line / member: polyline,
     /// surface: boundary polygon).
     pub pick: Vec<(ObjectId, Vec<Vec3>)>,
@@ -272,7 +277,11 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
                     .push(format!("Member {}: line {line} has no nodes", id.no));
             }
             for w in pts.windows(2) {
-                member_box(&mut s, w[0], w[1], b, h, beta);
+                if vis.member_profiles {
+                    member_box(&mut s, w[0], w[1], b, h, beta);
+                } else {
+                    s.member_lines.push((to_world(w[0]), to_world(w[1])));
+                }
             }
             if pts.len() >= 2 {
                 s.pick
@@ -1011,6 +1020,51 @@ mod tests {
             pts.iter()
                 .all(|p| p.x > 0.1 && p.x < 2.9 && p.y > 0.1 && p.y < 2.9)
         );
+    }
+
+    #[test]
+    fn members_with_and_without_profile() {
+        let mut m = Model::new();
+        for (no, x) in [(1, 0.0), (2, 6.0)] {
+            let id = ObjectId::new(K::Node, no);
+            m.add(id).unwrap();
+            m.set(id, "coordinate_1", Value::Float(x)).unwrap();
+            m.set(id, "coordinate_2", Value::Float(0.0)).unwrap();
+            m.set(id, "coordinate_3", Value::Float(0.0)).unwrap();
+        }
+        let line = ObjectId::new(K::Line, 1);
+        m.add(line).unwrap();
+        m.set(line, "definition_nodes", Value::RefList(vec![1, 2]))
+            .unwrap();
+        let member = ObjectId::new(K::Member, 1);
+        m.add(member).unwrap();
+        m.set(member, "line", Value::Ref(1)).unwrap();
+
+        let vis = Visibility {
+            lines: false,
+            ..Visibility::default()
+        };
+        let profile = build(&m, &vis);
+        assert!(!profile.lines.is_empty() && profile.member_lines.is_empty());
+
+        let plain = build(
+            &m,
+            &Visibility {
+                member_profiles: false,
+                ..vis.clone()
+            },
+        );
+        assert_eq!(plain.member_lines.len(), 1);
+        assert!(plain.lines.is_empty() && plain.triangles.is_empty());
+
+        let hidden = build(
+            &m,
+            &Visibility {
+                members: false,
+                ..vis
+            },
+        );
+        assert!(hidden.member_lines.is_empty() && hidden.lines.is_empty());
     }
 
     #[test]
