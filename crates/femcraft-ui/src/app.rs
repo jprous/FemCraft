@@ -14,7 +14,7 @@ use femcraft_render::grid::{GridPlane, GridSettings};
 use femcraft_render::viewport::{self, LineVertex, LinesCallback};
 use femcraft_rfdb::RfDocument;
 
-use crate::dock::{Dock, DockLayout, Pane};
+use crate::dock::{self, Pane};
 use crate::panels;
 use crate::scene::{self, Scene, SupportSymbol, Visibility};
 
@@ -62,8 +62,8 @@ pub struct FemCraftApp {
     /// Box drag in progress: button and start position.
     drag_box: Option<(egui::PointerButton, Pos2)>,
 
-    /// Docks around the model space and the panes in them.
-    layout: DockLayout,
+    /// Dockable layout of the model view and panels.
+    tree: egui_tiles::Tree<Pane>,
     ribbon_tab: RibbonTab,
     tables: panels::TableState,
 }
@@ -119,7 +119,7 @@ impl FemCraftApp {
             message: None,
             selection: HashSet::new(),
             drag_box: None,
-            layout: DockLayout::default(),
+            tree: dock::default_tree(),
             ribbon_tab: RibbonTab::Home,
             tables: panels::TableState::default(),
         };
@@ -324,22 +324,18 @@ impl FemCraftApp {
             );
         });
         ribbon_group(ui, "Panels", |ui| {
-            for pane in Pane::ALL {
-                let mut open = self.layout.is_open(pane);
-                let hint = format!(
-                    "Docked {}. Right-click its tab to move or close it.",
-                    self.layout.dock_of(pane).label()
-                );
+            for pane in Pane::CLOSABLE {
+                let mut open = dock::is_open(&self.tree, pane);
                 if ui
                     .toggle_value(&mut open, pane.title())
-                    .on_hover_text(hint)
+                    .on_hover_text("Show or hide. Drag a panel's tab to move it anywhere.")
                     .changed()
                 {
-                    self.layout.set_open(pane, open);
+                    dock::set_open(&mut self.tree, pane, open);
                 }
             }
             if ui.button("Reset layout").clicked() {
-                self.layout.reset();
+                self.tree = dock::default_tree();
             }
         });
     }
@@ -378,29 +374,17 @@ impl FemCraftApp {
         });
     }
 
-    /// The docks around the model space and the panes in them.
+    /// The dockable area below the ribbon: model view and panels as draggable tiles.
     fn docks(&mut self, ui: &mut egui::Ui) {
-        for dock in Dock::ALL {
-            if self.layout.panes_in(dock).is_empty() {
-                continue;
-            }
-            let panel = match dock {
-                Dock::Left => egui::Panel::left("dock_left").default_size(270.0),
-                Dock::Right => egui::Panel::right("dock_right").default_size(290.0),
-                Dock::Bottom => egui::Panel::bottom("dock_bottom").default_size(230.0),
-            };
-            panel.resizable(true).show(ui, |ui| {
-                let active = self.layout.tab_strip(ui, dock);
-                ui.separator();
-                if let Some(pane) = active {
-                    self.pane_ui(ui, pane);
-                }
-            });
-        }
+        // The tree is taken out while it draws, so panes can borrow the rest of the app.
+        let mut tree = std::mem::replace(&mut self.tree, dock::default_tree());
+        tree.ui(&mut TileBehavior { app: self }, ui);
+        self.tree = tree;
     }
 
     fn pane_ui(&mut self, ui: &mut egui::Ui, pane: Pane) {
         match pane {
+            Pane::Viewport => self.viewport_ui(ui),
             Pane::Display => {
                 egui::ScrollArea::vertical()
                     .id_salt("display_pane")
@@ -923,11 +907,74 @@ impl eframe::App for FemCraftApp {
         }
         self.ribbon(ui);
         self.status_bar(ui);
-        self.docks(ui);
         self.refresh_lines();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.viewport_ui(ui));
+            .show(ui, |ui| self.docks(ui));
+    }
+}
+
+/// How `egui_tiles` draws and names FemCraft's panes.
+struct TileBehavior<'a> {
+    app: &'a mut FemCraftApp,
+}
+
+impl egui_tiles::Behavior<Pane> for TileBehavior<'_> {
+    fn pane_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        _tile_id: egui_tiles::TileId,
+        pane: &mut Pane,
+    ) -> egui_tiles::UiResponse {
+        if *pane == Pane::Viewport {
+            self.app.pane_ui(ui, *pane);
+        } else {
+            egui::Frame::new()
+                .fill(ui.visuals().panel_fill)
+                .inner_margin(6.0)
+                .show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    self.app.pane_ui(ui, *pane);
+                });
+        }
+        egui_tiles::UiResponse::None
+    }
+
+    fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
+        pane.title().into()
+    }
+
+    fn is_tab_closable(
+        &self,
+        tiles: &egui_tiles::Tiles<Pane>,
+        tile_id: egui_tiles::TileId,
+    ) -> bool {
+        !matches!(
+            tiles.get(tile_id),
+            Some(egui_tiles::Tile::Pane(Pane::Viewport))
+        )
+    }
+
+    /// Closing hides the pane, so the ribbon can bring it back where it was.
+    fn on_tab_close(
+        &mut self,
+        tiles: &mut egui_tiles::Tiles<Pane>,
+        tile_id: egui_tiles::TileId,
+    ) -> bool {
+        tiles.set_visible(tile_id, false);
+        false
+    }
+
+    fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
+        egui_tiles::SimplificationOptions {
+            // Every pane keeps a tab bar, so every pane can be dragged.
+            all_panes_must_have_tabs: true,
+            ..Default::default()
+        }
+    }
+
+    fn gap_width(&self, _style: &egui::Style) -> f32 {
+        3.0
     }
 }
 

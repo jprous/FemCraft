@@ -19,7 +19,7 @@ Plan and milestone status: `docs/ROADMAP.md`.
 ## Code layout (Cargo workspace)
 
 - `apps/femcraft` executable (window setup only).
-- `crates/femcraft-ui`: `app.rs` ribbon (File menu + Home / View / Model / Loads tabs), docks and viewport interaction; `dock.rs` left / right / bottom docks holding panes as tabs (right-click a tab to move / close; own small implementation because `egui_dock` targets egui 0.36); `panels.rs` Navigator tree and object Tables (`egui_extras`), both sharing the viewport selection; `scene.rs` turns a `Model`
+- `crates/femcraft-ui`: `app.rs` ribbon (File menu + Home / View / Model / Loads tabs), docks and viewport interaction; `dock.rs` dockable layout on `egui_tiles` (model view + Display / Navigator / Tables panes as draggable tabs, resizable splits, closable panes reopened from View > Panels; `egui_dock` would add floating windows but targets egui 0.36); `panels.rs` Navigator tree and object Tables (`egui_extras`), both sharing the viewport selection; `scene.rs` turns a `Model`
   into GPU lines / triangles plus 2D marks (nodes, support symbols, load labels). RFEM's Z
   points down: model `(x, y, z)` is drawn at world `(x, -y, -z)`. Open a model with
   `cargo run --release -- file.rf6`, File > Open... (native dialog, `rfd`) or drag and drop.
