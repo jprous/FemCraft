@@ -89,6 +89,7 @@ fn new_model_with_frame_slab_and_loads() {
         ObjectId::load(K::NodalLoad, 2, 1),
         &[
             ("nodes", Value::RefList(vec![3])),
+            ("load_direction", Value::Int(1)), // global Y
             ("magnitude", Value::Float(5_000.0)),
         ],
     );
@@ -150,4 +151,121 @@ fn add_node_to_existing_model() {
     assert_eq!(back.model.count(K::Node), no as usize);
     assert_eq!(back.model.node_position(no), Some([3.0, 0.0, -6.0]));
     assert_eq!(back.model.node_position(1), doc.model.node_position(1));
+}
+
+/// Four files from the RFEM-saved template, each adding one step, to find what RFEM rejects:
+/// 1 portal frame nodes + lines, 2 + members and a support, 3 + a slab with a surface support,
+/// 4 + loads. `FEMCRAFT_KEEP_DIR=<dir>` keeps them.
+#[test]
+fn staged_models_from_template() {
+    let (Some(template), Some(prokon), Some(portal), Some(pit)) = (
+        private("FEMCRAFT - RFEM6 Template.rf6"),
+        private("Prokon Model1.rf6"),
+        private("FemCraft portal frame.rf6"),
+        private("FemCraft pit 3 loads.rf6"),
+    ) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    for stage in 1..=4 {
+        let mut doc = RfDocument::open(&template).unwrap();
+        doc.prototype_files = vec![prokon.clone(), portal.clone(), pit.clone()];
+        // Portal frame in the XZ plane (Z down) ...
+        for (no, x, z) in [(1, 0.0, 0.0), (2, 0.0, -4.0), (3, 6.0, -4.0), (4, 6.0, 0.0)] {
+            node(&mut doc, no, x, 0.0, z);
+        }
+        // ... and a 2 x 2 m slab beside it.
+        for (no, x, y) in [
+            (5, 10.0, 0.0),
+            (6, 12.0, 0.0),
+            (7, 12.0, 2.0),
+            (8, 10.0, 2.0),
+        ] {
+            node(&mut doc, no, x, y, 0.0);
+        }
+        let lines: [&[u32]; 7] = [
+            &[1, 2],
+            &[2, 3],
+            &[3, 4],
+            &[5, 6],
+            &[6, 7],
+            &[7, 8],
+            &[8, 5],
+        ];
+        for (i, l) in lines.iter().enumerate() {
+            add(
+                &mut doc,
+                ObjectId::new(K::Line, i as u32 + 1),
+                &[("definition_nodes", Value::RefList(l.to_vec()))],
+            );
+        }
+        if stage >= 2 {
+            for no in 1..=3 {
+                add(
+                    &mut doc,
+                    ObjectId::new(K::Member, no),
+                    &[("line", Value::Ref(no)), ("section_start", Value::Ref(1))],
+                );
+            }
+            let fixed = ObjectId::new(K::NodalSupport, 2);
+            doc.model
+                .set(fixed, "nodes", Value::RefList(vec![1, 4]))
+                .unwrap();
+        }
+        if stage >= 3 {
+            add(
+                &mut doc,
+                ObjectId::new(K::Surface, 1),
+                &[
+                    ("boundary_lines", Value::RefList(vec![4, 5, 6, 7])),
+                    ("thickness", Value::Ref(1)),
+                ],
+            );
+            let rigid = ObjectId::new(K::SurfaceSupport, 1);
+            doc.model
+                .set(rigid, "surfaces", Value::RefList(vec![1]))
+                .unwrap();
+        }
+        if stage >= 4 {
+            add(
+                &mut doc,
+                ObjectId::load(K::NodalLoad, 2, 1),
+                &[
+                    ("nodes", Value::RefList(vec![2])),
+                    ("magnitude", Value::Float(10_000.0)),
+                ],
+            );
+            add(
+                &mut doc,
+                ObjectId::load(K::MemberLoad, 3, 1),
+                &[
+                    ("members", Value::RefList(vec![2])),
+                    ("magnitude", Value::Float(5_000.0)),
+                ],
+            );
+            add(
+                &mut doc,
+                ObjectId::load(K::SurfaceLoad, 3, 1),
+                &[
+                    ("surfaces", Value::RefList(vec![1])),
+                    ("uniform_magnitude", Value::Float(2_000.0)),
+                ],
+            );
+        }
+        let expected = doc.model.clone();
+        let out = dir.path().join(format!("FemCraft stage {stage}.rf6"));
+        doc.save(&out).unwrap();
+        if let Ok(keep) = std::env::var("FEMCRAFT_KEEP_DIR") {
+            std::fs::copy(&out, Path::new(&keep).join(out.file_name().unwrap())).unwrap();
+        }
+        let back = RfDocument::open(&out).unwrap();
+        for &kind in K::ALL {
+            for (id, o) in expected.iter_kind(kind) {
+                let got = back.model.get(id).unwrap();
+                for (k, v) in &o.values {
+                    assert_eq!(got.get(k), v, "stage {stage}: {id:?}.{k}");
+                }
+            }
+        }
+    }
 }

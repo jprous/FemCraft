@@ -172,6 +172,8 @@ static MEMBER: &[FieldSpec] = &[
     f("line", "Line", Ref(K::Line)),
     f("section_start", "Section start", Ref(K::Section)),
     f("section_end", "Section end", Ref(K::Section)),
+    // 0 = uniform.
+    f("section_distribution", "Cross-section distribution", Enum),
     f("rotation_angle", "Rotation β", Float("rad")),
     f("member_hinge_start", "Hinge start", Int),
     f("member_hinge_end", "Hinge end", Int),

@@ -25,6 +25,19 @@ Plan and milestone status: `docs/ROADMAP.md`.
   `cargo run --release -- file.rf6`, File > Open... (native dialog, `rfd`) or drag and drop.
 - `crates/femcraft-render` orbit camera (Z up), grid and snapping, wgpu renderer (line list +
   translucent triangle list, no depth buffer yet), `shaders/`.
+- `crates/femcraft-mcp` built-in MCP server. Methods mimic RFEM 6 API I (go-by:
+  github.com/jprous/Rfem-API1-MCP-beta), one MCP tool each: `new_model`, `open_model`, `save`,
+  `save_as`, `get_model_list`, `get_all_object_numbers` / `get_first_free_number` (`type` =
+  `E_OBJECT_TYPE_*`), `set_<kind>({value: {no, ...}})` / `get_<kind>({no})` for material,
+  section, thickness, node, line, member, surface, nodal / line / surface support, load case,
+  nodal / line / surface load (loads also take `load_case_no`). Fields are `kinds.rs` keys;
+  enums are RFEM's stored codes. `api.rs` (methods, `Workspace` trait), `lib.rs` (JSON-RPC),
+  `http.rs` (the app listens on `127.0.0.1:7980/mcp`, `FEMCRAFT_MCP_PORT`, 0 = off; requests
+  are answered on the UI thread, so edits show live), `stdio.rs` + `headless.rs`
+  (`femcraft --mcp`, no window). Add a kind by adding it to `api::KINDS`. Not yet: delete.
+  New objects of a kind the model lacks need a prototype file holding one (line loads: e.g.
+  `Al Qou_Rev6.rf6`); supports are assigned to the template's predefined ones (Hinged, Rigid).
+  `tests/build_models.rs` builds a portal frame + RC pit over JSON-RPC.
 - `crates/femcraft-aster`, `-results` placeholders.
 - egui / eframe 0.37 (panels are `egui::Panel`, `App::ui` instead of `update`).
 - CI: `.github/workflows/ci.yml` (Windows build + test).

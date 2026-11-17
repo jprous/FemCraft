@@ -1,0 +1,16 @@
+[package]
+name = "femcraft-mcp"
+description = "FemCraft MCP server: RFEM API I style methods over stdio or local HTTP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+femcraft-model.workspace = true
+femcraft-rfdb.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3.27.0"

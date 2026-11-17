@@ -814,32 +814,122 @@ impl RfDocument {
         }
         // Load cases first: loads need their database ids.
         new.sort_by_key(|id| (id.kind != ObjectKind::LoadCase, *id));
-        let mut protos: HashMap<ObjectKind, crate::build::Proto> = HashMap::new();
+        // One transaction: nothing is inserted unless every new object can be.
+        let mut b = crate::build::Builder::on_db(self.archive.db_path())?;
         let mut donors: Vec<Option<RfDocument>> = Vec::new();
+        let files = self.prototype_files.clone();
+        // A copy must suit this database (a file from another RFEM version may lack columns).
+        let mut why: Vec<String> = Vec::new();
+        let pick = |b: &crate::build::Builder,
+                    donors: &mut Vec<Option<RfDocument>>,
+                    why: &mut Vec<String>,
+                    own: Option<&RfDocument>,
+                    get: &dyn Fn(&RfDocument) -> Option<crate::build::Proto>|
+         -> Option<crate::build::Proto> {
+            let fits =
+                |p: crate::build::Proto, from: &str, why: &mut Vec<String>| match b.misfit(&p) {
+                    None => Some(p),
+                    Some(m) => {
+                        why.push(format!("{from}: {m}"));
+                        None
+                    }
+                };
+            // The model's own objects match its database; else the prototype with the fewest
+            // missing columns (none: same RFEM version), missing ones getting defaults.
+            if let Some(own) = own {
+                match get(own) {
+                    Some(p) => {
+                        if let Some(p) = fits(p, "this model", why) {
+                            return Some(p);
+                        }
+                    }
+                    None => why.push("this model: none".into()),
+                }
+            }
+            if files.is_empty() {
+                why.push("no prototype files given".into());
+            }
+            let mut best: Option<(usize, crate::build::Proto)> = None;
+            for (i, f) in files.iter().enumerate() {
+                let name = f
+                    .file_name()
+                    .map_or(String::new(), |n| n.to_string_lossy().into());
+                if donors.len() <= i {
+                    donors.push(match RfDocument::open(f) {
+                        Ok(d) => Some(d),
+                        Err(e) => {
+                            why.push(format!("{name}: could not open ({e})"));
+                            None
+                        }
+                    });
+                }
+                let Some(d) = donors[i].as_ref() else {
+                    continue;
+                };
+                match get(d) {
+                    Some(p) => {
+                        if let Some(p) = fits(p, &name, why) {
+                            let missing = b.missing_columns(&p);
+                            if missing == 0 {
+                                return Some(p);
+                            }
+                            if best.as_ref().is_none_or(|(m, _)| missing < *m) {
+                                best = Some((missing, p));
+                            }
+                        }
+                    }
+                    None => why.push(format!("{name}: none")),
+                }
+            }
+            best.map(|(_, p)| p)
+        };
+        // Keyed by kind and prototype filter (a nodal load with components needs another copy).
+        let mut protos: HashMap<(ObjectKind, String), crate::build::Proto> = HashMap::new();
+        let key_of = |id: &ObjectId, model: &Model| {
+            let want = prototype_filter(id.kind, model.get(*id).expect("new objects exist"));
+            ((id.kind, format!("{want:?}")), want)
+        };
         for id in &new {
-            if protos.contains_key(&id.kind) {
+            let (key, want) = key_of(id, &self.model);
+            if protos.contains_key(&key) {
                 continue;
             }
-            let want = prototype_filter(id.kind);
-            let mut found = crate::build::find_proto(self, id.kind, &want).ok();
-            for (i, f) in self.prototype_files.iter().enumerate() {
-                if found.is_some() {
-                    break;
-                }
-                if donors.len() <= i {
-                    donors.push(RfDocument::open(f).ok());
-                }
-                found = donors[i]
-                    .as_ref()
-                    .and_then(|d| crate::build::find_proto(d, id.kind, &want).ok());
-            }
-            let p = found.ok_or_else(|| {
+            why.clear();
+            let get = |d: &RfDocument| crate::build::find_proto(d, id.kind, &want).ok();
+            let p = pick(&b, &mut donors, &mut why, Some(&*self), &get).ok_or_else(|| {
                 Error::Unsupported(format!(
-                    "adding {}: no example of it in this model or the prototype files",
-                    id.kind.name()
+                    "adding {}: no usable example in this model or the prototype files{}",
+                    id.kind.name(),
+                    if why.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", why.join("; "))
+                    }
                 ))
             })?;
-            protos.insert(id.kind, p);
+            protos.insert(key, p);
+        }
+        // New surfaces need the objects RFEM makes with the first surface.
+        let mut extra = Vec::new();
+        if new.iter().any(|id| id.kind == ObjectKind::Surface) {
+            for table in crate::build::SURFACE_SUPPORT_TABLES {
+                if b.count_rows(table)? > 0 {
+                    continue;
+                }
+                why.clear();
+                let get = |d: &RfDocument| crate::build::first_of_table(d, table).ok().flatten();
+                let p = pick(&b, &mut donors, &mut why, None, &get).ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "adding surfaces: no usable {table} in the prototype files{}",
+                        if why.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", why.join("; "))
+                        }
+                    ))
+                })?;
+                extra.push(p);
+            }
         }
         drop(donors);
 
@@ -849,7 +939,10 @@ impl RfDocument {
             .cloned()
             .unwrap_or_default();
         {
-            let mut b = crate::build::Builder::on_db(self.archive.db_path())?;
+            b.begin()?;
+            for p in &extra {
+                b.add(p, 1, None)?;
+            }
             for id in &new {
                 let lc = if id.kind.spec().is_load() {
                     Some(*lc_ids.get(&id.load_case).ok_or_else(|| {
@@ -863,7 +956,7 @@ impl RfDocument {
                 } else {
                     None
                 };
-                let main = b.add(&protos[&id.kind], id.no as i64, lc)?;
+                let main = b.add(&protos[&key_of(id, &self.model).0], id.no as i64, lc)?;
                 match id.kind {
                     ObjectKind::Surface => b.make_surface_standard(main)?,
                     ObjectKind::LoadCase => {
@@ -874,6 +967,7 @@ impl RfDocument {
             }
             // References a copy brought from another file that point nowhere.
             b.clear_dangling_references()?;
+            b.commit()?;
         }
 
         let old = std::mem::replace(&mut self.model, Model::new());
@@ -1114,7 +1208,7 @@ impl RfDocument {
 }
 
 /// Which object a new object of `kind` is copied from (the simplest type of each kind).
-fn prototype_filter(kind: ObjectKind) -> Vec<(&'static str, Value)> {
+fn prototype_filter(kind: ObjectKind, obj: &Object) -> Vec<(&'static str, Value)> {
     use ObjectKind as K;
     let t = |k: &'static str, v: &str| vec![(k, Value::Text(v.into()))];
     match kind {
@@ -1123,6 +1217,15 @@ fn prototype_filter(kind: ObjectKind) -> Vec<(&'static str, Value)> {
         K::Member => t("type", "TYPE_BEAM"),
         K::Surface => t("geometry", "GEOMETRY_PLANE"),
         K::Thickness => t("type", "TYPE_UNIFORM"),
+        // Nodal loads by components (PX ... MZ) are their own load type.
+        K::NodalLoad
+            if obj
+                .values
+                .iter()
+                .any(|(k, v)| k.starts_with("components_") && !matches!(v, Value::Null)) =>
+        {
+            t("load_type", "LOAD_TYPE_COMPONENTS")
+        }
         k if k.spec().is_load() && k != K::LoadCase => t("load_type", "LOAD_TYPE_FORCE"),
         _ => Vec::new(),
     }

@@ -136,12 +136,21 @@ fn overrides(kind: ObjectKind, key: &str) -> &'static [&'static str] {
         (ImposedLineDeformation, "imposed_rotation_line_start") => &["imposedRotationLineStart"],
         (ImposedLineDeformation, "imposed_rotation_line_end") => &["imposedRotationAtLineEnd"],
         (NodalLoad, "load_direction") => &["loadDirectionAxis"],
+        // NodalLoadImplComponents (RFEM 6.16 table structure; no object seen yet).
+        (NodalLoad, "components_force_x") => &["force_x"],
+        (NodalLoad, "components_force_y") => &["force_y"],
+        (NodalLoad, "components_force_z") => &["force_z"],
+        (NodalLoad, "components_moment_x") => &["moment_x"],
+        (NodalLoad, "components_moment_y") => &["moment_y"],
+        (NodalLoad, "components_moment_z") => &["moment_z"],
         (FreeRectangularLoad | FreeLineLoad, "load_distribution") => &["distribution"],
         // Objects a load is applied to.
         (k, "nodes" | "lines" | "members" | "surfaces" | "solids") if k.spec().is_load() => {
             &["assignedTo"]
         }
         (Surface, "boundary_lines") => &["boundaryLines"],
+        // Confirmed on RFEM 6.14 (MemberImplBeam; 0 = uniform).
+        (Member, "section_distribution") => &["sectionDistributionType"],
         (Thickness, "uniform_thickness") => &["thickness"],
         // guess
         (Solid, "boundary_surfaces") => &["boundarySurfaces", "surfaces"],

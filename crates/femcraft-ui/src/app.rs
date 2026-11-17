@@ -131,6 +131,8 @@ pub struct FemCraftApp {
     ribbon_tab: RibbonTab,
     tables: panels::TableState,
     render_state: Option<eframe::egui_wgpu::RenderState>,
+    /// MCP requests from the HTTP listener (see `femcraft_mcp::http`).
+    mcp: Option<std::sync::mpsc::Receiver<femcraft_mcp::http::Request>>,
 }
 
 impl FemCraftApp {
@@ -160,7 +162,18 @@ impl FemCraftApp {
             ribbon_tab: RibbonTab::Home,
             tables: panels::TableState::default(),
             render_state: Some(render_state),
+            mcp: None,
         };
+        // Built-in MCP server on 127.0.0.1 (FEMCRAFT_MCP_PORT, 0 = off). A second instance
+        // finds the port taken and runs without it.
+        let port = std::env::var("FEMCRAFT_MCP_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(femcraft_mcp::DEFAULT_PORT);
+        if port != 0 {
+            let ctx = cc.egui_ctx.clone();
+            app.mcp = femcraft_mcp::http::serve(port, move || ctx.request_repaint()).ok();
+        }
         // Layout, recent files and ribbon state from the previous session.
         if let Some(saved) = cc
             .storage
@@ -232,6 +245,13 @@ impl FemCraftApp {
             self.to_open.push(path.to_owned());
             return;
         }
+        if let Err(e) = self.try_open(path) {
+            self.message = Some(e);
+        }
+    }
+
+    /// [`Self::open`] returning the error (MCP); the model's id when opened.
+    fn try_open(&mut self, path: &Path) -> Result<u64, String> {
         let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
         if let Some(id) = self
             .docs
@@ -241,7 +261,7 @@ impl FemCraftApp {
         {
             self.activate(id);
             self.remember_recent(&abs);
-            return;
+            return Ok(id);
         }
         match Document::open(self.next_doc_id, path) {
             Ok(mut doc) => {
@@ -256,35 +276,44 @@ impl FemCraftApp {
                 self.active = Some(id);
                 self.message = None;
                 self.remember_recent(&abs);
+                Ok(id)
             }
-            Err(e) => self.message = Some(format!("Could not open {}: {e}", path.display())),
+            Err(e) => Err(format!("Could not open {}: {e}", path.display())),
         }
     }
 
     /// Where the blank model behind File > New is kept (next to the saved UI state).
-    fn blank_model_path() -> Option<PathBuf> {
+    pub fn blank_model_path() -> Option<PathBuf> {
         eframe::storage_dir("FemCraft").map(|d| d.join("new model.rf6"))
     }
 
     /// RFEM files new objects are copied from when a model has none of that kind yet: the
     /// `.rf6` files in `prototypes` next to the saved UI state.
-    fn prototype_files() -> Vec<PathBuf> {
-        let Some(dir) = eframe::storage_dir("FemCraft").map(|d| d.join("prototypes")) else {
-            return Vec::new();
-        };
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rf6")))
-            .collect();
-        files.sort();
+    /// Also the `prototypes` folder next to the executable.
+    pub fn prototype_files() -> Vec<PathBuf> {
+        let dirs = [
+            eframe::storage_dir("FemCraft").map(|d| d.join("prototypes")),
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| d.join("prototypes"))),
+        ];
+        let mut files: Vec<PathBuf> = Vec::new();
+        for dir in dirs.into_iter().flatten() {
+            let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rf6")))
+                .collect();
+            found.sort();
+            files.extend(found);
+        }
         files
     }
 
-    /// File > New: an untitled model from the blank model. The first time, the blank model is
-    /// made from an RFEM file the user picks (settings, materials and sections are kept).
+    /// File > New: an untitled model from the template model. The first time, the user picks
+    /// the template: an RFEM model without geometry, copied as it is.
     fn new_model(&mut self) {
         let Some(blank) = Self::blank_model_path() else {
             self.message = Some("No folder for FemCraft's data was found".into());
@@ -292,9 +321,7 @@ impl FemCraftApp {
         };
         if !blank.is_file() {
             let Some(template) = rfd::FileDialog::new()
-                .set_title(
-                    "New model: choose an RFEM 6 model to take settings, materials and sections from",
-                )
+                .set_title("New model: choose the template (an RFEM 6 model without geometry)")
                 .add_filter("RFEM 6 model", &["rf6"])
                 .pick_file()
             else {
@@ -303,19 +330,30 @@ impl FemCraftApp {
             if let Some(dir) = blank.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            if let Err(e) = femcraft_rfdb::build::blank_model(&template, &blank) {
-                let _ = std::fs::remove_file(&blank);
-                self.message = Some(format!(
-                    "Could not make a blank model from {}: {e}",
-                    template.display()
-                ));
+            // Used as it is: a model saved by RFEM (no geometry, with the materials, sections,
+            // supports and load cases new models should start with) opens in RFEM for sure.
+            if let Err(e) = std::fs::copy(&template, &blank) {
+                self.message = Some(format!("Could not copy {}: {e}", template.display()));
                 return;
             }
         }
-        let n = (1..)
-            .find(|n| !self.docs.iter().any(|d| d.title() == format!("Model {n}")))
-            .unwrap_or(1);
-        match Document::new_untitled(self.next_doc_id, &blank, &format!("Model {n}")) {
+        if let Err(e) = self.new_from(&blank, None) {
+            self.message = Some(e);
+        }
+    }
+
+    /// An untitled model from the blank model `blank`, named `name` or "Model N".
+    fn new_from(&mut self, blank: &Path, name: Option<&str>) -> Result<String, String> {
+        let name = name.map_or_else(
+            || {
+                let n = (1..)
+                    .find(|n| !self.docs.iter().any(|d| d.title() == format!("Model {n}")))
+                    .unwrap_or(1);
+                format!("Model {n}")
+            },
+            str::to_owned,
+        );
+        match Document::new_untitled(self.next_doc_id, blank, &name) {
             Ok(mut doc) => {
                 let id = doc.id;
                 self.next_doc_id += 1;
@@ -327,8 +365,9 @@ impl FemCraftApp {
                 self.docs.push(doc);
                 self.active = Some(id);
                 self.message = None;
+                Ok(name)
             }
-            Err(e) => self.message = Some(format!("Could not start a new model: {e}")),
+            Err(e) => Err(format!("Could not start a new model: {e}")),
         }
     }
 
@@ -341,7 +380,7 @@ impl FemCraftApp {
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("rf6"));
         if is_rf6 {
-            self.save_to(&path);
+            let _ = self.save_to(&path);
         } else {
             self.save_as_dialog();
         }
@@ -361,23 +400,26 @@ impl FemCraftApp {
             if path.extension().is_none() {
                 path.set_extension("rf6");
             }
-            self.save_to(&path);
+            let _ = self.save_to(&path);
         }
     }
 
-    fn save_to(&mut self, path: &Path) {
+    fn save_to(&mut self, path: &Path) -> Result<(), String> {
         let Some(d) = self.active_doc_mut() else {
-            return;
+            return Err("no model is open".into());
         };
         match d.save_as(path) {
             Ok(()) => {
                 self.message = None;
                 self.notice = Some(format!("Saved {}", path.display()));
                 self.remember_recent(path);
+                Ok(())
             }
             Err(e) => {
+                let e = format!("Could not save {}: {e}", path.display());
                 self.notice = None;
-                self.message = Some(format!("Could not save {}: {e}", path.display()));
+                self.message = Some(e.clone());
+                Err(e)
             }
         }
     }
@@ -1092,6 +1134,13 @@ fn load_case_combo(ui: &mut egui::Ui, id: &str, d: &mut Document) {
 
 impl eframe::App for FemCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Requests from MCP clients (the HTTP listener queues them for this thread).
+        if let Some(rx) = self.mcp.take() {
+            while let Ok(req) = rx.try_recv() {
+                req.answer(self);
+            }
+            self.mcp = Some(rx);
+        }
         let dropped: Vec<PathBuf> = ui.input(|i| {
             i.raw
                 .dropped_files
@@ -1397,5 +1446,67 @@ mod tests {
         // A toggle added in a later version falls back to its default.
         let old: Visibility = ron::from_str("(nodes: false)").unwrap();
         assert!(!old.nodes && old.member_profiles);
+    }
+}
+
+/// MCP methods act on the open models like the menu commands do.
+impl femcraft_mcp::Workspace for FemCraftApp {
+    fn new_model(&mut self, name: Option<&str>) -> Result<String, String> {
+        let blank = Self::blank_model_path()
+            .filter(|p| p.is_file())
+            .ok_or("no blank model: use File > New once in FemCraft to choose the template")?;
+        self.new_from(&blank, name)
+    }
+
+    fn open_model(&mut self, path: &Path) -> Result<String, String> {
+        let id = self.try_open(path)?;
+        Ok(self
+            .docs
+            .iter()
+            .find(|d| d.id == id)
+            .map(Document::title)
+            .unwrap_or_default())
+    }
+
+    fn save_model(&mut self, path: Option<&Path>) -> Result<PathBuf, String> {
+        let own = self
+            .active_doc()
+            .map(|d| d.path.clone())
+            .ok_or("no model is open")?;
+        let path = match path {
+            Some(p) => std::path::absolute(p).unwrap_or_else(|_| p.to_owned()),
+            None if own
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("rf6")) =>
+            {
+                own
+            }
+            None => return Err("the model is untitled; use save_as".into()),
+        };
+        self.save_to(&path)?;
+        Ok(path)
+    }
+
+    fn models(&self) -> Vec<femcraft_mcp::ModelInfo> {
+        self.docs
+            .iter()
+            .map(|d| femcraft_mcp::ModelInfo {
+                name: d.title(),
+                path: d.path.clone(),
+                active: self.active == Some(d.id),
+                modified: d.is_modified(),
+            })
+            .collect()
+    }
+
+    fn active(&mut self) -> Option<&mut femcraft_rfdb::RfDocument> {
+        self.active_doc_mut().map(|d| &mut d.rf)
+    }
+
+    fn changed(&mut self) {
+        if let Some(d) = self.active_doc_mut() {
+            d.revision += 1; // rebuild the 3D view
+            d.load_cases = scene::load_cases(&d.rf.model);
+        }
     }
 }

@@ -69,6 +69,8 @@ pub const EXTRA_PURGE_TABLES: &[&str] = &[
 /// Table layout needed to follow ownership.
 pub struct Schema {
     columns: HashMap<String, Vec<String>>,
+    /// Columns that must be given a value (NOT NULL, no default, not the key), with their type.
+    required: HashMap<String, Vec<(String, String)>>,
     /// Tables with `owner_id` and `owner_table`.
     owner_tables: Vec<String>,
     /// Owner table -> its list tables.
@@ -78,13 +80,21 @@ pub struct Schema {
 impl Schema {
     pub fn read(conn: &Connection) -> Result<Self, Error> {
         let mut columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut required: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let mut stmt = conn.prepare(
-            "SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p \
-             WHERE m.type = 'table'",
+            "SELECT m.name, p.name, p.[notnull] AND p.dflt_value IS NULL AND p.pk = 0, p.type \
+             FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type = 'table'",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
-            columns.entry(r.get(0)?).or_default().push(r.get(1)?);
+            let (t, c): (String, String) = (r.get(0)?, r.get(1)?);
+            if r.get::<_, bool>(2)? {
+                required
+                    .entry(t.clone())
+                    .or_default()
+                    .push((c.clone(), r.get(3)?));
+            }
+            columns.entry(t).or_default().push(c);
         }
         let has = |cols: &[String], c: &str| cols.iter().any(|x| x == c);
         let owner_tables = columns
@@ -108,6 +118,7 @@ impl Schema {
         }
         Ok(Self {
             columns,
+            required,
             owner_tables,
             lists,
         })
@@ -244,6 +255,29 @@ pub fn find_proto(
     let schema = Schema::read(&conn)?;
     capture(&conn, &schema, kind, table, key)
 }
+
+/// Captures the first row tree of `table` in an opened model: standalone objects without an
+/// [`ObjectKind`], such as `ConcreteExposureCondition`. None if the table is empty or missing.
+pub fn first_of_table(doc: &RfDocument, table: &str) -> Result<Option<Proto>, Error> {
+    let conn =
+        Connection::open_with_flags(doc.archive.db_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let schema = Schema::read(&conn)?;
+    if !schema.columns.contains_key(table) {
+        return Ok(None);
+    }
+    let id: Option<i64> =
+        conn.query_row(&format!("SELECT MIN(id) FROM {}", quote(table)), [], |r| {
+            r.get(0)
+        })?;
+    // The kind is only a label here.
+    id.map(|id| capture(&conn, &schema, ObjectKind::Surface, table, id))
+        .transpose()
+}
+
+/// Objects RFEM expects concrete surfaces to refer to (it crashed on surfaces without them);
+/// RFEM creates them with the first surface.
+pub const SURFACE_SUPPORT_TABLES: [&str; 2] =
+    ["ConcreteExposureCondition", "ReinforcementDirection"];
 
 /// Random-enough GUID text (`xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx`) without extra crates.
 fn new_guid(seq: &mut u64) -> String {
@@ -491,6 +525,7 @@ impl Builder {
                 };
                 out.push((c.clone(), nv));
             }
+            self.fill_required(t, &mut out);
             self.insert(t, &out)?;
         }
         // List entries: references to rows of this object's own tree are remapped (for
@@ -544,7 +579,7 @@ impl Builder {
             let Some(new) = map.get(&(owner, old)) else {
                 continue;
             };
-            let out: Row = row
+            let mut out: Row = row
                 .iter()
                 .map(|(c, v)| {
                     (
@@ -557,6 +592,7 @@ impl Builder {
                     )
                 })
                 .collect();
+            self.fill_required(l, &mut out);
             self.insert(l, &out)?;
         }
         let main_old = int(get(&proto.rows[0].1, "id")).unwrap_or(0);
@@ -590,6 +626,79 @@ impl Builder {
         Ok(())
     }
 
+    /// Starts a transaction; without [`Builder::commit`] everything is rolled back when the
+    /// builder is dropped.
+    pub(crate) fn begin(&self) -> Result<(), Error> {
+        self.conn.execute_batch("BEGIN")?;
+        Ok(())
+    }
+
+    pub(crate) fn commit(self) -> Result<(), Error> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// Whether `proto` can be inserted here: every row's table exists. (Required columns the
+    /// copy lacks, e.g. from an older RFEM version, get default values in [`Builder::add`].)
+    /// Returns the first problem.
+    pub fn misfit(&self, proto: &Proto) -> Option<String> {
+        for (t, _) in proto.rows.iter().chain(&proto.lists) {
+            if !self.schema.columns.contains_key(t) {
+                return Some(format!("table {t} does not exist"));
+            }
+        }
+        None
+    }
+
+    /// How many columns of this database the copy has no value for (0: it comes from the same
+    /// RFEM version; such a copy is preferred).
+    pub fn missing_columns(&self, proto: &Proto) -> usize {
+        proto
+            .rows
+            .iter()
+            .chain(&proto.lists)
+            .map(|(t, row)| {
+                self.schema.columns.get(t).map_or(0, |cols| {
+                    cols.iter().filter(|c| get(row, c).is_none()).count()
+                })
+            })
+            .sum()
+    }
+
+    /// Adds the required columns of `table` that `row` lacks, with RFEM's neutral defaults
+    /// (0 / false, 0.0, empty text), as for a file written by an older RFEM version.
+    fn fill_required(&self, table: &str, row: &mut Row) {
+        for (c, ty) in self.schema.required.get(table).into_iter().flatten() {
+            if get(row, c).is_some() {
+                continue;
+            }
+            let ty = ty.to_ascii_uppercase();
+            let v = if ty.contains("INT") || ty.contains("BOOL") {
+                Sql::Integer(0)
+            } else if ["REAL", "DOUB", "FLOA", "NUM", "DEC"]
+                .iter()
+                .any(|k| ty.contains(k))
+            {
+                Sql::Real(0.0)
+            } else {
+                Sql::Text(String::new())
+            };
+            row.push((c.clone(), v));
+        }
+    }
+
+    /// Rows in `table` (0 if the table does not exist).
+    pub(crate) fn count_rows(&self, table: &str) -> Result<i64, Error> {
+        if !self.schema.columns.contains_key(table) {
+            return Ok(0);
+        }
+        Ok(self
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {}", quote(table)), [], |r| {
+                r.get(0)
+            })?)
+    }
+
     /// Gives a surface (main row id) the "standard" stiffness type, which carries a thickness.
     pub fn make_surface_standard(&mut self, surface_id: i64) -> Result<(), Error> {
         let (it, iid): (String, i64) = self.conn.query_row(
@@ -603,22 +712,22 @@ impl Builder {
             rusqlite::params![it, iid],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        if st == "SurfaceStiffnessStandard" {
-            return Ok(());
+        if st != "SurfaceStiffnessStandard" {
+            self.conn
+                .execute(&format!("DELETE FROM {} WHERE id = ?1", quote(&st)), [sid])?;
+            let new = self.next_id("SurfaceStiffnessStandard")?;
+            self.conn.execute(
+                "INSERT INTO SurfaceStiffnessStandard (id, version, owner_id, owner_table, \
+                 thickness_id) VALUES (?1, 0, ?2, ?3, NULL)",
+                rusqlite::params![new, iid, it],
+            )?;
+            self.conn.execute(
+                "UPDATE SurfaceSpecificImplPart SET stiffness_table = 'SurfaceStiffnessStandard', \
+                 stiffness_id = ?1 WHERE id = ?2",
+                rusqlite::params![new, part],
+            )?;
         }
-        self.conn
-            .execute(&format!("DELETE FROM {} WHERE id = ?1", quote(&st)), [sid])?;
-        let new = self.next_id("SurfaceStiffnessStandard")?;
-        self.conn.execute(
-            "INSERT INTO SurfaceStiffnessStandard (id, version, owner_id, owner_table, thickness_id) \
-             VALUES (?1, 0, ?2, ?3, NULL)",
-            rusqlite::params![new, iid, it],
-        )?;
-        self.conn.execute(
-            "UPDATE SurfaceSpecificImplPart SET stiffness_table = 'SurfaceStiffnessStandard', \
-             stiffness_id = ?1 WHERE id = ?2",
-            rusqlite::params![new, part],
-        )?;
+        // (Also for surfaces that were standard already: cloning drops these list entries.)
         // Concrete surfaces refer to a durability and a reinforcement direction (one entry
         // per surface side), as in models saved by RFEM.
         for (list, target) in [

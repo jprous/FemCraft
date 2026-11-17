@@ -22,7 +22,17 @@ fn editable(kind: K) -> Vec<&'static str> {
         ],
         K::NodalSupport | K::LineSupport | K::MemberSupport | K::SurfaceSupport => all(kind),
         K::LoadCase => vec!["name", "self_weight_active", "to_solve"],
-        K::NodalLoad | K::LineLoad | K::MemberLoad | K::SurfaceLoad => vec![
+        K::NodalLoad => vec![
+            "nodes",
+            "magnitude",
+            "components_force_x",
+            "components_force_y",
+            "components_force_z",
+            "components_moment_x",
+            "components_moment_y",
+            "components_moment_z",
+        ],
+        K::LineLoad | K::MemberLoad | K::SurfaceLoad => vec![
             "nodes",
             "lines",
             "members",

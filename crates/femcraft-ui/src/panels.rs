@@ -205,6 +205,7 @@ pub fn is_editable(kind: ObjectKind, key: &str) -> bool {
         ),
         K::NodalSupport | K::LineSupport | K::MemberSupport | K::SurfaceSupport => true,
         K::LoadCase => matches!(key, "name" | "self_weight_active" | "to_solve"),
+        K::NodalLoad if key.starts_with("components_") || key == "load_direction" => true,
         K::NodalLoad | K::LineLoad | K::MemberLoad | K::SurfaceLoad => matches!(
             key,
             "nodes"
@@ -235,7 +236,13 @@ pub const NEW_ROW_KINDS: [ObjectKind; 9] = [
 
 /// Adds object `id` with starting values (node at the origin, load case without self-weight).
 fn add_object(model: &mut Model, id: ObjectId) -> Result<(), String> {
-    model.add(id).map_err(|e| e.to_string())?;
+    let obj = model.add(id).map_err(|e| e.to_string())?;
+    // Every editable field present (empty), so all its cells stay editable.
+    for f in id.kind.spec().fields {
+        if is_editable(id.kind, f.key) {
+            obj.values.insert(f.key, Value::Null);
+        }
+    }
     let defaults: &[(&str, Value)] = match id.kind {
         ObjectKind::Node => &[
             ("coordinate_1", Value::Float(0.0)),
@@ -243,6 +250,12 @@ fn add_object(model: &mut Model, id: ObjectId) -> Result<(), String> {
             ("coordinate_3", Value::Float(0.0)),
         ],
         ObjectKind::LoadCase => &[("self_weight_active", Value::Bool(false))],
+        ObjectKind::NodalLoad => &[("load_direction", Value::Int(2))],
+        // As RFEM's default member (and the copy saved for it): a beam, uniform section.
+        ObjectKind::Member => &[
+            ("type", Value::Text("TYPE_BEAM".into())),
+            ("section_distribution", Value::Int(0)),
+        ],
         _ => &[],
     };
     for (k, v) in defaults {
@@ -320,6 +333,35 @@ fn parse_cell(model: &Model, ty: FieldType, text: &str) -> Result<Value, String>
             Value::RefList(list)
         }
     })
+}
+
+/// Fields edited with a dropdown: (stored code, name shown).
+fn choices(kind: ObjectKind, key: &str) -> Option<&'static [(i64, &'static str)]> {
+    match (kind, key) {
+        // `loadDirectionAxis` in RFEM files: 0 / 1 / 2 = global X / Y / Z.
+        (ObjectKind::NodalLoad, "load_direction") => Some(&[(0, "X"), (1, "Y"), (2, "Z")]),
+        _ => None,
+    }
+}
+
+/// Cell text, with RFEM's names for member type and cross-section distribution.
+fn display_text(kind: ObjectKind, key: &str, v: &Value, ty: FieldType) -> String {
+    if let (Some(options), Value::Int(i)) = (choices(kind, key), v)
+        && let Some((_, name)) = options.iter().find(|(c, _)| c == i)
+    {
+        return (*name).to_owned();
+    }
+    match (kind, key, v) {
+        (ObjectKind::Member, "type", Value::Text(t)) => {
+            let name = t.strip_prefix("TYPE_").unwrap_or(t).replace('_', " ");
+            let mut c = name.chars();
+            c.next()
+                .map(|f| f.to_string() + &c.as_str().to_lowercase())
+                .unwrap_or_default()
+        }
+        (ObjectKind::Member, "section_distribution", Value::Int(0)) => "Uniform".into(),
+        _ => cell_text(v, ty),
+    }
 }
 
 fn cell_text(v: &Value, ty: FieldType) -> String {
@@ -535,6 +577,25 @@ fn object_table(
                                 // without thickness has no thickness to edit).
                                 let editable = is_editable(kind, f.key)
                                     && (is_new || obj.values.contains_key(f.key));
+                                // A fixed set of options: a dropdown, applied at once.
+                                if editable && let Some(options) = choices(kind, f.key) {
+                                    let current = value.as_i64();
+                                    egui::ComboBox::from_id_salt(("choice", doc, id, f.key))
+                                        .selected_text(display_text(kind, f.key, value, f.ty))
+                                        .width(ui.available_width())
+                                        .show_ui(ui, |ui| {
+                                            for (code, name) in options {
+                                                if ui
+                                                    .selectable_label(current == Some(*code), *name)
+                                                    .clicked()
+                                                    && current != Some(*code)
+                                                {
+                                                    edit = Some((id, f.key, Ok(Value::Int(*code))));
+                                                }
+                                            }
+                                        });
+                                    return;
+                                }
                                 // True / false: a checkbox, applied at once.
                                 if editable && f.ty == FieldType::Bool {
                                     let mut b = value.as_bool().unwrap_or(false);
@@ -569,7 +630,7 @@ fn object_table(
                                     return;
                                 }
                                 let label = ui.add(
-                                    egui::Label::new(cell_text(value, f.ty))
+                                    egui::Label::new(display_text(kind, f.key, value, f.ty))
                                         .sense(egui::Sense::click()),
                                 );
                                 // The whole cell reacts, so empty cells can be edited too.
