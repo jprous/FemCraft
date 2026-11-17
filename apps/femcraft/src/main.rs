@@ -7,6 +7,12 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("FemCraft")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!(
+                    "../../../assets/icon/femcraft-256.png"
+                ))
+                .expect("valid icon PNG"),
+            )
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 500.0]),
         renderer: eframe::Renderer::Wgpu,
