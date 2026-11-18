@@ -20,6 +20,8 @@ pub struct ResultsView {
     pub active: Option<ResultComponent>,
     /// The surface layer side ([`RadioGroup::LayerSide`]); defaults to Top.
     pub layer: Option<ResultComponent>,
+    /// Deformation exaggeration factor; `0.0` means "auto" (the document picks one on first use).
+    pub magnification: f64,
 }
 
 impl ResultsView {
@@ -69,12 +71,59 @@ pub fn results_panel(
 
     case_dropdown(ui, results, view);
     ui.separator();
-    result_tree_ui(ui, model, view);
 
-    if let Some(version) = &results.results_version {
-        ui.add_space(4.0);
+    // Reserve space at the bottom for the deformation factor (shown for displacement results)
+    // and the version line, so the scrolling tree does not cover them.
+    let show_factor = model.is_some() && view.active.is_some_and(crate::scene::is_displacement);
+    let version = results.results_version.clone();
+    let reserve = if show_factor { 36.0 } else { 0.0 } + if version.is_some() { 20.0 } else { 0.0 };
+    let tree_height = (ui.available_height() - reserve).max(60.0);
+
+    egui::ScrollArea::vertical()
+        .max_height(tree_height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| result_nodes_ui(ui, model, view));
+
+    if show_factor {
+        ui.separator();
+        factor_row(ui, view);
+    }
+    if let Some(version) = version {
         ui.weak(format!("RFEM results v{version}"));
     }
+}
+
+/// The deformation exaggeration factor, pinned at the bottom: editable value with ± steppers and
+/// an Auto reset (the document then picks a fitting factor).
+fn factor_row(ui: &mut egui::Ui, view: &mut ResultsView) {
+    ui.horizontal(|ui| {
+        ui.label("Factor");
+        if ui.small_button("−").clicked() {
+            view.magnification = (view.magnification.max(1.0) / 1.25).max(1.0).round();
+        }
+        let mut value = view.magnification.max(1.0);
+        if ui
+            .add(
+                egui::DragValue::new(&mut value)
+                    .range(1.0..=1_000_000.0)
+                    .speed(1.0),
+            )
+            .on_hover_text("Deformation exaggeration")
+            .changed()
+        {
+            view.magnification = value;
+        }
+        if ui.small_button("+").clicked() {
+            view.magnification = (view.magnification.max(1.0) * 1.25).round();
+        }
+        if ui
+            .button("Auto")
+            .on_hover_text("Fit the factor to the model")
+            .clicked()
+        {
+            view.magnification = 0.0;
+        }
+    });
 }
 
 /// The case dropdown at the top: cases grouped by kind (Load Cases, Load Combinations, ...).
@@ -111,8 +160,8 @@ fn case_dropdown(ui: &mut egui::Ui, results: &ResultSet, view: &mut ResultsView)
         });
 }
 
-/// The result-quantity tree, rendered recursively.
-fn result_tree_ui(ui: &mut egui::Ui, model: Option<&Model>, view: &mut ResultsView) {
+/// The result-quantity tree, rendered recursively (the caller provides the scroll area).
+fn result_nodes_ui(ui: &mut egui::Ui, model: Option<&Model>, view: &mut ResultsView) {
     let Some(model) = model else {
         ui.weak("No model open.");
         return;
@@ -122,14 +171,9 @@ fn result_tree_ui(ui: &mut egui::Ui, model: Option<&Model>, view: &mut ResultsVi
         ui.weak("No result quantities for this model.");
         return;
     }
-
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for node in &tree {
-                render_node(ui, node, view, "");
-            }
-        });
+    for node in &tree {
+        render_node(ui, node, view, "");
+    }
 }
 
 /// Draws one tree node: a tick-box category (recursing into its children) or a radio leaf.

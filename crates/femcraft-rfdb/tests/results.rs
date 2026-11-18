@@ -74,6 +74,26 @@ fn reads_result_cases_and_tree() {
         })
         .collect();
     eprintln!("top-level categories: {top:?} ({leaves} leaves total)");
+
+    // Decode nodal displacements for the first calculated case.
+    let fe_nodes = doc.fe_mesh().unwrap().map_or(0, |m| m.nodes.len());
+    let first = &results.cases[0];
+    let disp = doc
+        .displacements(first.solver_id, fe_nodes)
+        .unwrap()
+        .expect("first case has a displacement file");
+    assert_eq!(disp.nodal.len(), fe_nodes.max(disp.nodal.len()));
+    let max_u = disp.max_translation();
+    assert!(
+        max_u > 0.0 && max_u < 1.0,
+        "max translation {max_u} m is implausible"
+    );
+    eprintln!(
+        "{} displacements: {} nodes, max |u| = {:.2} mm",
+        first.tag(),
+        disp.nodal.len(),
+        max_u * 1000.0
+    );
 }
 
 /// Counts the radio leaves anywhere in the tree.

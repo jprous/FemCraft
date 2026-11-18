@@ -26,6 +26,42 @@ pub const AXIS_Z: [f32; 4] = [0.35, 0.58, 0.98, 1.0];
 const BG_TOP: Color32 = Color32::from_rgb(0x2e, 0x34, 0x3d);
 const BG_BOTTOM: Color32 = Color32::from_rgb(0x16, 0x19, 0x1e);
 
+/// The colour-scale legend for the active result overlay (values stored in SI).
+struct ResultLegend {
+    label: &'static str,
+    unit: &'static str,
+    /// SI -> display-unit factor (e.g. 1000 for m -> mm).
+    factor: f64,
+    min: f32,
+    max: f32,
+}
+
+/// Formats a legend value with a sensible number of digits for its size.
+fn format_legend_value(v: f64) -> String {
+    let a = v.abs();
+    if a >= 100.0 {
+        format!("{v:.0}")
+    } else if a >= 1.0 {
+        format!("{v:.2}")
+    } else {
+        format!("{v:.3}")
+    }
+}
+
+/// Diagonal of the FE mesh's bounding box (model units), used to scale the deformation factor.
+fn mesh_span(mesh: &femcraft_rfdb::FeMesh) -> f64 {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for n in &mesh.nodes {
+        for k in 0..3 {
+            lo[k] = lo[k].min(n[k]);
+            hi[k] = hi[k].max(n[k]);
+        }
+    }
+    let d = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+}
+
 pub struct Document {
     /// Unique per session; names the tab and the GPU buffers.
     pub id: u64,
@@ -50,10 +86,18 @@ pub struct Document {
     /// Snapped grid point under the mouse (world coordinates).
     pub cursor: Option<Vec3>,
 
+    /// Decoded nodal displacements for the selected result case (by solver id; inner `None` when
+    /// the case has no displacement file, so it is not re-decoded every frame).
+    result_disp: Option<(u32, Option<femcraft_rfdb::Displacements>)>,
+    /// Colour-scale legend for the active result overlay, drawn over the viewport.
+    result_legend: Option<ResultLegend>,
+
     lines: Arc<Vec<LineVertex>>,
     triangles: Arc<Vec<LineVertex>>,
+    result_triangles: Arc<Vec<LineVertex>>,
+    grid_lines: Arc<Vec<LineVertex>>,
     version: u64,
-    built_from: Option<(GridSettings, bool, Visibility, u64)>,
+    built_from: Option<(GridSettings, bool, Visibility, u64, u64)>,
     /// Box drag in progress: button and start position.
     drag_box: Option<(egui::PointerButton, Pos2)>,
 }
@@ -87,6 +131,8 @@ impl Document {
             fe_mesh,
             results,
             results_view: crate::results_panel::ResultsView::default(),
+            result_disp: None,
+            result_legend: None,
             revision: 0,
             vis,
             scene: Scene::default(),
@@ -95,6 +141,8 @@ impl Document {
             cursor: None,
             lines: Arc::new(Vec::new()),
             triangles: Arc::new(Vec::new()),
+            result_triangles: Arc::new(Vec::new()),
+            grid_lines: Arc::new(Vec::new()),
             version: 0,
             built_from: None,
             drag_box: None,
@@ -143,11 +191,20 @@ impl Document {
         )
     }
 
-    /// Rebuilds the drawable geometry when the grid, axes or display settings changed.
+    /// Rebuilds the drawable geometry when the grid, axes, display settings or result selection
+    /// changed.
     pub fn refresh(&mut self, grid: &GridSettings, show_axes: bool) {
         // Support glyphs along lines / surface edges follow the grid spacing.
         self.vis.glyph_spacing = grid.spacing;
-        let key = (grid.clone(), show_axes, self.vis.clone(), self.revision);
+        // Load results for the selected case and pick an exaggeration factor before hashing.
+        self.update_result_overlay();
+        let key = (
+            grid.clone(),
+            show_axes,
+            self.vis.clone(),
+            self.revision,
+            self.result_signature(),
+        );
         if self.built_from.as_ref() == Some(&key) {
             return;
         }
@@ -157,11 +214,18 @@ impl Document {
                 scene::add_fe_mesh(&mut self.scene, mesh);
             }
         }
+        // The result contour overlays the model view; only the displaced-mesh edge lines are left
+        // off (add_result_surface draws no outlines, since without a depth buffer they would show
+        // the far side of the surface through the near one).
+        self.add_result_overlay();
 
-        let mut v = Vec::new();
+        // The grid is drawn before the opaque result contour, so the contour hides it.
+        let mut g = Vec::new();
         if grid.visible {
-            grid.build_lines(&mut v);
+            grid.build_lines(&mut g);
         }
+        self.grid_lines = Arc::new(g);
+        let mut v = Vec::new();
         if show_axes {
             let len = self.axis_length(grid);
             for ((dir, _), color) in scene::GLOBAL_AXES.iter().zip([AXIS_X, AXIS_Y, AXIS_Z]) {
@@ -172,8 +236,180 @@ impl Document {
         v.extend_from_slice(&self.scene.lines);
         self.lines = Arc::new(v);
         self.triangles = Arc::new(self.scene.triangles.clone());
+        self.result_triangles = Arc::new(self.scene.result_triangles.clone());
         self.version += 1;
         self.built_from = Some(key);
+    }
+
+    /// The active result overlay: `(solver id, component)` when a displacement quantity is chosen
+    /// for a selected case and the model is unedited (results belong to the saved geometry).
+    fn active_overlay(&self) -> Option<(u32, femcraft_rfdb::ResultComponent)> {
+        if self.rf.is_modified() || !self.vis.results {
+            return None;
+        }
+        let comp = self.results_view.active?;
+        if !scene::is_displacement(comp) {
+            return None;
+        }
+        let (kind, no) = self.results_view.selected?;
+        let case = self
+            .results
+            .as_ref()?
+            .cases
+            .iter()
+            .find(|c| (c.kind, c.no) == (kind, no))?;
+        Some((case.solver_id, comp))
+    }
+
+    /// Loads the selected case's displacements (once per case) and, when the factor is unset,
+    /// picks one so the peak displacement is a visible fraction of the model.
+    fn update_result_overlay(&mut self) {
+        let Some((solver_id, _)) = self.active_overlay() else {
+            return;
+        };
+        let fe_nodes = self.fe_mesh.as_ref().map_or(0, |m| m.nodes.len());
+        if self.result_disp.as_ref().map(|(s, _)| *s) != Some(solver_id) {
+            let decoded = match self.rf.displacements(solver_id, fe_nodes) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.warnings.push(format!("Results not read: {e}"));
+                    None
+                }
+            };
+            self.result_disp = Some((solver_id, decoded));
+        }
+        if self.results_view.magnification <= 0.0
+            && let (Some((_, Some(disp))), Some(mesh)) = (&self.result_disp, &self.fe_mesh)
+        {
+            let max_u = disp.max_translation();
+            if max_u > 0.0 {
+                let factor = (0.05 * mesh_span(mesh) / max_u).clamp(1.0, 100_000.0);
+                self.results_view.magnification = factor.round();
+            }
+        }
+    }
+
+    /// A hash of the result selection, so the scene rebuilds when it changes.
+    fn result_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let Some((solver_id, comp)) = self.active_overlay() else {
+            return 0;
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        solver_id.hash(&mut h);
+        comp.hash(&mut h);
+        self.results_view.magnification.to_bits().hash(&mut h);
+        h.finish()
+    }
+
+    /// Draws the active result overlay (displaced coloured surface, deformed member axes) and
+    /// records its colour-scale range for the legend.
+    fn add_result_overlay(&mut self) {
+        self.result_legend = None;
+        let Some((_, comp)) = self.active_overlay() else {
+            return;
+        };
+        let (Some((_, Some(disp))), Some(mesh)) = (&self.result_disp, &self.fe_mesh) else {
+            return;
+        };
+        let mag = self.results_view.magnification.max(1.0);
+        if let Some((min, max)) = scene::add_result_surface(&mut self.scene, mesh, disp, comp, mag)
+        {
+            let (label, unit, factor) = comp.display();
+            self.result_legend = Some(ResultLegend {
+                label,
+                unit,
+                factor,
+                min,
+                max,
+            });
+        }
+        let member_lines: HashSet<u32> = self
+            .rf
+            .model
+            .iter_kind(ObjectKind::Member)
+            .filter_map(|(_, m)| m.get("line").as_ref_no())
+            .collect();
+        if !member_lines.is_empty() {
+            scene::add_member_deformation(&mut self.scene, mesh, disp, &member_lines, mag);
+        }
+    }
+
+    /// Draws the result colour-scale legend over the right of the viewport: solid RFEM colour
+    /// bands (red/maximum at the top, blue/minimum at the bottom) with the quantity label and a
+    /// value at every band boundary, max to min.
+    fn paint_result_legend(&self, painter: &egui::Painter, rect: egui::Rect) {
+        use femcraft_render::colorscale;
+        let Some(leg) = &self.result_legend else {
+            return;
+        };
+        let bands = colorscale::BAND_COUNT;
+        let bar_w = 36.0;
+        let margin = 16.0;
+        let bar_x = rect.right() - margin - bar_w; // bar's left edge
+        let bar_right = bar_x + bar_w;
+        let bar_h = (rect.height() - 120.0).clamp(140.0, 320.0);
+        let bar_top = rect.top() + 56.0;
+        let text_col = Color32::from_gray(235);
+        let font = egui::FontId::proportional(11.0);
+        let boundary = |j: usize| bar_top + bar_h * (j as f32 / bands as f32);
+
+        // Solid bands: top (j = 0) is the highest band (dark red), bottom the lowest (dark blue).
+        for i in 0..bands {
+            let c = colorscale::rfem_band(bands - 1 - i);
+            let col = Color32::from_rgb(
+                (c[0] * 255.0) as u8,
+                (c[1] * 255.0) as u8,
+                (c[2] * 255.0) as u8,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(bar_x, boundary(i)),
+                    egui::pos2(bar_right, boundary(i + 1)),
+                ),
+                0.0,
+                col,
+            );
+        }
+        let bar = egui::Rect::from_min_size(egui::pos2(bar_x, bar_top), egui::vec2(bar_w, bar_h));
+        painter.rect_stroke(
+            bar,
+            0.0,
+            Stroke::new(1.0, Color32::from_gray(30)),
+            egui::StrokeKind::Outside,
+        );
+
+        // Title above the bar, right-aligned so it stays on screen.
+        let title = if leg.unit.is_empty() {
+            leg.label.to_string()
+        } else {
+            format!("{} [{}]", leg.label, leg.unit)
+        };
+        painter.text(
+            egui::pos2(bar_right, bar_top - 6.0),
+            egui::Align2::RIGHT_BOTTOM,
+            title,
+            font.clone(),
+            text_col,
+        );
+
+        // A value at every band boundary (max at the top, min at the bottom), labelled on the left.
+        let span = (leg.max - leg.min) as f64;
+        for j in 0..=bands {
+            let y = boundary(j);
+            let value = (leg.max as f64 - span * (j as f64 / bands as f64)) * leg.factor;
+            painter.line_segment(
+                [egui::pos2(bar_x - 4.0, y), egui::pos2(bar_x, y)],
+                Stroke::new(1.0, Color32::from_gray(120)),
+            );
+            painter.text(
+                egui::pos2(bar_x - 7.0, y),
+                egui::Align2::RIGHT_CENTER,
+                format_legend_value(value),
+                font.clone(),
+                text_col,
+            );
+        }
     }
 
     fn axis_length(&self, grid: &GridSettings) -> f32 {
@@ -261,6 +497,11 @@ impl Document {
         paint_background(&painter, rect);
 
         let view_proj = self.camera.view_proj(aspect);
+        let ppp = ui.ctx().pixels_per_point();
+        let pixels = [
+            (rect.width() * ppp).round().max(1.0) as u32,
+            (rect.height() * ppp).round().max(1.0) as u32,
+        ];
         painter.add(egui_wgpu::Callback::new_paint_callback(
             rect,
             LinesCallback {
@@ -268,7 +509,10 @@ impl Document {
                 view_proj,
                 vertices: self.lines.clone(),
                 triangles: self.triangles.clone(),
+                result_triangles: self.result_triangles.clone(),
+                grid_lines: self.grid_lines.clone(),
                 version: self.version,
+                pixels,
             },
         ));
 
@@ -295,6 +539,7 @@ impl Document {
         }
 
         self.paint_model_marks(&painter, &to_screen);
+        self.paint_result_legend(&painter, rect);
 
         // Box selection: left to right = window (fully inside), right to left = crossing.
         if let Some((Primary, r, window)) = finished

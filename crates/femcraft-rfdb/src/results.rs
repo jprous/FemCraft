@@ -401,6 +401,25 @@ pub enum ResultComponent {
     SurfaceSupportReaction,
 }
 
+impl ResultComponent {
+    /// Display label, unit and the SI → display-unit factor for a displayable quantity. The
+    /// factor converts the stored SI value (m, rad) to the unit shown (mm, mrad). Returns empty
+    /// strings and a factor of `1.0` for quantities this build cannot yet display.
+    pub fn display(self) -> (&'static str, &'static str, f64) {
+        use ResultComponent::*;
+        match self {
+            GlobalU => ("|u|", "mm", 1000.0),
+            GlobalUx | SurfaceUx | MemberUx => ("u_x", "mm", 1000.0),
+            GlobalUy | SurfaceUy | MemberUy => ("u_y", "mm", 1000.0),
+            GlobalUz | SurfaceUz | MemberUz => ("u_z", "mm", 1000.0),
+            GlobalPhiX | SurfacePhiX | MemberPhiX => ("φ_x", "mrad", 1000.0),
+            GlobalPhiY | SurfacePhiY | MemberPhiY => ("φ_y", "mrad", 1000.0),
+            GlobalPhiZ | SurfacePhiZ | MemberPhiZ => ("φ_z", "mrad", 1000.0),
+            _ => ("", "", 1.0),
+        }
+    }
+}
+
 /// A radio-selectable leaf: a component, its display label, SI unit and radio group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResultLeaf {
@@ -657,6 +676,90 @@ pub fn result_tree(model: &femcraft_model::Model) -> Vec<ResultNode> {
     }
 
     tree
+}
+
+// ---------------------------------------------------------------------------
+// Result value decoding (binary `!solver/RN_*` files)
+// ---------------------------------------------------------------------------
+
+/// Expected magic in the header of a `Data.RN*` nodal-results file.
+const RN_MAGIC: i32 = 601;
+
+/// Per-FE-node nodal displacements for one result case (SI units: metres, radians).
+///
+/// Decoded from `!solver/RN_*/Data.RN<solver_id>` (confirmed on RFEM 6.16, results v18.00):
+/// a header of little-endian `i32`s where index 0 is the magic `601`, index 3 the number of
+/// components (`6` = u_x, u_y, u_z, φ_x, φ_y, φ_z), index 4 the FE node count, and index 48 the
+/// byte offset of the displacement block. The block is `count` records of six `f64`, in the same
+/// FE-node order as [`crate::FeMesh`]. The file suffix is the case's solver id
+/// (`Data.RN000028` = solver id 28), which [`ResultCase::solver_id`] carries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Displacements {
+    /// FE node `n` (1-based) -> `[u_x, u_y, u_z, φ_x, φ_y, φ_z]`; `nodal[n - 1]`.
+    pub nodal: Vec<[f64; 6]>,
+}
+
+impl Displacements {
+    /// Reads nodal displacements for the case whose solver id is `solver_id`. `fe_nodes` is the
+    /// FE mesh node count to cross-check against (pass 0 to skip the check). `Ok(None)` when the
+    /// file holds no results for that case or is not a recognised nodal-results block.
+    pub fn read(archive: &Archive, solver_id: u32, fe_nodes: usize) -> Result<Option<Self>, Error> {
+        let suffix = format!("Data.RN{solver_id:06}");
+        let Some(entry) = archive
+            .entries
+            .iter()
+            .find(|e| e.starts_with("!solver/RN") && e.ends_with(&suffix))
+        else {
+            return Ok(None);
+        };
+        let bytes = archive.read_entry(entry)?;
+        if bytes.len() < 240 {
+            return Err(Error::Format("results file too short".into()));
+        }
+        let i32_at = |i: usize| i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        if i32_at(0) != RN_MAGIC {
+            return Ok(None);
+        }
+        let components = i32_at(3) as usize;
+        let count = i32_at(4).max(0) as usize;
+        let offset = i32_at(48).max(0) as usize;
+        if components != 6 || count == 0 || offset == 0 || offset + count * 48 > bytes.len() {
+            return Err(Error::Format("unexpected results layout".into()));
+        }
+        if fe_nodes != 0 && count != fe_nodes {
+            return Err(Error::Format(format!(
+                "results have {count} nodes, FE mesh has {fe_nodes}"
+            )));
+        }
+        let f64_at = |o: usize| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+        let mut nodal = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = offset + i * 48;
+            let mut rec = [0.0f64; 6];
+            for (k, v) in rec.iter_mut().enumerate() {
+                let x = f64_at(base + k * 8);
+                if !x.is_finite() {
+                    return Err(Error::Format("non-finite displacement value".into()));
+                }
+                *v = x;
+            }
+            nodal.push(rec);
+        }
+        Ok(Some(Displacements { nodal }))
+    }
+
+    /// Displacement of FE node `no` (1-based): `[u_x, u_y, u_z, φ_x, φ_y, φ_z]`.
+    pub fn node(&self, no: u32) -> Option<[f64; 6]> {
+        self.nodal.get((no as usize).checked_sub(1)?).copied()
+    }
+
+    /// Largest translational displacement magnitude over all nodes (metres).
+    pub fn max_translation(&self) -> f64 {
+        self.nodal
+            .iter()
+            .map(|u| (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt())
+            .fold(0.0, f64::max)
+    }
 }
 
 #[cfg(test)]

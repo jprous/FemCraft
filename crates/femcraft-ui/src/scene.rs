@@ -5,6 +5,8 @@
 //! `(x, y, z)` is drawn at `(x, -y, -z)` (a 180 degree turn about X, which keeps the axes
 //! right-handed and shows the model the way RFEM does).
 
+use std::collections::HashSet;
+
 use femcraft_model::{Model, Object, ObjectId, ObjectKind as K, Value};
 use femcraft_render::viewport::LineVertex;
 use glam::Vec3;
@@ -76,6 +78,8 @@ pub struct Visibility {
     pub local_axes: bool,
     /// FE mesh saved by RFEM, while the model is unedited.
     pub fe_mesh: bool,
+    /// Result overlay (contour) for the selected result.
+    pub results: bool,
     /// Load case whose loads are shown.
     pub load_case: u32,
     /// Spacing of support glyphs along lines and surface edges (the grid spacing), metres.
@@ -95,6 +99,7 @@ impl Default for Visibility {
             load_values: true,
             local_axes: false,
             fe_mesh: true,
+            results: true,
             load_case: 1,
             glyph_spacing: 1.0,
         }
@@ -147,6 +152,9 @@ pub struct Label {
 pub struct Scene {
     pub lines: Vec<LineVertex>,
     pub triangles: Vec<LineVertex>,
+    /// Opaque result-contour triangles, drawn through a depth-tested pipeline so the surface
+    /// occludes itself correctly from any angle (kept apart from the translucent model fills).
+    pub result_triangles: Vec<LineVertex>,
     pub nodes: Vec<Vec3>,
     /// Members without profile: segments painted in screen space, thicker than GPU lines.
     pub member_lines: Vec<(Vec3, Vec3)>,
@@ -219,12 +227,183 @@ fn kn(v: f64, unit: &str) -> String {
         .replace("00 ", " ")
 }
 
-/// FE element edges (thin, dark grey) on top of the scene.
+/// FE element edges (medium grey) on top of the scene.
 pub fn add_fe_mesh(s: &mut Scene, mesh: &femcraft_rfdb::FeMesh) {
-    const MESH: [f32; 4] = [0.25, 0.25, 0.3, 0.9];
+    /// Thinner than model lines.
+    const MESH_WIDTH: f32 = 0.6;
+    const MESH: [f32; 4] = [0.55, 0.55, 0.58, 0.9];
     for (a, b) in mesh.edges() {
         if let (Some(a), Some(b)) = (mesh.node(a), mesh.node(b)) {
-            s.line(to_world(a), to_world(b), MESH);
+            s.lines.push(LineVertex::new(to_world(a), MESH).with_width(MESH_WIDTH));
+            s.lines.push(LineVertex::new(to_world(b), MESH).with_width(MESH_WIDTH));
+        }
+    }
+}
+
+/// Bright orange for member deformation lines, like RFEM's deformed shape.
+const DEFORM_LINE: [f32; 4] = [1.0, 0.55, 0.0, 1.0];
+
+/// The scalar a displacement [`ResultComponent`] colours by (`None` for quantities not yet
+/// decoded, e.g. forces and stresses). `u` is `[u_x, u_y, u_z, φ_x, φ_y, φ_z]` (m, rad).
+fn displacement_scalar(c: femcraft_rfdb::ResultComponent, u: [f64; 6]) -> Option<f64> {
+    use femcraft_rfdb::ResultComponent as C;
+    Some(match c {
+        C::GlobalU => (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt(),
+        C::GlobalUx | C::SurfaceUx | C::MemberUx => u[0],
+        C::GlobalUy | C::SurfaceUy | C::MemberUy => u[1],
+        C::GlobalUz | C::SurfaceUz | C::MemberUz => u[2],
+        C::GlobalPhiX | C::SurfacePhiX | C::MemberPhiX => u[3],
+        C::GlobalPhiY | C::SurfacePhiY | C::MemberPhiY => u[4],
+        C::GlobalPhiZ | C::SurfacePhiZ | C::MemberPhiZ => u[5],
+        _ => return None,
+    })
+}
+
+/// True for a component this build can display (a nodal displacement quantity).
+pub fn is_displacement(c: femcraft_rfdb::ResultComponent) -> bool {
+    displacement_scalar(c, [0.0; 6]).is_some()
+}
+
+/// Displaced world position of FE node `no`: model point plus `magnification × translation`.
+fn displaced(
+    mesh: &femcraft_rfdb::FeMesh,
+    disp: &femcraft_rfdb::Displacements,
+    no: u32,
+    magnification: f64,
+) -> Option<Vec3> {
+    let p = mesh.node(no)?;
+    let u = disp.node(no)?;
+    Some(to_world([
+        p[0] + u[0] * magnification,
+        p[1] + u[1] * magnification,
+        p[2] + u[2] * magnification,
+    ]))
+}
+
+/// Adds the contour of a displacement result as discrete RFEM colour bands: the FE surface mesh
+/// displaced by `magnification`, every triangle split at the band boundaries so each value range
+/// fills as one solid colour that matches the legend's blocks. Returns the value range
+/// `(min, max)`, or `None` when `component` is not a (decoded) displacement.
+///
+/// No element outlines are drawn: without a depth buffer a net of lines over the displaced surface
+/// shows the far side through the near one and reads as inside-out. The bands alone are clearer.
+pub fn add_result_surface(
+    s: &mut Scene,
+    mesh: &femcraft_rfdb::FeMesh,
+    disp: &femcraft_rfdb::Displacements,
+    component: femcraft_rfdb::ResultComponent,
+    magnification: f64,
+) -> Option<(f32, f32)> {
+    // Per FE node (1-based): displaced world position and the plotted scalar.
+    let node: Vec<Option<(Vec3, f64)>> = (1..=mesh.nodes.len() as u32)
+        .map(|no| {
+            Some((
+                displaced(mesh, disp, no, magnification)?,
+                disp.node(no)
+                    .and_then(|u| displacement_scalar(component, u))?,
+            ))
+        })
+        .collect();
+    let at = |no: u32| node.get((no as usize).checked_sub(1)?).copied().flatten();
+
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for nd in node.iter().flatten() {
+        lo = lo.min(nd.1);
+        hi = hi.max(nd.1);
+    }
+    if !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    let bands = femcraft_render::colorscale::BAND_COUNT;
+    let step = ((hi - lo) / bands as f64).max(f64::MIN_POSITIVE);
+
+    for e in &mesh.elements {
+        // Triangle (d == 0 or d == c) or quad; fan from the first node.
+        let quad = e[3] != 0 && e[3] != e[2];
+        let corners: &[u32] = if quad { &e[..4] } else { &e[..3] };
+        let Some(verts): Option<Vec<(Vec3, f64)>> = corners.iter().map(|&no| at(no)).collect()
+        else {
+            continue;
+        };
+        for k in 1..verts.len() - 1 {
+            band_fill_triangle(s, [verts[0], verts[k], verts[k + 1]], lo, step, bands);
+        }
+    }
+    Some((lo as f32, hi as f32))
+}
+
+/// Splits one triangle (vertices carry `(displaced position, value)`) into the colour bands it
+/// spans, filling each with its solid RFEM band colour.
+fn band_fill_triangle(s: &mut Scene, tri: [(Vec3, f64); 3], lo: f64, step: f64, bands: usize) {
+    let band_of = |v: f64| (((v - lo) / step).floor() as isize).clamp(0, bands as isize - 1);
+    let (tmin, tmax) = tri
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+            (a.min(v.1), b.max(v.1))
+        });
+    for k in band_of(tmin)..=band_of(tmax) {
+        let lower = lo + k as f64 * step;
+        let mut poly: Vec<(Vec3, f64)> = tri.to_vec();
+        if k > 0 {
+            poly = clip_band(&poly, lower, true);
+        }
+        if (k as usize) < bands - 1 {
+            poly = clip_band(&poly, lower + step, false);
+        }
+        if poly.len() < 3 {
+            continue;
+        }
+        let c = femcraft_render::colorscale::rfem_band(k as usize);
+        for i in 1..poly.len() - 1 {
+            s.result_triangles.push(LineVertex::new(poly[0].0, c));
+            s.result_triangles.push(LineVertex::new(poly[i].0, c));
+            s.result_triangles.push(LineVertex::new(poly[i + 1].0, c));
+        }
+    }
+}
+
+/// Sutherland–Hodgman clip of a value-carrying polygon by a scalar threshold: keeps the part with
+/// value ≥ `t` (`keep_ge`) or ≤ `t`, inserting interpolated vertices where edges cross.
+fn clip_band(poly: &[(Vec3, f64)], t: f64, keep_ge: bool) -> Vec<(Vec3, f64)> {
+    let inside = |v: f64| if keep_ge { v >= t } else { v <= t };
+    let mut out = Vec::with_capacity(poly.len() + 2);
+    for i in 0..poly.len() {
+        let cur = poly[i];
+        let nxt = poly[(i + 1) % poly.len()];
+        if inside(cur.1) {
+            out.push(cur);
+        }
+        if inside(cur.1) != inside(nxt.1) {
+            let denom = nxt.1 - cur.1;
+            if denom.abs() > f64::EPSILON {
+                let f = ((t - cur.1) / denom).clamp(0.0, 1.0) as f32;
+                out.push((cur.0 + (nxt.0 - cur.0) * f, t));
+            }
+        }
+    }
+    out
+}
+
+/// Adds deformed member axes as bright orange polylines: each listed line's FE node chain,
+/// displaced by `magnification`. `member_lines` are the model lines that carry a member.
+pub fn add_member_deformation(
+    s: &mut Scene,
+    mesh: &femcraft_rfdb::FeMesh,
+    disp: &femcraft_rfdb::Displacements,
+    member_lines: &HashSet<u32>,
+    magnification: f64,
+) {
+    for (line_no, chain) in &mesh.lines {
+        if !member_lines.contains(line_no) {
+            continue;
+        }
+        for pair in chain.windows(2) {
+            if let (Some(a), Some(b)) = (
+                displaced(mesh, disp, pair[0], magnification),
+                displaced(mesh, disp, pair[1], magnification),
+            ) {
+                s.line(a, b, DEFORM_LINE);
+            }
         }
     }
 }
@@ -301,7 +480,8 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
                 if poly.len() >= 3 {
                     s.line(*poly.last().unwrap(), poly[0], OPENING_EDGE);
                 }
-                s.pick.push((ObjectId::new(K::Opening, *opn_no), poly.clone()));
+                s.pick
+                    .push((ObjectId::new(K::Opening, *opn_no), poly.clone()));
             }
         }
     }
@@ -822,9 +1002,7 @@ fn triangulate_with_holes(outer: &[Vec3], holes: &[&[Vec3]]) -> Vec<[Vec3; 3]> {
             });
 
         // Insert the hole into merged at bridge_idx: outer[..=bridge] + hole rotated to hr + outer[bridge..]
-        let rotated_hole: Vec<Vec3> = (0..h.len())
-            .map(|i| h[(hr_idx + i) % h.len()])
-            .collect();
+        let rotated_hole: Vec<Vec3> = (0..h.len()).map(|i| h[(hr_idx + i) % h.len()]).collect();
         let mut new_merged = Vec::with_capacity(merged.len() + h.len() + 2);
         new_merged.extend_from_slice(&merged[..=bridge_idx]);
         new_merged.extend_from_slice(&rotated_hole);
@@ -864,7 +1042,9 @@ impl PartialOrd for OrderedF32 {
 }
 impl Ord for OrderedF32 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -1012,9 +1192,8 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
     }
 
     for (_, l) in in_case(K::SurfaceLoad) {
-        let world = |no: u32| {
-            node(no).map(|p| dir_world(Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)))
-        };
+        let world =
+            |no: u32| node(no).map(|p| dir_world(Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)));
         // Varying between two nodes (e.g. soil / water pressure on a wall): p1 at node 1
         // linearly to p2 at node 2, constant across the direction normal to that line.
         let varying = (|| {
@@ -1049,7 +1228,12 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
                 let mc = mag_at(c);
                 if mc.abs() > 1e-6 * peak {
                     let toward = dw * mc.signum();
-                    s.arrow(c, toward, len * 0.9 * (mc.abs() / peak).max(0.25), SURFACE_LOAD);
+                    s.arrow(
+                        c,
+                        toward,
+                        len * 0.9 * (mc.abs() / peak).max(0.25),
+                        SURFACE_LOAD,
+                    );
                 }
                 s.labels.push(Label {
                     pos: c - dw * len * 1.25 * mc.signum(),
@@ -1176,6 +1360,63 @@ pub fn load_cases(model: &Model) -> Vec<(u32, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn result_surface_colours_and_displaces() {
+        use femcraft_rfdb::{Displacements, FeMesh, ResultComponent};
+        // One quad: 4 FE nodes, element [1,2,3,4].
+        let mesh = FeMesh {
+            nodes: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            elements: vec![[1, 2, 3, 4]],
+            element_surface: vec![1],
+            lines: vec![(1, vec![1, 2])],
+        };
+        let disp = Displacements {
+            nodal: vec![
+                [0.0, 0.0, 0.000, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.010, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.020, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.010, 0.0, 0.0, 0.0],
+            ],
+        };
+        let mut s = Scene::default();
+        let range = add_result_surface(&mut s, &mesh, &disp, ResultComponent::GlobalUz, 100.0);
+        // Discrete bands split the quad into many solid-colour triangles spanning the u_z values.
+        let tris = &s.result_triangles;
+        assert!(tris.len() >= 6 && tris.len() % 3 == 0);
+        let (lo, hi) = range.expect("displacement range");
+        assert!(
+            (lo - 0.0).abs() < 1e-6 && (hi - 0.02).abs() < 1e-6,
+            "{lo}..{hi}"
+        );
+        // Node 3 (max u_z) is displaced far along world Z (model z is negated, magnified ×100).
+        assert!(tris.iter().any(|v| v.pos[2].abs() > 1.0));
+        // The largest value is red, the smallest blue (RFEM's scale).
+        assert!(
+            tris.iter().any(|v| v.color[0] > 0.4 && v.color[2] < 0.2),
+            "max value painted red"
+        );
+        assert!(
+            tris.iter().any(|v| v.color[2] > 0.4 && v.color[0] < 0.2),
+            "min value painted blue"
+        );
+        // A non-displacement component paints nothing.
+        let mut s2 = Scene::default();
+        assert!(
+            add_result_surface(&mut s2, &mesh, &disp, ResultComponent::SurfaceMx, 1.0).is_none()
+        );
+
+        // Member deformation: line 1 carries a member -> one orange segment.
+        let mut s3 = Scene::default();
+        let members: HashSet<u32> = [1].into_iter().collect();
+        add_member_deformation(&mut s3, &mesh, &disp, &members, 1.0);
+        assert_eq!(s3.lines.len(), 2, "one segment = two line vertices");
+    }
 
     #[test]
     fn square_triangulates_into_two() {

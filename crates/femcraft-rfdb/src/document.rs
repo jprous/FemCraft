@@ -1418,6 +1418,16 @@ impl RfDocument {
         crate::ResultSet::read(&self.archive)
     }
 
+    /// Nodal displacements for the result case with solver id `solver_id`, aligned to the FE mesh
+    /// (`fe_nodes` node count, 0 to skip the check). `Ok(None)` when the case has no results.
+    pub fn displacements(
+        &self,
+        solver_id: u32,
+        fe_nodes: usize,
+    ) -> Result<Option<crate::Displacements>, Error> {
+        crate::Displacements::read(&self.archive, solver_id, fe_nodes)
+    }
+
     /// Saves to `path`: `.rf6` sources are re-zipped with unchanged sidecars; bare databases are
     /// copied. Unchanged models give a byte-identical `model.db`.
     pub fn save(&mut self, path: &Path) -> Result<(), Error> {

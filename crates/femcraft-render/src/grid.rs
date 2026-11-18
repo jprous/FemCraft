@@ -9,6 +9,9 @@ pub const MAX_HALF_LINES: i32 = 1000;
 
 const MINOR_COLOR: [f32; 4] = [0.42, 0.46, 0.52, 0.35];
 const MAJOR_COLOR: [f32; 4] = [0.58, 0.62, 0.68, 0.75];
+const MINOR_DOT: [f32; 4] = [0.62, 0.66, 0.72, 0.65];
+/// Most dots either side of the origin in dot mode (keeps the GPU buffer small).
+const MAX_HALF_DOTS: i32 = 150;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GridPlane {
@@ -58,6 +61,8 @@ pub struct GridSettings {
     pub major_every: u32,
     /// Shift of the grid along the plane normal, metres (e.g. a storey level).
     pub offset: f32,
+    /// Draw a dot at each grid intersection instead of lines.
+    pub dots: bool,
 }
 
 impl Default for GridSettings {
@@ -69,6 +74,7 @@ impl Default for GridSettings {
             extent: 20.0,
             major_every: 5,
             offset: 0.0,
+            dots: false,
         }
     }
 }
@@ -95,7 +101,11 @@ impl GridSettings {
         self.half_lines() as f32 * self.spacing
     }
 
+    /// Grid geometry: lines, or (in dot mode) zero-length segments the renderer draws as dots.
     pub fn build_lines(&self, out: &mut Vec<LineVertex>) {
+        if self.dots {
+            return self.build_dots(out);
+        }
         let (u, v, _) = self.plane.axes();
         let origin = self.origin();
         let half = self.half_lines();
@@ -116,6 +126,36 @@ impl GridSettings {
             };
             line(origin + u * t - v * size, origin + u * t + v * size);
             line(origin + v * t - u * size, origin + v * t + u * size);
+        }
+    }
+
+    fn build_dots(&self, out: &mut Vec<LineVertex>) {
+        let (u, v, _) = self.plane.axes();
+        let origin = self.origin();
+        let half = self.half_lines().min(MAX_HALF_DOTS);
+        let major = self.major_every.max(1) as i32;
+        out.reserve(((half as usize * 2 + 1).pow(2)) * 2);
+        // The major grid lines stay in dot mode (as in RFEM); only the minor ones become dots.
+        let size = half as f32 * self.spacing;
+        for i in (-half..=half).filter(|i| i % major == 0) {
+            let t = i as f32 * self.spacing;
+            let mut line = |a: Vec3, b: Vec3| {
+                out.push(LineVertex::new(a, MAJOR_COLOR));
+                out.push(LineVertex::new(b, MAJOR_COLOR));
+            };
+            line(origin + u * t - v * size, origin + u * t + v * size);
+            line(origin + v * t - u * size, origin + v * t + u * size);
+        }
+        for i in -half..=half {
+            for j in -half..=half {
+                let p = origin + u * (i as f32 * self.spacing) + v * (j as f32 * self.spacing);
+                // None on the major lines, which are drawn as lines.
+                if i % major == 0 || j % major == 0 {
+                    continue;
+                }
+                out.push(LineVertex::new(p, MINOR_DOT));
+                out.push(LineVertex::new(p, MINOR_DOT));
+            }
         }
     }
 
