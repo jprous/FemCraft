@@ -24,15 +24,23 @@ pub enum Pane {
     Display,
     /// Tree explorer of the model database.
     Navigator,
+    /// Results navigator: result cases and the available result quantities.
+    Results,
     /// Object tables of the model database.
     Tables,
 }
 
 impl Pane {
     /// Panels that can be closed and reopened.
-    pub const CLOSABLE: [Pane; 3] = [Pane::Display, Pane::Navigator, Pane::Tables];
+    pub const CLOSABLE: [Pane; 4] = [Pane::Display, Pane::Navigator, Pane::Results, Pane::Tables];
     /// Panes every layout must contain.
-    pub const FIXED: [Pane; 4] = [Pane::Start, Pane::Display, Pane::Navigator, Pane::Tables];
+    pub const FIXED: [Pane; 5] = [
+        Pane::Start,
+        Pane::Display,
+        Pane::Navigator,
+        Pane::Results,
+        Pane::Tables,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -40,6 +48,7 @@ impl Pane {
             Pane::Document(_) => "Model",
             Pane::Display => "Display",
             Pane::Navigator => "Navigator",
+            Pane::Results => "Results",
             Pane::Tables => "Tables",
         }
     }
@@ -57,11 +66,13 @@ pub fn default_tree() -> Tree<Pane> {
     let start = tiles.insert_pane(Pane::Start);
     let display = tiles.insert_pane(Pane::Display);
     let navigator = tiles.insert_pane(Pane::Navigator);
+    let results = tiles.insert_pane(Pane::Results);
     let tables = tiles.insert_pane(Pane::Tables);
 
     let model_space = tiles.insert_tab_tile(vec![start]);
     let left = tiles.insert_tab_tile(vec![display]);
-    let right = tiles.insert_tab_tile(vec![navigator]);
+    // Navigator and Results share a tab bar, like RFEM's Data and Results navigators.
+    let right = tiles.insert_tab_tile(vec![navigator, results]);
     let bottom = tiles.insert_tab_tile(vec![tables]);
 
     let centre = tiles.insert_vertical_tile(vec![model_space, bottom]);

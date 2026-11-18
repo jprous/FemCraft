@@ -55,6 +55,7 @@ struct SavedGrid {
     extent: f32,
     major_every: u32,
     offset: f32,
+    dots: bool,
 }
 
 impl Default for SavedGrid {
@@ -72,6 +73,7 @@ impl From<&GridSettings> for SavedGrid {
             extent: g.extent,
             major_every: g.major_every,
             offset: g.offset,
+            dots: g.dots,
         }
     }
 }
@@ -94,6 +96,7 @@ impl From<SavedGrid> for GridSettings {
             } else {
                 d.offset
             },
+            dots: s.dots,
         }
     }
 }
@@ -831,6 +834,17 @@ impl FemCraftApp {
                 }
                 None => panels::navigator(ui, None, &[], &mut Default::default()),
             },
+            Pane::Results => match self.active_doc_mut() {
+                Some(d) => crate::results_panel::results_panel(
+                    ui,
+                    d.results.as_ref(),
+                    Some(&d.rf.model),
+                    &mut d.results_view,
+                ),
+                None => {
+                    crate::results_panel::results_panel(ui, None, None, &mut Default::default())
+                }
+            },
             Pane::Tables => {
                 let tables = &mut self.tables;
                 let id = self.active;
@@ -950,6 +964,8 @@ impl FemCraftApp {
                 } else {
                     "No mesh in this file; mesh or calculate the model in RFEM"
                 });
+            ui.checkbox(&mut v.results, "Results")
+                .on_hover_text("Show the selected result (contour) on the model");
             ui.end_row();
             ui.add_enabled(
                 v.loads,
@@ -1082,7 +1098,7 @@ impl FemCraftApp {
         );
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let doc = self.active_doc();
@@ -1122,9 +1138,32 @@ impl FemCraftApp {
                         ));
                     }
                 }
+                // AutoCAD-style toggles at the right edge.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let dots = self.grid.dots;
+                    if status_toggle(ui, if dots { "DOTS" } else { "LINES" }, true)
+                        .on_hover_text("Grid style: click to switch between dots and lines")
+                        .clicked()
+                    {
+                        self.grid.dots = !dots;
+                    }
+                    let on = self.grid.visible;
+                    if status_toggle(ui, "GRID", on)
+                        .on_hover_text("Show / hide the grid")
+                        .clicked()
+                    {
+                        self.grid.visible = !on;
+                    }
+                });
             });
         });
     }
+}
+
+/// Flat status-bar toggle button in the style of AutoCAD's: highlighted while on.
+fn status_toggle(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    let label = egui::RichText::new(text).monospace().small();
+    ui.add(egui::Button::new(label).selected(on).min_size(egui::vec2(52.0, 18.0)))
 }
 
 /// Load case selector for a model.
