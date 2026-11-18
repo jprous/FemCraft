@@ -29,7 +29,7 @@ Plan and milestone status: `docs/ROADMAP.md`.
   github.com/jprous/Rfem-API1-MCP-beta), one MCP tool each: `new_model`, `open_model`, `save`,
   `save_as`, `get_model_list`, `get_all_object_numbers` / `get_first_free_number` (`type` =
   `E_OBJECT_TYPE_*`), `set_<kind>({value: {no, ...}})` / `get_<kind>({no})` for material,
-  section, thickness, node, line, member, surface, nodal / line / surface support, load case,
+  section, thickness, node, line, member, surface, opening, nodal / line / surface support, load case,
   nodal / line / surface load (loads also take `load_case_no`). Fields are `kinds.rs` keys;
   enums are RFEM's stored codes. `api.rs` (methods, `Workspace` trait), `lib.rs` (JSON-RPC),
   `http.rs` (the app listens on `127.0.0.1:7980/mcp`, `FEMCRAFT_MCP_PORT`, 0 = off; requests
@@ -83,10 +83,11 @@ Plan and milestone status: `docs/ROADMAP.md`.
 - egui / eframe 0.37 (panels are `egui::Panel`, `App::ui` instead of `update`).
 - CI: `.github/workflows/ci.yml` (Windows build + test).
 - `crates/femcraft-model` - no I/O. `kinds.rs`: every object kind (materials, sections,
-  thicknesses, nodes, lines, members, surfaces, solids, 4 support kinds, load cases, 11 load
-  kinds) with field descriptors (key, label, type/SI unit) that drive tables and dialogs.
+  thicknesses, nodes, lines, members, surfaces, solids, openings, 4 support kinds, load cases,
+  11 load kinds) with field descriptors (key, label, type/SI unit) that drive tables and dialogs.
   `model.rs`: `Model` of `ObjectId { kind, load_case, no }` -> `Object` (field values),
-  typed `set` with dirty / removed tracking, geometry helpers. References are object numbers.
+  typed `set` with dirty / removed tracking, geometry helpers. `geometry.rs`: line tessellation
+  (arc, circle, ellipse, elliptical arc, parabola, spline). References are object numbers.
 - `crates/femcraft-rfdb` - `.rf6` I/O. `archive.rs` ZIP / bare db / folder, raw-copies
   sidecars on save. `mapping.rs`: **all RFEM table and column names** (layout rules in its
   header; entries marked "guess" are unconfirmed). `document.rs`: `RfDocument::open` loads

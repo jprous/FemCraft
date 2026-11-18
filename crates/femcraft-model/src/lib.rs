@@ -1,5 +1,6 @@
 //! FemCraft domain model: object kinds, their fields and the editable model. No UI, no file I/O.
 
+pub mod geometry;
 pub mod kinds;
 pub mod list;
 pub mod model;

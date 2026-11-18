@@ -77,6 +77,7 @@ kinds!(
     Member,
     Surface,
     Solid,
+    Opening,
     NodalSupport,
     LineSupport,
     MemberSupport,
@@ -170,6 +171,36 @@ static LINE: &[FieldSpec] = &[
     TYPE,
     f("definition_nodes", "Nodes", RefList(K::Node)),
     f("rotation_angle", "Rotation β", Float("rad")),
+    // Curve geometry (RFEM API I names); each group applies to one line type only.
+    f("arc_control_point_x", "Arc control point X", Float("m")),
+    f("arc_control_point_y", "Arc control point Y", Float("m")),
+    f("arc_control_point_z", "Arc control point Z", Float("m")),
+    f("circle_center_coordinate_1", "Circle center X", Float("m")),
+    f("circle_center_coordinate_2", "Circle center Y", Float("m")),
+    f("circle_center_coordinate_3", "Circle center Z", Float("m")),
+    f("circle_normal_coordinate_1", "Circle normal X", Float("")),
+    f("circle_normal_coordinate_2", "Circle normal Y", Float("")),
+    f("circle_normal_coordinate_3", "Circle normal Z", Float("")),
+    f("circle_radius", "Circle radius", Float("m")),
+    f("circle_rotation", "Circle rotation", Float("rad")),
+    f("ellipse_control_point_x", "Ellipse control point X", Float("m")),
+    f("ellipse_control_point_y", "Ellipse control point Y", Float("m")),
+    f("ellipse_control_point_z", "Ellipse control point Z", Float("m")),
+    f("elliptical_arc_first_control_point_x", "Elliptical arc axis point 1 X", Float("m")),
+    f("elliptical_arc_first_control_point_y", "Elliptical arc axis point 1 Y", Float("m")),
+    f("elliptical_arc_first_control_point_z", "Elliptical arc axis point 1 Z", Float("m")),
+    f("elliptical_arc_second_control_point_x", "Elliptical arc axis point 2 X", Float("m")),
+    f("elliptical_arc_second_control_point_y", "Elliptical arc axis point 2 Y", Float("m")),
+    f("elliptical_arc_second_control_point_z", "Elliptical arc axis point 2 Z", Float("m")),
+    f("elliptical_arc_perimeter_control_point_x", "Elliptical arc perimeter point X", Float("m")),
+    f("elliptical_arc_perimeter_control_point_y", "Elliptical arc perimeter point Y", Float("m")),
+    f("elliptical_arc_perimeter_control_point_z", "Elliptical arc perimeter point Z", Float("m")),
+    f("elliptical_arc_alpha", "Elliptical arc start angle α", Float("rad")),
+    f("elliptical_arc_beta", "Elliptical arc angle β", Float("rad")),
+    f("parabola_control_point_x", "Parabola control point X", Float("m")),
+    f("parabola_control_point_y", "Parabola control point Y", Float("m")),
+    f("parabola_control_point_z", "Parabola control point Z", Float("m")),
+    f("parabola_alpha", "Parabola angle α", Float("rad")),
     COMMENT,
 ];
 
@@ -215,6 +246,12 @@ const NL_Z: FieldSpec = f("nonlinearity_z", "Nonlinearity uZ", Enum);
 const NL_RX: FieldSpec = f("nonlinearity_rx", "Nonlinearity φX", Enum);
 const NL_RY: FieldSpec = f("nonlinearity_ry", "Nonlinearity φY", Enum);
 const NL_RZ: FieldSpec = f("nonlinearity_rz", "Nonlinearity φZ", Enum);
+
+static OPENING: &[FieldSpec] = &[
+    f("boundary_lines", "Boundary lines", RefList(K::Line)),
+    f("surfaces", "In surface", RefList(K::Surface)),
+    COMMENT,
+];
 
 static NODAL_SUPPORT: &[FieldSpec] = &[
     NAME,
@@ -451,6 +488,7 @@ static SPECS: &[KindSpec] = &[
     spec!(Member, "Members", BasicObjects, MEMBER),
     spec!(Surface, "Surfaces", BasicObjects, SURFACE),
     spec!(Solid, "Solids", BasicObjects, SOLID),
+    spec!(Opening, "Openings", BasicObjects, OPENING),
     spec!(NodalSupport, "Nodal Supports", Supports, NODAL_SUPPORT),
     spec!(LineSupport, "Line Supports", Supports, LINE_SUPPORT),
     spec!(MemberSupport, "Member Supports", Supports, MEMBER_SUPPORT),

@@ -466,6 +466,53 @@ fn derived_value(
             let rest = t.strip_prefix("SurfaceStiffness").unwrap_or(&t);
             Ok(upper_snake("TYPE", rest).map(Sql::Text))
         }
+        Derived::ControlPoint(column, axis) => {
+            let Some(cp) = get(impl_row, column).and_then(int) else {
+                return Ok(None);
+            };
+            if cat.table("ControlPoint").is_none() || cat.table("ControlPointImpl").is_none() {
+                return Ok(None);
+            }
+            let Some(cp_impl) = lookup_int(conn, "ControlPoint", "impl_id", cp)? else {
+                return Ok(None);
+            };
+            let v: Option<Sql> = conn
+                .prepare_cached(&format!(
+                    "SELECT {} FROM ControlPointImpl WHERE id = ?1",
+                    quote(&format!("coordinates_{axis}"))
+                ))?
+                .query_row([cp_impl], |r| r.get(0))
+                .optional()?;
+            Ok(v)
+        }
+        Derived::OpeningSurfaces => {
+            // Reverse lookup: which surfaces contain this opening?
+            // SurfaceSpecificImplPart_integratedOpenings.value_id = opening impl_id
+            // → SurfaceSpecificImplPart.owner_id = surface impl_id → Surface.
+            if cat.table("SurfaceSpecificImplPart_integratedOpenings").is_none()
+                || cat.table("SurfaceSpecificImplPart").is_none()
+            {
+                return Ok(None);
+            }
+            let sql = "SELECT s.userID FROM SurfaceSpecificImplPart_integratedOpenings io \
+                        JOIN SurfaceSpecificImplPart sp ON sp.id = io.id \
+                        JOIN Surface s ON s.impl_id = sp.owner_id \
+                        WHERE io.value_id = ?1 ORDER BY s.userID";
+            let mut stmt = conn.prepare_cached(sql)?;
+            let ids: Vec<u32> = stmt
+                .query_map([impl_id], |r| r.get::<_, i64>(0))?
+                .filter_map(|r| r.ok().and_then(|v| u32::try_from(v).ok()))
+                .collect();
+            if ids.is_empty() {
+                return Ok(None);
+            }
+            let txt = ids
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            Ok(Some(Sql::Text(txt)))
+        }
         Derived::MaterialProperty(key) => {
             let vector = format!("{impl_name}_materialDataVector");
             if cat.table(&vector).is_none() || cat.table("MaterialData").is_none() {
@@ -686,6 +733,14 @@ impl RfDocument {
                 let mut obj = Object::default();
                 let mut locs = HashMap::new();
                 for fs in spec.fields {
+                    if let Some(t) = mapping::field_impl_table(kind, fs.key) {
+                        if !impl_row
+                            .as_ref()
+                            .is_some_and(|(n, ..)| n.eq_ignore_ascii_case(t))
+                        {
+                            continue;
+                        }
+                    }
                     let cands = mapping::column_candidates(kind, fs.key);
                     let hit = find(row, &cands)
                         .map(|(c, v)| (Loc::Main(c.to_owned()), v.clone()))
@@ -1154,7 +1209,7 @@ impl RfDocument {
                     }) => (table, "rowid", *rowid, column),
                     Some(Loc::Derived) => {
                         return Err(Error::Unsupported(format!(
-                            "editing library property {}.{key}",
+                            "editing derived property {}.{key}",
                             id.kind.name()
                         )));
                     }
