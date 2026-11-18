@@ -54,6 +54,7 @@ pub fn tables(kind: ObjectKind) -> &'static [&'static str] {
         Member => &["Member"],
         Surface => &["Surface"],
         Solid => &["Solid"],
+        Opening => &["Opening"],
         NodalSupport => &["NodalSupport"],
         LineSupport => &["LineSupport"],
         MemberSupport => &["MemberSupport"],
@@ -81,6 +82,17 @@ fn overrides(kind: ObjectKind, key: &str) -> &'static [&'static str] {
         (Node, "coordinate_2") => &["coordinates_y"],
         (Node, "coordinate_3") => &["coordinates_z"],
         (Member | Line, "rotation_angle") => &["angle"],
+        // Confirmed on RFEM 6.16 (Lines.rf6): LineImplCircle / EllipticalArc / Parabola.
+        (Line, "circle_center_coordinate_1") => &["center_x"],
+        (Line, "circle_center_coordinate_2") => &["center_y"],
+        (Line, "circle_center_coordinate_3") => &["center_z"],
+        (Line, "circle_normal_coordinate_1") => &["normal_x"],
+        (Line, "circle_normal_coordinate_2") => &["normal_y"],
+        (Line, "circle_normal_coordinate_3") => &["normal_z"],
+        (Line, "circle_radius") => &["radius"],
+        (Line, "circle_rotation") => &["rotationAroundNormal"],
+        (Line, "elliptical_arc_alpha" | "parabola_alpha") => &["alpha"],
+        (Line, "elliptical_arc_beta") => &["beta"],
         (LoadCase, "action_category") => &["actionCategoryId"],
         (LoadCase, "self_weight_factor_x") => &["selfWeightFactors_x"],
         (LoadCase, "self_weight_factor_y") => &["selfWeightFactors_y"],
@@ -148,7 +160,8 @@ fn overrides(kind: ObjectKind, key: &str) -> &'static [&'static str] {
         (k, "nodes" | "lines" | "members" | "surfaces" | "solids") if k.spec().is_load() => {
             &["assignedTo"]
         }
-        (Surface, "boundary_lines") => &["boundaryLines"],
+        // Confirmed on RFEM 6.16 (Lines.rf6): `OpeningImpl_boundaryLines` / `SurfaceImplPlane`.
+        (Surface | Opening, "boundary_lines") => &["boundaryLines"],
         // Confirmed on RFEM 6.14 (MemberImplBeam; 0 = uniform).
         (Member, "section_distribution") => &["sectionDistributionType"],
         (Thickness, "uniform_thickness") => &["thickness"],
@@ -156,6 +169,26 @@ fn overrides(kind: ObjectKind, key: &str) -> &'static [&'static str] {
         (Solid, "boundary_surfaces") => &["boundarySurfaces", "surfaces"],
         _ => &[],
     }
+}
+
+/// Impl table a field belongs to, when it only applies to one type (line curve fields share
+/// column names such as `alpha` between impl tables).
+pub fn field_impl_table(kind: ObjectKind, key: &str) -> Option<&'static str> {
+    if kind != ObjectKind::Line {
+        return None;
+    }
+    // Longest prefix first: `elliptical_arc_` before `ellipse_` / `arc_`.
+    [
+        ("elliptical_arc_", "LineImplEllipticalArc"),
+        ("ellipse_", "LineImplEllipse"),
+        ("arc_", "LineImplArc"),
+        ("circle_", "LineImplCircle"),
+        ("parabola_", "LineImplParabola"),
+        ("nurbs_", "LineImplNurbs"),
+    ]
+    .into_iter()
+    .find(|(p, _)| key.starts_with(p))
+    .map(|(_, t)| t)
 }
 
 pub fn column_candidates(kind: ObjectKind, key: &'static str) -> Vec<String> {
@@ -245,11 +278,23 @@ pub enum Derived {
     /// Impl `librarySection_id` -> `ParametricSection.parametrizationShape`, as RFEM's
     /// API enum (see [`parametric_shape`]); other codes stay integers.
     SectionShape,
+    /// A parametric section's master dimensions (`ParametricSection_parameterValues`) in mm,
+    /// joined with `/` (read-only; RFEM builds the section name from them).
+    SectionParameters,
     /// Impl `librarySection_id` -> `DatabaseSection.databaseSectionId`: RFEM's library id.
     SectionLibraryId,
     /// `SurfaceSpecificImplPart.stiffness_table` (owner = surface impl), e.g.
     /// `SurfaceStiffnessWithoutThickness` -> `TYPE_WITHOUT_THICKNESS`.
     SurfaceStiffness,
+    /// Impl `<ref>` (e.g. `controlPoint_id`) -> `ControlPoint.impl_id` ->
+    /// `ControlPointImpl.coordinates_<axis>` (global coordinates; confirmed on RFEM 6.16).
+    ControlPoint(&'static str, &'static str),
+    /// Opening → surfaces: reverse lookup through `SurfaceSpecificImplPart_integratedOpenings`
+    /// (value_id = opening impl_id) → `SurfaceSpecificImplPart.owner_id` → `Surface.impl_id`.
+    OpeningSurfaces,
+    /// Surface load `loadParameters_id` list row `order`: its magnitude (`false`) or the
+    /// number of the node it is given at (`true`), for loads varying between nodes.
+    SurfaceLoadParameter(i64, bool),
 }
 
 pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
@@ -257,6 +302,11 @@ pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
     use ObjectKind::*;
     Some(match (kind, key) {
         (Section, "parametrization_type") => SectionShape,
+        (SurfaceLoad, "varying_magnitude_1") => SurfaceLoadParameter(0, false),
+        (SurfaceLoad, "varying_node_1") => SurfaceLoadParameter(0, true),
+        (SurfaceLoad, "varying_magnitude_2") => SurfaceLoadParameter(1, false),
+        (SurfaceLoad, "varying_node_2") => SurfaceLoadParameter(1, true),
+        (Section, "parameters") => SectionParameters,
         (Section, "database_section_id") => SectionLibraryId,
         (Section, "b") => SectionParameter(&["b"]),
         (Section, "h") => SectionParameter(&["h"]),
@@ -269,6 +319,20 @@ pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
         (Section, "A_y") => SectionParameter(&["A_v_y", "A_y"]),
         (Section, "A_z") => SectionParameter(&["A_v_z", "A_z"]),
         (Surface, "type") => SurfaceStiffness,
+        (Opening, "surfaces") => OpeningSurfaces,
+        (Line, k) if k.ends_with("control_point_x")
+            || k.ends_with("control_point_y")
+            || k.ends_with("control_point_z") =>
+        {
+            let axis = &k[k.len() - 1..];
+            let column = match k {
+                _ if k.starts_with("elliptical_arc_first_") => "firstMainAxisControlPoint_id",
+                _ if k.starts_with("elliptical_arc_second_") => "secondMainAxisControlPoint_id",
+                _ if k.starts_with("elliptical_arc_perimeter_") => "perimeterControlPoint_id",
+                _ => "controlPoint_id",
+            };
+            ControlPoint(column, axis)
+        }
         (Material, "elasticity_modulus") => MaterialProperty("E"),
         (Material, "shear_modulus") => MaterialProperty("G"),
         (Material, "poisson_ratio") => MaterialProperty("nu"),

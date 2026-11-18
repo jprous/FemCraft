@@ -44,6 +44,7 @@ pub const KINDS: &[(K, &str, &str)] = &[
     (K::Line, "line", "E_OBJECT_TYPE_LINE"),
     (K::Member, "member", "E_OBJECT_TYPE_MEMBER"),
     (K::Surface, "surface", "E_OBJECT_TYPE_SURFACE"),
+    (K::Opening, "opening", "E_OBJECT_TYPE_OPENING"),
     (
         K::NodalSupport,
         "nodal_support",

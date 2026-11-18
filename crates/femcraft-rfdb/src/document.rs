@@ -451,6 +451,61 @@ fn derived_value(
                 None => Sql::Integer(code),
             }))
         }
+        Derived::SectionParameters => {
+            let (Some(Sql::Text(lib)), Some(lib_id)) = (
+                get(impl_row, "librarySection_table"),
+                get(impl_row, "librarySection_id").and_then(int),
+            ) else {
+                return Ok(None);
+            };
+            if lib != "ParametricSection" || cat.table("ParametricSection_parameterValues").is_none() {
+                return Ok(None);
+            }
+            let mut st = conn.prepare_cached(
+                "SELECT value FROM ParametricSection_parameterValues WHERE id = ?1                  ORDER BY container_order",
+            )?;
+            let vals: Vec<String> = st
+                .query_map([lib_id], |r| r.get::<_, f64>(0))?
+                .map(|v| v.map(|v| format!("{}", (v * 1e4).round() / 10.0)))
+                .collect::<Result<_, _>>()?;
+            Ok((!vals.is_empty()).then(|| Sql::Text(vals.join("/"))))
+        }
+        Derived::SurfaceLoadParameter(order, node) => {
+            let table = format!("{impl_name}_NodeAndMagnitudeParameters_loadParameters");
+            let (Some(info), Some(params)) =
+                (cat.table(&table), get(impl_row, "loadParameters_id").and_then(int))
+            else {
+                return Ok(None);
+            };
+            if info.column("node_id").is_none()
+                || info.column("magnitude").is_none()
+                || cat.table("Node").is_none()
+            {
+                return Ok(None);
+            }
+            let sql = if node {
+                format!(
+                    "SELECT n.userID FROM {} p JOIN Node n ON n.id = p.node_id                      WHERE p.id = ?1 AND p.container_order = ?2",
+                    quote(&table)
+                )
+            } else {
+                format!(
+                    "SELECT p.magnitude FROM {} p WHERE p.id = ?1 AND p.container_order = ?2                      AND p.node_id IS NOT NULL",
+                    quote(&table)
+                )
+            };
+            let mut st = conn.prepare_cached(&sql)?;
+            let v = if node {
+                st.query_row(rusqlite::params![params, order], |r| r.get::<_, i64>(0))
+                    .optional()?
+                    .map(Sql::Integer)
+            } else {
+                st.query_row(rusqlite::params![params, order], |r| r.get::<_, f64>(0))
+                    .optional()?
+                    .map(Sql::Real)
+            };
+            Ok(v)
+        }
         Derived::SurfaceStiffness => {
             let Some((_, _, Sql::Text(t))) = part_value(
                 conn,
@@ -465,6 +520,53 @@ fn derived_value(
             };
             let rest = t.strip_prefix("SurfaceStiffness").unwrap_or(&t);
             Ok(upper_snake("TYPE", rest).map(Sql::Text))
+        }
+        Derived::ControlPoint(column, axis) => {
+            let Some(cp) = get(impl_row, column).and_then(int) else {
+                return Ok(None);
+            };
+            if cat.table("ControlPoint").is_none() || cat.table("ControlPointImpl").is_none() {
+                return Ok(None);
+            }
+            let Some(cp_impl) = lookup_int(conn, "ControlPoint", "impl_id", cp)? else {
+                return Ok(None);
+            };
+            let v: Option<Sql> = conn
+                .prepare_cached(&format!(
+                    "SELECT {} FROM ControlPointImpl WHERE id = ?1",
+                    quote(&format!("coordinates_{axis}"))
+                ))?
+                .query_row([cp_impl], |r| r.get(0))
+                .optional()?;
+            Ok(v)
+        }
+        Derived::OpeningSurfaces => {
+            // Reverse lookup: which surfaces contain this opening?
+            // SurfaceSpecificImplPart_integratedOpenings.value_id = opening impl_id
+            // → SurfaceSpecificImplPart.owner_id = surface impl_id → Surface.
+            if cat.table("SurfaceSpecificImplPart_integratedOpenings").is_none()
+                || cat.table("SurfaceSpecificImplPart").is_none()
+            {
+                return Ok(None);
+            }
+            let sql = "SELECT s.userID FROM SurfaceSpecificImplPart_integratedOpenings io \
+                        JOIN SurfaceSpecificImplPart sp ON sp.id = io.id \
+                        JOIN Surface s ON s.impl_id = sp.owner_id \
+                        WHERE io.value_id = ?1 ORDER BY s.userID";
+            let mut stmt = conn.prepare_cached(sql)?;
+            let ids: Vec<u32> = stmt
+                .query_map([impl_id], |r| r.get::<_, i64>(0))?
+                .filter_map(|r| r.ok().and_then(|v| u32::try_from(v).ok()))
+                .collect();
+            if ids.is_empty() {
+                return Ok(None);
+            }
+            let txt = ids
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            Ok(Some(Sql::Text(txt)))
         }
         Derived::MaterialProperty(key) => {
             let vector = format!("{impl_name}_materialDataVector");
@@ -686,6 +788,14 @@ impl RfDocument {
                 let mut obj = Object::default();
                 let mut locs = HashMap::new();
                 for fs in spec.fields {
+                    if let Some(t) = mapping::field_impl_table(kind, fs.key) {
+                        if !impl_row
+                            .as_ref()
+                            .is_some_and(|(n, ..)| n.eq_ignore_ascii_case(t))
+                        {
+                            continue;
+                        }
+                    }
                     let cands = mapping::column_candidates(kind, fs.key);
                     let hit = find(row, &cands)
                         .map(|(c, v)| (Loc::Main(c.to_owned()), v.clone()))
@@ -1154,7 +1264,7 @@ impl RfDocument {
                     }) => (table, "rowid", *rowid, column),
                     Some(Loc::Derived) => {
                         return Err(Error::Unsupported(format!(
-                            "editing library property {}.{key}",
+                            "editing derived property {}.{key}",
                             id.kind.name()
                         )));
                     }
@@ -1333,7 +1443,11 @@ fn prototype_filter(kind: ObjectKind, obj: &Object) -> Vec<(&'static str, Value)
     let t = |k: &'static str, v: &str| vec![(k, Value::Text(v.into()))];
     match kind {
         K::Node => t("type", "TYPE_STANDARD"),
-        K::Line => t("type", "TYPE_POLYLINE"),
+        // A curve (arc, circle, ...) needs a copy of its own type: the type is not editable.
+        K::Line => match obj.get("type") {
+            Value::Text(ty) => t("type", ty),
+            _ => t("type", "TYPE_POLYLINE"),
+        },
         K::Member => t("type", "TYPE_BEAM"),
         K::Surface => t("geometry", "GEOMETRY_PLANE"),
         K::Thickness => t("type", "TYPE_UNIFORM"),

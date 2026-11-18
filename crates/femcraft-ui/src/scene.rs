@@ -18,6 +18,7 @@ pub const SUPPORT: [f32; 4] = [0.35, 0.85, 0.40, 1.0];
 pub const NODAL_LOAD: [f32; 4] = [1.0, 0.35, 0.30, 1.0];
 pub const LINE_LOAD: [f32; 4] = [1.0, 0.62, 0.20, 1.0];
 pub const SURFACE_LOAD: [f32; 4] = [0.98, 0.86, 0.30, 1.0];
+const OPENING_EDGE: [f32; 4] = [0.90, 0.60, 0.20, 1.0];
 const SURFACE_LOAD_FILL: [f32; 4] = [0.98, 0.86, 0.30, 0.18];
 const SUPPORT_FILL: [f32; 4] = [0.35, 0.85, 0.40, 0.20];
 const SUPPORT_EDGE: [f32; 4] = [0.35, 0.85, 0.40, 0.70];
@@ -246,6 +247,20 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
     for (_, sup) in model.iter_kind(K::SurfaceSupport) {
         supported.extend_from_slice(sup.get("surfaces").as_ref_list());
     }
+    // Collect openings per surface.
+    let mut openings_per_surface: std::collections::HashMap<u32, Vec<(u32, Vec<Vec3>)>> =
+        std::collections::HashMap::new();
+    for (id, opn) in model.iter_kind(K::Opening) {
+        if let Some(poly) = surface_polygon(model, opn.get("boundary_lines").as_ref_list()) {
+            for &srf_no in opn.get("surfaces").as_ref_list() {
+                openings_per_surface
+                    .entry(srf_no)
+                    .or_default()
+                    .push((id.no, poly.clone()));
+            }
+        }
+    }
+
     let mut surface_polys: Vec<(u32, Vec<Vec3>)> = Vec::new();
     for (id, srf) in model.iter_kind(K::Surface) {
         match surface_polygon(model, srf.get("boundary_lines").as_ref_list()) {
@@ -262,20 +277,38 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
             } else {
                 SURFACE_FILL
             };
-            for [a, b, c] in triangulate(poly) {
-                s.tri(a, b, c, col);
+            let holes: Vec<&[Vec3]> = openings_per_surface
+                .get(no)
+                .map(|v| v.iter().map(|(_, h)| h.as_slice()).collect())
+                .unwrap_or_default();
+            if holes.is_empty() {
+                for [a, b, c] in triangulate(poly) {
+                    s.tri(a, b, c, col);
+                }
+            } else {
+                for [a, b, c] in triangulate_with_holes(poly, &holes) {
+                    s.tri(a, b, c, col);
+                }
             }
             s.pick.push((ObjectId::new(K::Surface, *no), poly.clone()));
+        }
+        // Draw opening boundary lines.
+        for openings in openings_per_surface.values() {
+            for (opn_no, poly) in openings {
+                for w in poly.windows(2) {
+                    s.line(w[0], w[1], OPENING_EDGE);
+                }
+                if poly.len() >= 3 {
+                    s.line(*poly.last().unwrap(), poly[0], OPENING_EDGE);
+                }
+                s.pick.push((ObjectId::new(K::Opening, *opn_no), poly.clone()));
+            }
         }
     }
 
     if vis.lines {
         for (id, _) in model.iter_kind(K::Line) {
-            let pts: Vec<Vec3> = model
-                .line_nodes(id.no)
-                .iter()
-                .filter_map(|n| node(*n))
-                .collect();
+            let pts: Vec<Vec3> = model.line_points(id.no).into_iter().map(to_world).collect();
             if pts.len() >= 2 {
                 s.pick.push((id, pts.clone()));
             }
@@ -290,11 +323,7 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
             let Some(line) = m.get("line").as_ref_no() else {
                 continue;
             };
-            let pts: Vec<[f64; 3]> = model
-                .line_nodes(line)
-                .iter()
-                .filter_map(|n| model.node_position(*n))
-                .collect();
+            let pts: Vec<[f64; 3]> = model.line_points(line);
             let (b, h) = section_size(model, m.get("section_start").as_ref_no());
             let beta = f(m, "rotation_angle").unwrap_or(0.0) as f32;
             if pts.len() < 2 {
@@ -375,11 +404,7 @@ pub fn build(model: &Model, vis: &Visibility) -> Scene {
             let nonlinear = is_nonlinear(sup, NL_KEYS);
             let (fill, edge) = support_colors(nonlinear);
             for l in sup.get("lines").as_ref_list() {
-                let pts: Vec<Vec3> = model
-                    .line_nodes(*l)
-                    .iter()
-                    .filter_map(|n| node(*n))
-                    .collect();
+                let pts: Vec<Vec3> = model.line_points(*l).into_iter().map(to_world).collect();
                 for w in pts.windows(2) {
                     // Support side: global +Z (down) made perpendicular to the line; for
                     // vertical lines, global +X.
@@ -647,36 +672,41 @@ fn member_box(s: &mut Scene, a: [f64; 3], b: [f64; 3], width: f32, height: f32, 
     }
 }
 
-/// Ordered boundary points of a surface from its boundary lines (chained end to end).
+/// Ordered boundary points of a surface from its boundary lines (chained end to end by
+/// their end nodes; curved lines contribute their tessellated points).
 fn surface_polygon(model: &Model, lines: &[u32]) -> Option<Vec<Vec3>> {
-    let mut segs: Vec<Vec<u32>> = lines
+    // (start node, end node, points) per line.
+    let mut segs: Vec<(u32, u32, Vec<[f64; 3]>)> = lines
         .iter()
-        .map(|l| model.line_nodes(*l).to_vec())
-        .filter(|n| n.len() >= 2)
+        .filter_map(|l| {
+            let nodes = model.line_nodes(*l);
+            let pts = model.line_points(*l);
+            if pts.len() < 2 {
+                return None;
+            }
+            Some((*nodes.first()?, *nodes.last()?, pts))
+        })
         .collect();
     if segs.is_empty() {
         return None;
     }
-    let mut chain = segs.remove(0);
+    let (first, mut end, mut chain) = segs.remove(0);
     while !segs.is_empty() {
-        let end = *chain.last()?;
-        let i = segs
-            .iter()
-            .position(|s| s[0] == end || *s.last().unwrap() == end)?;
-        let mut next = segs.remove(i);
-        if next[0] != end {
-            next.reverse();
+        let i = segs.iter().position(|s| s.0 == end || s.1 == end)?;
+        let (a, b, mut pts) = segs.remove(i);
+        if a != end {
+            pts.reverse();
+            end = a;
+        } else {
+            end = b;
         }
-        chain.extend_from_slice(&next[1..]);
+        chain.extend_from_slice(&pts[1..]);
     }
-    if chain.first() == chain.last() {
+    if end == first && chain.len() > 1 {
         chain.pop();
     }
-    let pts: Option<Vec<Vec3>> = chain
-        .iter()
-        .map(|n| model.node_position(*n).map(to_world))
-        .collect();
-    pts.filter(|p| p.len() >= 3)
+    let pts: Vec<Vec3> = chain.into_iter().map(to_world).collect();
+    (pts.len() >= 3).then_some(pts)
 }
 
 /// Ear-clipping triangulation of a planar polygon (falls back to a fan if it gets stuck).
@@ -720,6 +750,124 @@ fn triangulate(poly: &[Vec3]) -> Vec<[Vec3; 3]> {
     out
 }
 
+/// Triangulate a polygon with holes using bridge-edge insertion: each hole is connected to the
+/// outer boundary (or a previously merged hole) by a pair of coincident edges, producing a
+/// single simple polygon that the ear-clipper handles. The bridge is chosen at the rightmost
+/// vertex of the hole (projected onto the polygon plane) for simplicity.
+fn triangulate_with_holes(outer: &[Vec3], holes: &[&[Vec3]]) -> Vec<[Vec3; 3]> {
+    if holes.is_empty() {
+        return triangulate(outer);
+    }
+    let n = newell_normal(outer);
+    // Project onto a 2D plane for bridge computation.
+    let (u_ax, v_ax) = {
+        let t = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+        let u = t.cross(n).normalize_or_zero();
+        (u, n.cross(u).normalize_or_zero())
+    };
+    let proj = |p: Vec3| -> (f32, f32) { (p.dot(u_ax), p.dot(v_ax)) };
+
+    let mut merged: Vec<Vec3> = outer.to_vec();
+    // Ensure the outer boundary is counter-clockwise in the projected plane relative to n.
+    if signed_area_2d(&merged, &proj) < 0.0 {
+        merged.reverse();
+    }
+
+    // Sort holes by their rightmost x so we always bridge to the already-merged boundary.
+    let mut hole_order: Vec<usize> = (0..holes.len()).collect();
+    hole_order.sort_by(|&a, &b| {
+        let ma = holes[a].iter().map(|p| ordered(proj(*p).0)).max();
+        let mb = holes[b].iter().map(|p| ordered(proj(*p).0)).max();
+        mb.cmp(&ma) // descending: rightmost first
+    });
+
+    for &hi in &hole_order {
+        let hole = holes[hi];
+        if hole.is_empty() {
+            continue;
+        }
+        // Ensure the hole is clockwise (opposite winding to the outer).
+        let mut h: Vec<Vec3> = hole.to_vec();
+        if signed_area_2d(&h, &proj) > 0.0 {
+            h.reverse();
+        }
+        // Find the rightmost vertex of the hole.
+        let (hr_idx, _) = h
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| ordered(proj(**a).0).cmp(&ordered(proj(**b).0)))
+            .unwrap();
+        let hr = proj(h[hr_idx]);
+        // Find the nearest visible vertex on the merged boundary to bridge to.
+        // Simple: pick the closest merged vertex that is to the right of or at hr.x.
+        let bridge_idx = (0..merged.len())
+            .filter(|&i| {
+                let (mx, _) = proj(merged[i]);
+                mx >= hr.0 - 1e-6
+            })
+            .min_by(|&a, &b| {
+                let da = dist2d(hr, proj(merged[a]));
+                let db = dist2d(hr, proj(merged[b]));
+                ordered(da).cmp(&ordered(db))
+            })
+            .unwrap_or_else(|| {
+                // Fallback: nearest vertex overall.
+                (0..merged.len())
+                    .min_by(|&a, &b| {
+                        let da = dist2d(hr, proj(merged[a]));
+                        let db = dist2d(hr, proj(merged[b]));
+                        ordered(da).cmp(&ordered(db))
+                    })
+                    .unwrap_or(0)
+            });
+
+        // Insert the hole into merged at bridge_idx: outer[..=bridge] + hole rotated to hr + outer[bridge..]
+        let rotated_hole: Vec<Vec3> = (0..h.len())
+            .map(|i| h[(hr_idx + i) % h.len()])
+            .collect();
+        let mut new_merged = Vec::with_capacity(merged.len() + h.len() + 2);
+        new_merged.extend_from_slice(&merged[..=bridge_idx]);
+        new_merged.extend_from_slice(&rotated_hole);
+        new_merged.push(rotated_hole[0]); // back to hole start
+        new_merged.extend_from_slice(&merged[bridge_idx..]); // duplicate bridge vertex closes it
+        merged = new_merged;
+    }
+
+    triangulate(&merged)
+}
+
+fn signed_area_2d(poly: &[Vec3], proj: &dyn Fn(Vec3) -> (f32, f32)) -> f32 {
+    let mut area = 0.0f32;
+    for i in 0..poly.len() {
+        let (ax, ay) = proj(poly[i]);
+        let (bx, by) = proj(poly[(i + 1) % poly.len()]);
+        area += (bx - ax) * (by + ay);
+    }
+    area
+}
+
+fn dist2d(a: (f32, f32), b: (f32, f32)) -> f32 {
+    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+}
+
+fn ordered(f: f32) -> OrderedF32 {
+    OrderedF32(f)
+}
+
+#[derive(PartialEq)]
+struct OrderedF32(f32);
+impl Eq for OrderedF32 {}
+impl PartialOrd for OrderedF32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrderedF32 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
 fn in_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3, n: Vec3) -> bool {
     [(a, b), (b, c), (c, a)]
         .iter()
@@ -750,6 +898,10 @@ fn load_dir(code: i64, nodal: bool, local: Option<(Vec3, Vec3, Vec3)>) -> Option
         (11, false, _) => Some(Vec3::X),
         (12, false, _) => Some(Vec3::Y),
         (13, false, _) => Some(Vec3::Z),
+        // Projected global directions (Xp, Yp, Zp): drawn like the plain ones for now.
+        (14, false, _) => Some(Vec3::X),
+        (15, false, _) => Some(Vec3::Y),
+        (16, false, _) => Some(Vec3::Z),
         (0, false, Some((x, _, _))) => Some(x),
         (1, false, Some((_, y, _))) => Some(y),
         (2, false, Some((_, _, z))) => Some(z),
@@ -818,11 +970,7 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
         let p2 = f(l, "magnitude_2").filter(|v| v.is_finite()).unwrap_or(p1);
         let code = l.get("load_direction").as_i64().unwrap_or(13);
         for (line, beta) in lines {
-            let pts: Vec<[f64; 3]> = model
-                .line_nodes(line)
-                .iter()
-                .filter_map(|n| node(*n))
-                .collect();
+            let pts: Vec<[f64; 3]> = model.line_points(line);
             let (Some(a), Some(b)) = (pts.first(), pts.last()) else {
                 continue;
             };
@@ -864,6 +1012,57 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
     }
 
     for (_, l) in in_case(K::SurfaceLoad) {
+        let world = |no: u32| {
+            node(no).map(|p| dir_world(Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)))
+        };
+        // Varying between two nodes (e.g. soil / water pressure on a wall): p1 at node 1
+        // linearly to p2 at node 2, constant across the direction normal to that line.
+        let varying = (|| {
+            let n1 = world(l.get("varying_node_1").as_i64()? as u32)?;
+            let n2 = world(l.get("varying_node_2").as_i64()? as u32)?;
+            let (m1, m2) = (f(l, "varying_magnitude_1")?, f(l, "varying_magnitude_2")?);
+            ((m1 != 0.0 || m2 != 0.0) && (n2 - n1).length() > 1e-6).then_some((n1, m1, n2, m2))
+        })();
+        if let Some((n1, m1, n2, m2)) = varying {
+            let code = l.get("load_direction").as_i64().unwrap_or(13);
+            let axis = n2 - n1;
+            let (u, span) = (axis.normalize(), axis.length());
+            let peak = m1.abs().max(m2.abs()) as f32;
+            for sn in l.get("surfaces").as_ref_list() {
+                let Some((_, poly)) = surfaces.iter().find(|(no, _)| no == sn) else {
+                    continue;
+                };
+                let srf = model.get(ObjectId::new(K::Surface, *sn));
+                let local = Some(surface_axes(poly, srf));
+                let Some(d) = load_dir(code, false, local) else {
+                    unknown_dir += 1;
+                    continue;
+                };
+                let dw = dir_world(d);
+                let mag_at = |p: Vec3| m1 as f32 + (m2 - m1) as f32 * (p - n1).dot(u) / span;
+                let offsets: Vec<Vec3> = poly
+                    .iter()
+                    .map(|p| -dw * (mag_at(*p) / peak * len))
+                    .collect();
+                prism_varying(s, poly, &offsets, SURFACE_LOAD_FILL, SURFACE_LOAD);
+                let c = poly.iter().copied().sum::<Vec3>() / poly.len() as f32;
+                let mc = mag_at(c);
+                if mc.abs() > 1e-6 * peak {
+                    let toward = dw * mc.signum();
+                    s.arrow(c, toward, len * 0.9 * (mc.abs() / peak).max(0.25), SURFACE_LOAD);
+                }
+                s.labels.push(Label {
+                    pos: c - dw * len * 1.25 * mc.signum(),
+                    text: format!(
+                        "{} - {}",
+                        kn(m1.abs(), "kN/m²").trim_end_matches(" kN/m²"),
+                        kn(m2.abs(), "kN/m²")
+                    ),
+                    color: SURFACE_LOAD,
+                });
+            }
+            continue;
+        }
         let Some(mag) = f(l, "uniform_magnitude").filter(|v| *v != 0.0) else {
             continue;
         };
@@ -918,6 +1117,24 @@ fn surface_load_block(s: &mut Scene, poly: &[Vec3], dir: Vec3, h: f32) {
 /// filled far face and sides, outlined far edges and side edges.
 fn prism(s: &mut Scene, poly: &[Vec3], offset: Vec3, fill: [f32; 4], edge: [f32; 4]) {
     let top: Vec<Vec3> = poly.iter().map(|p| *p + offset).collect();
+    for [a, b, c] in triangulate(&top) {
+        s.tri(a, b, c, fill);
+    }
+    let n = poly.len();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (a, b, ta, tb) = (poly[i], poly[j], top[i], top[j]);
+        s.tri(a, b, tb, fill);
+        s.tri(a, tb, ta, fill);
+        s.line(ta, tb, edge);
+        s.line(a, ta, edge);
+    }
+}
+
+/// Like [`prism`], with a separate offset (world) per polygon vertex: a wedge for a load
+/// varying across the surface. Vertices with a zero offset stay on the surface.
+fn prism_varying(s: &mut Scene, poly: &[Vec3], offsets: &[Vec3], fill: [f32; 4], edge: [f32; 4]) {
+    let top: Vec<Vec3> = poly.iter().zip(offsets).map(|(p, o)| *p + *o).collect();
     for [a, b, c] in triangulate(&top) {
         s.tri(a, b, c, fill);
     }
@@ -1090,6 +1307,39 @@ mod tests {
             },
         );
         assert!(hidden.member_lines.is_empty() && hidden.lines.is_empty());
+    }
+
+    /// Soil / water pressure on the Chamber model's walls (linear between two nodes) is drawn.
+    #[test]
+    fn varying_wall_loads_are_drawn() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/private/Chamber 4x4x6.rf6");
+        if !path.is_file() {
+            return;
+        }
+        let doc = femcraft_rfdb::RfDocument::open(&path).unwrap();
+        let vis = Visibility::default();
+        let mut with = vis.clone();
+        with.load_case = 5;
+        let none = {
+            let mut v = vis.clone();
+            v.load_case = 1;
+            build(&doc.model, &v)
+        };
+        for lc in [6, 8] {
+            let mut v = vis.clone();
+            v.load_case = lc;
+            let sc = build(&doc.model, &v);
+            assert!(sc.notes.is_empty(), "LC{lc}: {:?}", sc.notes);
+        }
+        let sc = build(&doc.model, &with);
+        assert!(sc.triangles.len() > none.triangles.len(), "wedges drawn");
+        assert!(sc.notes.is_empty(), "{:?}", sc.notes);
+        assert!(
+            sc.labels.iter().any(|l| l.text == "0 - 31 kN/m²"),
+            "{:?}",
+            sc.labels.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
     }
 
     #[test]
