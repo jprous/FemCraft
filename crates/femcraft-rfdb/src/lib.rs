@@ -10,12 +10,16 @@ pub mod document;
 pub mod library;
 pub mod mapping;
 pub mod mesh;
+pub mod results;
 
 pub use archive::{Archive, SourceFormat};
 pub use catalog::Catalog;
 pub use document::{KindReport, LoadReport, RfDocument};
 pub use library::{Library, LibraryFilter, LibraryItem, LibraryKind, LibraryValue};
 pub use mesh::FeMesh;
+pub use results::{
+    CaseKind, RadioGroup, ResultCase, ResultComponent, ResultLeaf, ResultNode, ResultSet,
+};
 
 #[derive(Debug)]
 pub enum Error {

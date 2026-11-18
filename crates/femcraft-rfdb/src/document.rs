@@ -1412,6 +1412,12 @@ impl RfDocument {
         crate::FeMesh::read(&self.archive)
     }
 
+    /// Solver results RFEM saved in the file (`!solver/`), if any: the calculated cases and the
+    /// available result quantities. `Ok(None)` for an unsolved model. See [`crate::results`].
+    pub fn results(&self) -> Result<Option<crate::ResultSet>, Error> {
+        crate::ResultSet::read(&self.archive)
+    }
+
     /// Saves to `path`: `.rf6` sources are re-zipped with unchanged sidecars; bare databases are
     /// copied. Unchanged models give a byte-identical `model.db`.
     pub fn save(&mut self, path: &Path) -> Result<(), Error> {

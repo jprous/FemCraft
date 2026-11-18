@@ -831,6 +831,17 @@ impl FemCraftApp {
                 }
                 None => panels::navigator(ui, None, &[], &mut Default::default()),
             },
+            Pane::Results => match self.active_doc_mut() {
+                Some(d) => crate::results_panel::results_panel(
+                    ui,
+                    d.results.as_ref(),
+                    Some(&d.rf.model),
+                    &mut d.results_view,
+                ),
+                None => {
+                    crate::results_panel::results_panel(ui, None, None, &mut Default::default())
+                }
+            },
             Pane::Tables => {
                 let tables = &mut self.tables;
                 let id = self.active;

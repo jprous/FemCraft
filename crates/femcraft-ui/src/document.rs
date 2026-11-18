@@ -34,6 +34,10 @@ pub struct Document {
     pub rf: RfDocument,
     /// FE mesh RFEM saved in the file (shown until the model is edited).
     pub fe_mesh: Option<femcraft_rfdb::FeMesh>,
+    /// Solver results RFEM saved in the file (`None` for an unsolved model).
+    pub results: Option<femcraft_rfdb::ResultSet>,
+    /// The Results panel's current selection.
+    pub results_view: crate::results_panel::ResultsView,
     /// Bumped on every edit, so the 3D view is rebuilt.
     pub revision: u64,
     pub load_cases: Vec<(u32, String)>,
@@ -64,6 +68,10 @@ impl Document {
             warnings.push(format!("FE mesh not read: {e}"));
             None
         });
+        let results = doc.results().unwrap_or_else(|e| {
+            warnings.push(format!("Results not read: {e}"));
+            None
+        });
         let vis = Visibility {
             load_case: scene::first_loaded_case(&doc.model)
                 .or(load_cases.first().map(|(n, _)| *n))
@@ -77,6 +85,8 @@ impl Document {
             warnings,
             rf: doc,
             fe_mesh,
+            results,
+            results_view: crate::results_panel::ResultsView::default(),
             revision: 0,
             vis,
             scene: Scene::default(),
