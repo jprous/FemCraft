@@ -706,9 +706,26 @@ fn object_table(
                                         LibraryKind::Section => "database_section_id",
                                     };
                                     let rfem_id = obj.get(key).as_i64().filter(|i| *i > 0)?;
-                                    state.library_cache.name(lib, rfem_id)
+                                    state.library_cache.name(lib, rfem_id).or_else(|| {
+                                        // Not in our library under that id: the same profile
+                                        // from another manufacturer - match by properties.
+                                        (lib == LibraryKind::Section)
+                                            .then(|| {
+                                                state.library_cache.section_name_by_properties(
+                                                    obj.get("A").as_f64()?,
+                                                    obj.get("I_y").as_f64()?,
+                                                    obj.get("I_z").as_f64()?,
+                                                )
+                                            })
+                                            .flatten()
+                                    })
                                 })
-                                .flatten();
+                                .flatten()
+                                .or_else(|| {
+                                    (f.key == "name" && value.as_str().is_none_or(str::is_empty))
+                                        .then(|| parametric_section_name(kind, obj))
+                                        .flatten()
+                                });
                                 let label = match &lib_name {
                                     Some(n) => ui
                                         .add(
@@ -770,4 +787,32 @@ fn object_table(
                 });
         });
     edit
+}
+
+/// RFEM's generated name of a parametric concrete section (it stores none), e.g.
+/// `R_M1 220/450`, `SQ_M1 500`, `CIRCLE_M1 500` (dimensions in mm).
+fn parametric_section_name(kind: ObjectKind, obj: &femcraft_model::Object) -> Option<String> {
+    if kind != ObjectKind::Section {
+        return None;
+    }
+    let mm = |key: &str| obj.get(key).as_f64().map(|v| (v * 1e4).round() / 10.0);
+    let n = |v: f64| format!("{v}");
+    match obj.get("parametrization_type") {
+        femcraft_model::Value::Text(shape) if shape.ends_with("__R_M1") => {
+            Some(format!("R_M1 {}/{}", n(mm("b")?), n(mm("h")?)))
+        }
+        femcraft_model::Value::Text(shape) if shape.ends_with("__SQ_M1") => {
+            Some(format!("SQ_M1 {}", n(mm("b")?)))
+        }
+        femcraft_model::Value::Text(shape) if shape.ends_with("__CIRCLE_M1") => {
+            Some(format!("CIRCLE_M1 {}", n(mm("d")?)))
+        }
+        // Back-to-back double angle: name = shape + its parameters in mm (+ "/H", as RFEM
+        // shows it on the two such sections seen so far).
+        v if v.as_i64() == Some(168) => {
+            let p = obj.get("parameters").as_str()?.to_owned();
+            Some(format!("2LE(BB) {p}/H"))
+        }
+        _ => None,
+    }
 }

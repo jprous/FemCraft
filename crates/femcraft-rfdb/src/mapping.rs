@@ -278,6 +278,9 @@ pub enum Derived {
     /// Impl `librarySection_id` -> `ParametricSection.parametrizationShape`, as RFEM's
     /// API enum (see [`parametric_shape`]); other codes stay integers.
     SectionShape,
+    /// A parametric section's master dimensions (`ParametricSection_parameterValues`) in mm,
+    /// joined with `/` (read-only; RFEM builds the section name from them).
+    SectionParameters,
     /// Impl `librarySection_id` -> `DatabaseSection.databaseSectionId`: RFEM's library id.
     SectionLibraryId,
     /// `SurfaceSpecificImplPart.stiffness_table` (owner = surface impl), e.g.
@@ -289,6 +292,9 @@ pub enum Derived {
     /// Opening → surfaces: reverse lookup through `SurfaceSpecificImplPart_integratedOpenings`
     /// (value_id = opening impl_id) → `SurfaceSpecificImplPart.owner_id` → `Surface.impl_id`.
     OpeningSurfaces,
+    /// Surface load `loadParameters_id` list row `order`: its magnitude (`false`) or the
+    /// number of the node it is given at (`true`), for loads varying between nodes.
+    SurfaceLoadParameter(i64, bool),
 }
 
 pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
@@ -296,6 +302,11 @@ pub fn derived(kind: ObjectKind, key: &'static str) -> Option<Derived> {
     use ObjectKind::*;
     Some(match (kind, key) {
         (Section, "parametrization_type") => SectionShape,
+        (SurfaceLoad, "varying_magnitude_1") => SurfaceLoadParameter(0, false),
+        (SurfaceLoad, "varying_node_1") => SurfaceLoadParameter(0, true),
+        (SurfaceLoad, "varying_magnitude_2") => SurfaceLoadParameter(1, false),
+        (SurfaceLoad, "varying_node_2") => SurfaceLoadParameter(1, true),
+        (Section, "parameters") => SectionParameters,
         (Section, "database_section_id") => SectionLibraryId,
         (Section, "b") => SectionParameter(&["b"]),
         (Section, "h") => SectionParameter(&["h"]),

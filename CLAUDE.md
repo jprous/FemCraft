@@ -77,8 +77,8 @@ Plan and milestone status: `docs/ROADMAP.md`.
 - Concrete sections are parametric, not library: `SectionImplParametricMassive` ->
   `ParametricSection.parametrizationShape` 49 = `R_M1` rectangle, 154 = `SQ_M1` square,
   53 = `CIRCLE_M1` circle (`mapping::parametric_shape`); dimensions `b` / `h` / `d` in
-  `SectionData_parameterValues`. API I names them in metres: `R_M1 0.3/0.6`, `SQ_M1 0.4`,
-  `CIRCLE_M1 0.4`. Section fields `parametrization_type`, `b`, `h`, `d` are read-only.
+  `SectionData_parameterValues`. RFEM's UI (and the library) name them in mm: `R_M1 300/600`, `SQ_M1 400`,
+  `CIRCLE_M1 400` (API I uses metres; `Library::get` accepts both). Section fields `parametrization_type`, `b`, `h`, `d` are read-only.
 - `crates/femcraft-aster`, `-results` placeholders.
 - egui / eframe 0.37 (panels are `egui::Panel`, `App::ui` instead of `update`).
 - CI: `.github/workflows/ci.yml` (Windows build + test).

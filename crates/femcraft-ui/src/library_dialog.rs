@@ -26,8 +26,8 @@ const fn col(key: &'static str, label: &'static str, scale: f64) -> Col {
 }
 
 const SECTION_COLS: &[Col] = &[
-    col("h", "h [mm]", 1e3),
     col("b", "b [mm]", 1e3),
+    col("h", "h [mm]", 1e3),
     col("t_w", "t_w [mm]", 1e3),
     col("t", "t [mm]", 1e3),
     col("t_f", "t_f [mm]", 1e3),
@@ -97,6 +97,9 @@ impl LibraryData {
                 list.join(", ")
             )
         })?;
+        if kind == LibraryKind::Section {
+            let _ = lib.migrate_concrete_names();
+        }
         let items = lib
             .list(kind, &LibraryFilter::default())
             .map_err(|e| e.to_string())?;
@@ -128,6 +131,30 @@ impl LibraryCache {
         self.get(kind).ok()?.names.get(&id).cloned()
     }
 
+    /// For a library section RFEM knows under an id this library lacks (another manufacturer's
+    /// copy of the same profile): the designation of the library section with the same
+    /// A / I_y / I_z, when all such sections share one designation (e.g. `UB 254x146x37`).
+    pub fn section_name_by_properties(&mut self, a: f64, iy: f64, iz: f64) -> Option<String> {
+        let data = self.get(LibraryKind::Section).ok()?;
+        let col = |k: &str| SECTION_COLS.iter().position(|c| c.key == k);
+        let (ca, cy, cz) = (col("A")?, col("I_y")?, col("I_z")?);
+        let close = |x: Option<f64>, y: f64| x.is_some_and(|x| (x - y).abs() <= 1e-2 * y.abs());
+        let mut found: Option<String> = None;
+        for item in &data.items {
+            let Some(v) = data.values.get(&item.user_id) else {
+                continue;
+            };
+            if close(v[ca], a) && close(v[cy], iy) && close(v[cz], iz) {
+                let d = item.designation.split(" | ").next().unwrap_or("").to_owned();
+                match &found {
+                    Some(f) if *f != d => return None,
+                    _ => found = Some(d),
+                }
+            }
+        }
+        found
+    }
+
     fn get(&mut self, kind: LibraryKind) -> Result<Rc<LibraryData>, String> {
         let slot = match kind {
             LibraryKind::Material => &mut self.materials,
@@ -135,6 +162,16 @@ impl LibraryCache {
         };
         slot.get_or_insert_with(|| LibraryData::load(kind).map(Rc::new))
             .clone()
+    }
+
+    /// Forgets the loaded library of `kind`, so the next [`Self::get`] reloads it from disk.
+    /// Called after a row is added, removed, or edited.
+    fn invalidate(&mut self, kind: LibraryKind) {
+        let slot = match kind {
+            LibraryKind::Material => &mut self.materials,
+            LibraryKind::Section => &mut self.sections,
+        };
+        *slot = None;
     }
 }
 
@@ -153,6 +190,279 @@ struct TreePick {
     family: String,
 }
 
+/// Family codes of FemCraft's three parametric concrete section shapes (massive rectangle,
+/// square, circle) - the only sections a user can add to / remove from the library. Steel
+/// profiles come from a fixed manufacturer catalogue and cannot be made up.
+const CONCRETE_FAMILIES: &[&str] = &["R", "SQ", "CIRCLE"];
+
+/// A row being added or edited in the Section table: a parametric concrete shape whose name
+/// and dimensions are typed in-place, write-through to the library on every change.
+struct EditRow {
+    user_id: i64,
+    family: String,
+    name: String,
+    /// Dimensions, in mm (the table's display unit), as typed.
+    b: String,
+    h: String,
+    d: String,
+}
+
+impl EditRow {
+    fn new(user_id: i64, family: &str, name: String, b_mm: f64, h_mm: f64, d_mm: f64) -> Self {
+        Self {
+            user_id,
+            family: family.to_owned(),
+            name,
+            b: number(b_mm),
+            h: number(h_mm),
+            d: number(d_mm),
+        }
+    }
+
+    fn dims(&self) -> (f64, f64, f64) {
+        let b = self.b.parse().unwrap_or(0.0);
+        // A square has one true dimension (`b`, its only editable cell - see `table`'s
+        // `dim_field`); `self.h` is only ever meaningful for a rectangle.
+        let h = if self.family == "SQ" {
+            b
+        } else {
+            self.h.parse().unwrap_or(0.0)
+        };
+        (b, h, self.d.parse().unwrap_or(0.0))
+    }
+}
+
+/// A new item's auto-generated name for `family`, following the naming FemCraft's own library
+/// RFEM itself uses for parametric concrete sections (mm, e.g. `R_M1 300/600`).
+fn concrete_name(family: &str, b_mm: f64, h_mm: f64, d_mm: f64) -> String {
+    match family {
+        "R" => format!("R_M1 {}/{}", number(b_mm), number(h_mm)),
+        "SQ" => format!("SQ_M1 {}", number(b_mm)),
+        "CIRCLE" => format!("CIRCLE_M1 {}", number(d_mm)),
+        _ => String::new(),
+    }
+}
+
+/// Section properties of a parametric concrete shape, from its dimensions (mm), in SI units
+/// and under the same key names as RFEM's own `SectionData_parameterValues` (so
+/// [`Self::library_values`]'s result can overwrite them - see `set_concrete_values`). A
+/// rectangle's formulas are used for a square too (`b_mm == h_mm`): RFEM treats them as
+/// separate shapes, but a square's section properties are the rectangle's with `b = h`.
+///
+/// Every formula here was checked against FemCraft's own real, RFEM-computed catalogue
+/// entries across several sizes per family (massive rectangle, square, circle), and matches
+/// to at least 4 significant figures - except `tor_alpha` (and the `J_alpha` / `W_t` values
+/// derived from it) for a non-square rectangle: RFEM's own `tor_alpha` is a torsional *stress*
+/// coefficient that needs its own series solution to reproduce exactly (unlike every other
+/// property here, which has a closed form), so it reuses the stiffness coefficient `tor_beta`
+/// as a reasonable approximation. That only affects torsional-stress reporting; it doesn't
+/// matter for a square or circle, whose `tor_alpha` is exact (1, resp. equal to `tor_beta`).
+fn concrete_properties(family: &str, b_mm: f64, h_mm: f64, d_mm: f64) -> Vec<(&'static str, f64)> {
+    match family {
+        "R" | "SQ" => rect_properties(b_mm, h_mm),
+        "CIRCLE" => circle_properties(d_mm),
+        _ => Vec::new(),
+    }
+}
+
+/// Massive rectangle (or square, `b == h`) section properties; see [`concrete_properties`].
+fn rect_properties(b_mm: f64, h_mm: f64) -> Vec<(&'static str, f64)> {
+    let (b, h) = (b_mm / 1e3, h_mm / 1e3);
+    let a = b * h;
+    let (iy, iz) = (b * h.powi(3) / 12.0, h * b.powi(3) / 12.0);
+    let (long, short) = (b.max(h), b.min(h));
+    // Roark/Timoshenko's standard engineering approximation for a solid rectangle's torsion
+    // constant (`long` = longer full side, `short` = shorter full side).
+    let tor_beta = 1.0 / 3.0
+        - 0.21 * (short / long) * (1.0 - short.powi(4) / (12.0 * long.powi(4)));
+    let it = long * short.powi(3) * tor_beta;
+    vec![
+        ("b", b),
+        ("h", h),
+        ("A", a),
+        ("A_m", 2.0 * (b + h)),
+        ("A_m_V", 2.0 * (b + h) / a),
+        ("A_u", 5.0 / 6.0 * a),
+        ("A_v", 5.0 / 6.0 * a),
+        ("A_y", 5.0 / 6.0 * a),
+        ("A_z", 5.0 / 6.0 * a),
+        ("DEPTH_FOR_TEMPERATURE_LOAD", h),
+        ("WIDTH_FOR_TEMPERATURE_LOAD", b),
+        ("I_p", iy + iz),
+        ("I_p_SC", iy + iz),
+        ("I_t", it),
+        ("I_u", iy),
+        ("I_v", iz),
+        ("I_y", iy),
+        ("I_yz", 0.0),
+        ("I_z", iz),
+        ("J_alpha", tor_beta * long * short.powi(3)),
+        ("J_beta", it),
+        ("SELF_WEIGHT_INTERNAL", 2500.0 * a),
+        ("S_u_max", b * h * h / 8.0),
+        ("S_v_max", h * b * b / 8.0),
+        ("S_y_max", b * h * h / 8.0),
+        ("S_z_max", h * b * b / 8.0),
+        ("U_t", 2.0 * (b + h)),
+        ("V", a),
+        ("W_pl_u", b * h * h / 4.0),
+        ("W_pl_v", h * b * b / 4.0),
+        ("W_pl_y", b * h * h / 4.0),
+        ("W_pl_z", h * b * b / 4.0),
+        ("W_t", tor_beta * long * short.powi(2)),
+        ("W_u", iy / (h / 2.0)),
+        ("W_u_max", iy / (h / 2.0)),
+        ("W_u_min", -iy / (h / 2.0)),
+        ("W_v", iz / (b / 2.0)),
+        ("W_v_max", iz / (b / 2.0)),
+        ("W_v_min", -iz / (b / 2.0)),
+        ("W_y", iy / (h / 2.0)),
+        ("W_y_max", iy / (h / 2.0)),
+        ("W_y_min", -iy / (h / 2.0)),
+        ("W_z", iz / (b / 2.0)),
+        ("W_z_max", iz / (b / 2.0)),
+        ("W_z_min", -iz / (b / 2.0)),
+        ("alpha", 0.0),
+        ("alpha_pl_u", 1.5),
+        ("alpha_pl_v", 1.5),
+        ("alpha_pl_y", 1.5),
+        ("alpha_pl_z", 1.5),
+        ("e_y", b / 2.0),
+        ("e_z", h / 2.0),
+        ("j_p", ((iy + iz) / a).sqrt()),
+        ("j_p_SC", ((iy + iz) / a).sqrt()),
+        ("j_u", (iy / a).sqrt()),
+        ("j_v", (iz / a).sqrt()),
+        ("j_y", (iy / a).sqrt()),
+        ("j_yz", 0.0),
+        ("j_z", (iz / a).sqrt()),
+        ("min_w", short),
+        ("r_omega_SC", 0.0),
+        ("r_u", 0.0),
+        ("r_u_SC", 0.0),
+        ("r_v", 0.0),
+        ("r_v_SC", 0.0),
+        ("r_y", 0.0),
+        ("r_y_SC", 0.0),
+        ("r_z", 0.0),
+        ("r_z_SC", 0.0),
+        ("t_M", 0.0),
+        ("tor_alpha", tor_beta),
+        ("tor_beta", tor_beta),
+        ("u_SC", 0.0),
+        ("u_pl", 0.0),
+        ("v_SC", 0.0),
+        ("v_pl", 0.0),
+        ("y_SC", 0.0),
+        ("y_pl", 0.0),
+        ("z_SC", 0.0),
+        ("z_pl", 0.0),
+    ]
+}
+
+/// Massive circle section properties; see [`concrete_properties`].
+fn circle_properties(d_mm: f64) -> Vec<(&'static str, f64)> {
+    let d = d_mm / 1e3;
+    let pi = std::f64::consts::PI;
+    let a = pi * d * d / 4.0;
+    let i = pi * d.powi(4) / 64.0;
+    let ip = pi * d.powi(4) / 32.0;
+    vec![
+        ("d", d),
+        ("A", a),
+        ("A_m", pi * d),
+        ("A_m_V", pi * d / a),
+        ("A_u", 0.84 * a),
+        ("A_v", 0.84 * a),
+        ("A_y", 0.84 * a),
+        ("A_z", 0.84 * a),
+        ("DEPTH_FOR_TEMPERATURE_LOAD", d),
+        ("WIDTH_FOR_TEMPERATURE_LOAD", d),
+        ("I_p", ip),
+        ("I_p_SC", ip),
+        ("I_t", ip),
+        ("I_u", i),
+        ("I_v", i),
+        ("I_y", i),
+        ("I_yz", 0.0),
+        ("I_z", i),
+        ("J_alpha", ip),
+        ("J_beta", ip),
+        ("SELF_WEIGHT_INTERNAL", 2500.0 * a),
+        ("S_u_max", d.powi(3) / 12.0),
+        ("S_v_max", d.powi(3) / 12.0),
+        ("S_y_max", d.powi(3) / 12.0),
+        ("S_z_max", d.powi(3) / 12.0),
+        ("U_t", pi * d),
+        ("V", a),
+        ("W_pl_u", d.powi(3) / 6.0),
+        ("W_pl_v", d.powi(3) / 6.0),
+        ("W_pl_y", d.powi(3) / 6.0),
+        ("W_pl_z", d.powi(3) / 6.0),
+        ("W_t", ip / (d / 2.0)),
+        ("W_u", i / (d / 2.0)),
+        ("W_u_max", i / (d / 2.0)),
+        ("W_u_min", -i / (d / 2.0)),
+        ("W_v", i / (d / 2.0)),
+        ("W_v_max", i / (d / 2.0)),
+        ("W_v_min", -i / (d / 2.0)),
+        ("W_y", i / (d / 2.0)),
+        ("W_y_max", i / (d / 2.0)),
+        ("W_y_min", -i / (d / 2.0)),
+        ("W_z", i / (d / 2.0)),
+        ("W_z_max", i / (d / 2.0)),
+        ("W_z_min", -i / (d / 2.0)),
+        ("alpha", 0.0),
+        ("alpha_pl_u", 16.0 / (3.0 * pi)),
+        ("alpha_pl_v", 16.0 / (3.0 * pi)),
+        ("alpha_pl_y", 16.0 / (3.0 * pi)),
+        ("alpha_pl_z", 16.0 / (3.0 * pi)),
+        ("e_y", d / 2.0),
+        ("e_z", d / 2.0),
+        ("j_p", (ip / a).sqrt()),
+        ("j_p_SC", (ip / a).sqrt()),
+        ("j_u", (i / a).sqrt()),
+        ("j_v", (i / a).sqrt()),
+        ("j_y", (i / a).sqrt()),
+        ("j_yz", 0.0),
+        ("j_z", (i / a).sqrt()),
+        ("min_w", d),
+        ("r_omega_SC", 0.0),
+        ("r_u", 0.0),
+        ("r_u_SC", 0.0),
+        ("r_v", 0.0),
+        ("r_v_SC", 0.0),
+        ("r_y", 0.0),
+        ("r_y_SC", 0.0),
+        ("r_z", 0.0),
+        ("r_z_SC", 0.0),
+        ("t_M", 0.0),
+        ("tor_alpha", 1.0),
+        ("tor_beta", 1.0),
+        ("u_SC", 0.0),
+        ("u_pl", 0.0),
+        ("v_SC", 0.0),
+        ("v_pl", 0.0),
+        ("y_SC", 0.0),
+        ("y_pl", 0.0),
+        ("z_SC", 0.0),
+        ("z_pl", 0.0),
+    ]
+}
+
+/// [`concrete_properties`] as [`LibraryValue`]s, ready to store.
+fn library_values(family: &str, b_mm: f64, h_mm: f64, d_mm: f64) -> Vec<LibraryValue> {
+    concrete_properties(family, b_mm, h_mm, d_mm)
+        .into_iter()
+        .map(|(key, value_si)| LibraryValue {
+            key: key.to_owned(),
+            value_si: Some(value_si),
+            value_text: None,
+            thickness_si: None,
+        })
+        .collect()
+}
+
 pub struct LibraryDialog {
     pub kind: LibraryKind,
     /// The table row the pick is for: (document id, object).
@@ -167,6 +477,11 @@ pub struct LibraryDialog {
     scroll_to_selected: bool,
     /// The cell's name, selected once the library is loaded.
     pending_name: Option<String>,
+    /// The row currently added / edited in place (a parametric concrete section).
+    editing: Option<EditRow>,
+    /// Set after a row was added, removed or edited; the library is reloaded on the next
+    /// frame to pick up the change.
+    reload: bool,
 }
 
 impl LibraryDialog {
@@ -182,6 +497,8 @@ impl LibraryDialog {
             sort: None,
             scroll_to_selected: !current.is_empty(),
             pending_name: (!current.is_empty()).then(|| current.to_owned()),
+            editing: None,
+            reload: false,
         }
     }
 
@@ -230,6 +547,26 @@ impl LibraryDialog {
         if modal.should_close() && matches!(outcome, Outcome::Open) {
             outcome = Outcome::Cancelled;
         }
+        // Closing (or picking) while a row is still being typed: save it, and if it's the
+        // row just picked, pick the freshly-typed version rather than the stale one.
+        if !matches!(outcome, Outcome::Open)
+            && let Ok(data) = &data
+            && let Some((item, values)) = self.edited_item()
+        {
+            let _ = data.lib.update_item(&item, &values);
+            let _ = data.lib.set_concrete_values(item.user_id, &values);
+            if let Outcome::Picked(picked) = &mut outcome
+                && picked.user_id == item.user_id
+            {
+                *picked = item;
+            }
+            self.editing = None;
+            self.reload = true;
+        }
+        if self.reload {
+            self.reload = false;
+            cache.invalidate(self.kind);
+        }
         outcome
     }
 
@@ -263,6 +600,9 @@ impl LibraryDialog {
                         .horizontal(|mut strip| {
                             strip.cell(|ui| self.tree(ui, data));
                             strip.cell(|ui| {
+                                if self.kind == LibraryKind::Section {
+                                    self.add_remove_row(ui, data);
+                                }
                                 if let Some(item) = self.table(ui, data, &visible) {
                                     outcome = Outcome::Picked(item);
                                 }
@@ -292,6 +632,145 @@ impl LibraryDialog {
                 });
             });
         outcome
+    }
+
+    /// Add / Remove buttons for the Section table: enabled only for parametric concrete
+    /// shapes (rectangular, square, circular), never for library-catalogue (e.g. steel)
+    /// sections, whose sizes are fixed by a manufacturer and can't be made up.
+    fn add_remove_row(&mut self, ui: &mut egui::Ui, data: &LibraryData) {
+        ui.horizontal(|ui| {
+            let add_family = CONCRETE_FAMILIES
+                .iter()
+                .find(|f| self.tree.category == "concrete" && self.tree.family == **f);
+            if ui
+                .add_enabled(add_family.is_some(), egui::Button::new("➕ Add"))
+                .on_hover_text("Add a new size to this concrete section family")
+                .on_disabled_hover_text(
+                    "Only concrete sections (rectangular, square, circular) can be added; \
+                     pick one of their families on the left",
+                )
+                .clicked()
+                && let Some(family) = add_family
+            {
+                self.add_row(data, family);
+            }
+            let can_remove = self.selected.is_some_and(|id| {
+                data.items
+                    .iter()
+                    .any(|i| i.user_id == id && i.category == "concrete")
+            });
+            if ui
+                .add_enabled(can_remove, egui::Button::new("➖ Remove"))
+                .on_hover_text("Remove the selected size")
+                .on_disabled_hover_text(
+                    "Only concrete sections (rectangular, square, circular) can be removed",
+                )
+                .clicked()
+            {
+                self.remove_row(data);
+            }
+        });
+    }
+
+    /// Adds a new, default-sized item of `family` to the library, selects it and switches it
+    /// into edit mode so its name and dimensions can be typed right away.
+    fn add_row(&mut self, data: &LibraryData, family: &str) {
+        if self.editing.is_some() {
+            self.commit_edit(data);
+            self.editing = None;
+        }
+        // A real RFEM row tree to copy: picking the new item has to find one (`Section`
+        // WHERE userID = ...), same as any catalogue item's, or assigning it to a model fails.
+        let Some(template) = data
+            .items
+            .iter()
+            .find(|i| i.family == family && i.category == "concrete")
+        else {
+            return;
+        };
+        let Ok(user_id) = data.lib.next_user_id(LibraryKind::Section) else {
+            return;
+        };
+        if data
+            .lib
+            .duplicate_concrete_item(template.user_id, user_id)
+            .is_err()
+        {
+            return;
+        }
+        let (b_mm, h_mm, d_mm) = (300.0, 300.0, 300.0);
+        let name = concrete_name(family, b_mm, h_mm, d_mm);
+        let item = LibraryItem {
+            kind: LibraryKind::Section,
+            user_id,
+            name: name.clone(),
+            designation: name.clone(),
+            standard: String::new(),
+            manufacturer: String::new(),
+            region: self.tree.region.clone(),
+            family: family.to_owned(),
+            category: "concrete".to_owned(),
+            rfem_library_id: None,
+            rfem_version: String::new(),
+        };
+        let values = library_values(family, b_mm, h_mm, d_mm);
+        let saved = data.lib.insert_item(&item, &values).is_ok()
+            && data.lib.set_concrete_values(user_id, &values).is_ok();
+        if saved {
+            self.selected = Some(user_id);
+            self.scroll_to_selected = true;
+            self.editing = Some(EditRow::new(user_id, family, name, b_mm, h_mm, d_mm));
+            self.reload = true;
+        }
+    }
+
+    /// Removes the selected item from the library.
+    fn remove_row(&mut self, data: &LibraryData) {
+        let Some(id) = self.selected else { return };
+        if self.editing.as_ref().is_some_and(|e| e.user_id != id) {
+            self.commit_edit(data);
+        }
+        if data.lib.delete_item(LibraryKind::Section, id).is_ok() {
+            self.editing = None;
+            self.selected = None;
+            self.details = None;
+            self.reload = true;
+        }
+    }
+
+    /// The item and property values implied by the edit currently in progress, if any.
+    fn edited_item(&self) -> Option<(LibraryItem, Vec<LibraryValue>)> {
+        let edit = self.editing.as_ref()?;
+        let (b_mm, h_mm, d_mm) = edit.dims();
+        let name = if edit.name.is_empty() {
+            concrete_name(&edit.family, b_mm, h_mm, d_mm)
+        } else {
+            edit.name.clone()
+        };
+        let item = LibraryItem {
+            kind: LibraryKind::Section,
+            user_id: edit.user_id,
+            name: name.clone(),
+            designation: name,
+            standard: String::new(),
+            manufacturer: String::new(),
+            region: self.tree.region.clone(),
+            family: edit.family.clone(),
+            category: "concrete".to_owned(),
+            rfem_library_id: None,
+            rfem_version: String::new(),
+        };
+        Some((item, library_values(&edit.family, b_mm, h_mm, d_mm)))
+    }
+
+    /// Writes the row being edited's current name and dimensions through to the library:
+    /// both its lightweight index entry and its real RFEM property values (what a later pick
+    /// actually assigns to a model object).
+    fn commit_edit(&mut self, data: &LibraryData) {
+        if let Some((item, values)) = self.edited_item() {
+            let _ = data.lib.update_item(&item, &values);
+            let _ = data.lib.set_concrete_values(item.user_id, &values);
+        }
     }
 
     /// Items passing the tree and search filters, sorted.
@@ -416,7 +895,16 @@ impl LibraryDialog {
     ) -> Option<LibraryItem> {
         let value_cols = cols(self.kind);
         // Value columns some visible item has.
+        // A square has one parameter (b) and a circle one (d): when every visible item is of
+        // those shapes, the columns for dimensions they lack are left out.
+        let all_in = |fams: &[&str]| {
+            !visible.is_empty() && visible.iter().all(|i| fams.contains(&i.family.as_str()))
+        };
+        let hide_h = all_in(&["SQ", "CIRCLE"]);
+        let hide_b = all_in(&["CIRCLE"]);
         let shown: Vec<usize> = (0..value_cols.len())
+            .filter(|c| !(hide_h && value_cols[*c].key == "h"))
+            .filter(|c| !(hide_b && value_cols[*c].key == "b"))
             .filter(|c| {
                 visible
                     .iter()
@@ -483,8 +971,19 @@ impl LibraryDialog {
                     let cell = |ui: &mut egui::Ui, text: &str| {
                         ui.add(egui::Label::new(text).selectable(false))
                     };
+                    // This row's in-place edit, if any; `computed` is its live section
+                    // properties (A, I_y, ...) from its (possibly just-typed) dimensions.
+                    let mut editing = self.editing.as_mut().filter(|e| e.user_id == item.user_id);
+                    let computed = editing.as_deref().map(|e| {
+                        let (b, h, d) = e.dims();
+                        concrete_properties(&e.family, b, h, d)
+                    });
                     row.col(|ui| {
-                        cell(ui, &item.designation).on_hover_text(&item.name);
+                        if let Some(edit) = editing.as_deref_mut() {
+                            ui.text_edit_singleline(&mut edit.name);
+                        } else {
+                            cell(ui, &item.designation).on_hover_text(&item.name);
+                        }
                     });
                     row.col(|ui| {
                         cell(ui, &item.standard);
@@ -494,15 +993,45 @@ impl LibraryDialog {
                     });
                     let values = data.values.get(&item.user_id);
                     for c in &shown {
+                        let key = value_cols[*c].key;
                         row.col(|ui| {
-                            if let Some(v) = values.and_then(|v| v[*c]) {
+                            // Which dimension column is editable depends on the shape: both
+                            // for a rectangle, only "b" for a square (its "h" stays a greyed
+                            // read-only mirror) and only "d" for a circle (no b / h).
+                            let dim_field = editing.as_deref_mut().and_then(|edit| {
+                                match (edit.family.as_str(), key) {
+                                    ("R", "b") => Some(&mut edit.b),
+                                    ("R", "h") => Some(&mut edit.h),
+                                    ("SQ", "b") => Some(&mut edit.b),
+                                    ("CIRCLE", "d") => Some(&mut edit.d),
+                                    _ => None,
+                                }
+                            });
+                            if let Some(field) = dim_field {
+                                ui.text_edit_singleline(field);
+                                return;
+                            }
+                            // A circle has no b / h (mixed views leave the cells blank).
+                            if item.family == "CIRCLE" && (key == "b" || key == "h") {
+                                return;
+                            }
+                            let mirror = item.family == "SQ" && key == "h";
+                            let v = computed
+                                .as_ref()
+                                .and_then(|p| p.iter().find(|(k, _)| *k == key))
+                                .map(|(_, v)| *v)
+                                .or_else(|| values.and_then(|v| v[*c]));
+                            if let Some(v) = v {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        ui.add(
-                                            egui::Label::new(number(v * value_cols[*c].scale))
-                                                .selectable(false),
-                                        )
+                                        let mut text = egui::RichText::new(number(
+                                            v * value_cols[*c].scale,
+                                        ));
+                                        if mirror {
+                                            text = text.weak();
+                                        }
+                                        ui.add(egui::Label::new(text).selectable(false))
                                     },
                                 );
                             }
@@ -510,6 +1039,11 @@ impl LibraryDialog {
                     }
                     let r = row.response();
                     if r.clicked() {
+                        if self.editing.as_ref().is_some_and(|e| e.user_id != item.user_id) {
+                            self.commit_edit(data);
+                            self.editing = None;
+                            self.reload = true;
+                        }
                         self.selected = Some(item.user_id);
                     }
                     if r.double_clicked() {

@@ -151,6 +151,11 @@ impl Schema {
     fn is_object_table(&self, table: &str) -> bool {
         self.has_column(table, "userID")
     }
+
+    /// List tables belonging to `table` (prefix-matched during schema read).
+    pub fn list_tables(&self, table: &str) -> &[String] {
+        self.lists.get(table).map_or(&[], |v| v.as_slice())
+    }
 }
 
 /// A captured object: its rows and list rows, main row first.
@@ -162,6 +167,14 @@ pub struct Proto {
 }
 
 impl Proto {
+    /// (table, id) pairs for every row in the tree.
+    pub fn row_keys(&self) -> Vec<(&str, i64)> {
+        self.rows
+            .iter()
+            .filter_map(|(t, r)| int(get(r, "id")).map(|id| (t.as_str(), id)))
+            .collect()
+    }
+
     /// One line per row: table and its non-null columns (research aid).
     pub fn describe(&self) -> String {
         let mut out = String::new();

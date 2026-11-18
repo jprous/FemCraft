@@ -451,6 +451,61 @@ fn derived_value(
                 None => Sql::Integer(code),
             }))
         }
+        Derived::SectionParameters => {
+            let (Some(Sql::Text(lib)), Some(lib_id)) = (
+                get(impl_row, "librarySection_table"),
+                get(impl_row, "librarySection_id").and_then(int),
+            ) else {
+                return Ok(None);
+            };
+            if lib != "ParametricSection" || cat.table("ParametricSection_parameterValues").is_none() {
+                return Ok(None);
+            }
+            let mut st = conn.prepare_cached(
+                "SELECT value FROM ParametricSection_parameterValues WHERE id = ?1                  ORDER BY container_order",
+            )?;
+            let vals: Vec<String> = st
+                .query_map([lib_id], |r| r.get::<_, f64>(0))?
+                .map(|v| v.map(|v| format!("{}", (v * 1e4).round() / 10.0)))
+                .collect::<Result<_, _>>()?;
+            Ok((!vals.is_empty()).then(|| Sql::Text(vals.join("/"))))
+        }
+        Derived::SurfaceLoadParameter(order, node) => {
+            let table = format!("{impl_name}_NodeAndMagnitudeParameters_loadParameters");
+            let (Some(info), Some(params)) =
+                (cat.table(&table), get(impl_row, "loadParameters_id").and_then(int))
+            else {
+                return Ok(None);
+            };
+            if info.column("node_id").is_none()
+                || info.column("magnitude").is_none()
+                || cat.table("Node").is_none()
+            {
+                return Ok(None);
+            }
+            let sql = if node {
+                format!(
+                    "SELECT n.userID FROM {} p JOIN Node n ON n.id = p.node_id                      WHERE p.id = ?1 AND p.container_order = ?2",
+                    quote(&table)
+                )
+            } else {
+                format!(
+                    "SELECT p.magnitude FROM {} p WHERE p.id = ?1 AND p.container_order = ?2                      AND p.node_id IS NOT NULL",
+                    quote(&table)
+                )
+            };
+            let mut st = conn.prepare_cached(&sql)?;
+            let v = if node {
+                st.query_row(rusqlite::params![params, order], |r| r.get::<_, i64>(0))
+                    .optional()?
+                    .map(Sql::Integer)
+            } else {
+                st.query_row(rusqlite::params![params, order], |r| r.get::<_, f64>(0))
+                    .optional()?
+                    .map(Sql::Real)
+            };
+            Ok(v)
+        }
         Derived::SurfaceStiffness => {
             let Some((_, _, Sql::Text(t))) = part_value(
                 conn,
@@ -1388,7 +1443,11 @@ fn prototype_filter(kind: ObjectKind, obj: &Object) -> Vec<(&'static str, Value)
     let t = |k: &'static str, v: &str| vec![(k, Value::Text(v.into()))];
     match kind {
         K::Node => t("type", "TYPE_STANDARD"),
-        K::Line => t("type", "TYPE_POLYLINE"),
+        // A curve (arc, circle, ...) needs a copy of its own type: the type is not editable.
+        K::Line => match obj.get("type") {
+            Value::Text(ty) => t("type", ty),
+            _ => t("type", "TYPE_POLYLINE"),
+        },
         K::Member => t("type", "TYPE_BEAM"),
         K::Surface => t("geometry", "GEOMETRY_PLANE"),
         K::Thickness => t("type", "TYPE_UNIFORM"),

@@ -898,6 +898,10 @@ fn load_dir(code: i64, nodal: bool, local: Option<(Vec3, Vec3, Vec3)>) -> Option
         (11, false, _) => Some(Vec3::X),
         (12, false, _) => Some(Vec3::Y),
         (13, false, _) => Some(Vec3::Z),
+        // Projected global directions (Xp, Yp, Zp): drawn like the plain ones for now.
+        (14, false, _) => Some(Vec3::X),
+        (15, false, _) => Some(Vec3::Y),
+        (16, false, _) => Some(Vec3::Z),
         (0, false, Some((x, _, _))) => Some(x),
         (1, false, Some((_, y, _))) => Some(y),
         (2, false, Some((_, _, z))) => Some(z),
@@ -1008,6 +1012,57 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
     }
 
     for (_, l) in in_case(K::SurfaceLoad) {
+        let world = |no: u32| {
+            node(no).map(|p| dir_world(Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)))
+        };
+        // Varying between two nodes (e.g. soil / water pressure on a wall): p1 at node 1
+        // linearly to p2 at node 2, constant across the direction normal to that line.
+        let varying = (|| {
+            let n1 = world(l.get("varying_node_1").as_i64()? as u32)?;
+            let n2 = world(l.get("varying_node_2").as_i64()? as u32)?;
+            let (m1, m2) = (f(l, "varying_magnitude_1")?, f(l, "varying_magnitude_2")?);
+            ((m1 != 0.0 || m2 != 0.0) && (n2 - n1).length() > 1e-6).then_some((n1, m1, n2, m2))
+        })();
+        if let Some((n1, m1, n2, m2)) = varying {
+            let code = l.get("load_direction").as_i64().unwrap_or(13);
+            let axis = n2 - n1;
+            let (u, span) = (axis.normalize(), axis.length());
+            let peak = m1.abs().max(m2.abs()) as f32;
+            for sn in l.get("surfaces").as_ref_list() {
+                let Some((_, poly)) = surfaces.iter().find(|(no, _)| no == sn) else {
+                    continue;
+                };
+                let srf = model.get(ObjectId::new(K::Surface, *sn));
+                let local = Some(surface_axes(poly, srf));
+                let Some(d) = load_dir(code, false, local) else {
+                    unknown_dir += 1;
+                    continue;
+                };
+                let dw = dir_world(d);
+                let mag_at = |p: Vec3| m1 as f32 + (m2 - m1) as f32 * (p - n1).dot(u) / span;
+                let offsets: Vec<Vec3> = poly
+                    .iter()
+                    .map(|p| -dw * (mag_at(*p) / peak * len))
+                    .collect();
+                prism_varying(s, poly, &offsets, SURFACE_LOAD_FILL, SURFACE_LOAD);
+                let c = poly.iter().copied().sum::<Vec3>() / poly.len() as f32;
+                let mc = mag_at(c);
+                if mc.abs() > 1e-6 * peak {
+                    let toward = dw * mc.signum();
+                    s.arrow(c, toward, len * 0.9 * (mc.abs() / peak).max(0.25), SURFACE_LOAD);
+                }
+                s.labels.push(Label {
+                    pos: c - dw * len * 1.25 * mc.signum(),
+                    text: format!(
+                        "{} - {}",
+                        kn(m1.abs(), "kN/m²").trim_end_matches(" kN/m²"),
+                        kn(m2.abs(), "kN/m²")
+                    ),
+                    color: SURFACE_LOAD,
+                });
+            }
+            continue;
+        }
         let Some(mag) = f(l, "uniform_magnitude").filter(|v| *v != 0.0) else {
             continue;
         };
@@ -1062,6 +1117,24 @@ fn surface_load_block(s: &mut Scene, poly: &[Vec3], dir: Vec3, h: f32) {
 /// filled far face and sides, outlined far edges and side edges.
 fn prism(s: &mut Scene, poly: &[Vec3], offset: Vec3, fill: [f32; 4], edge: [f32; 4]) {
     let top: Vec<Vec3> = poly.iter().map(|p| *p + offset).collect();
+    for [a, b, c] in triangulate(&top) {
+        s.tri(a, b, c, fill);
+    }
+    let n = poly.len();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (a, b, ta, tb) = (poly[i], poly[j], top[i], top[j]);
+        s.tri(a, b, tb, fill);
+        s.tri(a, tb, ta, fill);
+        s.line(ta, tb, edge);
+        s.line(a, ta, edge);
+    }
+}
+
+/// Like [`prism`], with a separate offset (world) per polygon vertex: a wedge for a load
+/// varying across the surface. Vertices with a zero offset stay on the surface.
+fn prism_varying(s: &mut Scene, poly: &[Vec3], offsets: &[Vec3], fill: [f32; 4], edge: [f32; 4]) {
+    let top: Vec<Vec3> = poly.iter().zip(offsets).map(|(p, o)| *p + *o).collect();
     for [a, b, c] in triangulate(&top) {
         s.tri(a, b, c, fill);
     }
@@ -1234,6 +1307,39 @@ mod tests {
             },
         );
         assert!(hidden.member_lines.is_empty() && hidden.lines.is_empty());
+    }
+
+    /// Soil / water pressure on the Chamber model's walls (linear between two nodes) is drawn.
+    #[test]
+    fn varying_wall_loads_are_drawn() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/private/Chamber 4x4x6.rf6");
+        if !path.is_file() {
+            return;
+        }
+        let doc = femcraft_rfdb::RfDocument::open(&path).unwrap();
+        let vis = Visibility::default();
+        let mut with = vis.clone();
+        with.load_case = 5;
+        let none = {
+            let mut v = vis.clone();
+            v.load_case = 1;
+            build(&doc.model, &v)
+        };
+        for lc in [6, 8] {
+            let mut v = vis.clone();
+            v.load_case = lc;
+            let sc = build(&doc.model, &v);
+            assert!(sc.notes.is_empty(), "LC{lc}: {:?}", sc.notes);
+        }
+        let sc = build(&doc.model, &with);
+        assert!(sc.triangles.len() > none.triangles.len(), "wedges drawn");
+        assert!(sc.notes.is_empty(), "{:?}", sc.notes);
+        assert!(
+            sc.labels.iter().any(|l| l.text == "0 - 31 kN/m²"),
+            "{:?}",
+            sc.labels.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
     }
 
     #[test]

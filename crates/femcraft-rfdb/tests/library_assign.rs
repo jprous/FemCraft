@@ -224,3 +224,57 @@ fn reassigning_repairs_incomplete_section() {
             .is_empty()
     );
 }
+
+/// A user-edited parametric concrete section assigned to a model: the b / h RFEM shows on
+/// its "Parametric - Massive I" tab (`ParametricSection_parameterValues`) are the edited ones.
+#[test]
+fn assign_edited_concrete_section() {
+    use femcraft_rfdb::LibraryValue;
+    let Some((lib, src)) = setup("Prokon Model1 - FemCraft node2.rf6") else {
+        return;
+    };
+    let uid = 99997_i64;
+    let _ = lib.delete_item(LibraryKind::Section, uid);
+    lib.duplicate_concrete_item(883, uid).unwrap();
+    let v = |k: &str, x: f64| LibraryValue {
+        key: k.into(),
+        value_si: Some(x),
+        value_text: None,
+        thickness_si: None,
+    };
+    lib.set_concrete_values(uid, &[v("b", 0.35), v("h", 0.8)]).unwrap();
+    let it = LibraryItem {
+        kind: LibraryKind::Section,
+        user_id: uid,
+        name: "R_M1 350/800".into(),
+        designation: "R_M1 350/800".into(),
+        standard: String::new(),
+        manufacturer: String::new(),
+        region: String::new(),
+        family: "R".into(),
+        category: "concrete".into(),
+        rfem_library_id: None,
+        rfem_version: String::new(),
+    };
+    lib.insert_item(&it, &[]).unwrap();
+
+    let mut doc = RfDocument::open(&src).unwrap();
+    let section = ObjectId::new(K::Section, 1);
+    let res = doc.assign_library_item(section, &lib, &it);
+    let conn = Connection::open(doc.archive.db_path()).unwrap();
+    let dims: Vec<f64> = conn
+        .prepare(
+            "SELECT pv.value FROM Section s JOIN SectionImplParametricMassive m ON m.id = s.impl_id \
+             JOIN ParametricSection_parameterValues pv ON pv.id = m.librarySection_id \
+             WHERE s.userID = 1 ORDER BY pv.container_order",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect();
+    drop(conn);
+    let _ = lib.delete_item(LibraryKind::Section, uid);
+    res.unwrap();
+    assert_eq!(dims, vec![0.35, 0.8]);
+}
