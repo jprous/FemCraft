@@ -35,6 +35,102 @@ struct Persisted {
     /// Display settings (absent in files from older versions).
     #[serde(default)]
     display: Option<SavedDisplay>,
+    /// Settings menu (paths).
+    #[serde(default)]
+    settings: AppSettings,
+}
+
+/// Settings menu: locations FemCraft works with. `None` = the default / automatic one.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct AppSettings {
+    section_db: Option<PathBuf>,
+    material_db: Option<PathBuf>,
+    /// `RFEM6Server.exe`.
+    rfem_server: Option<PathBuf>,
+    rfem_port: u16,
+    /// Dlubal account e-mail and licence for the server (the password is only read from the
+    /// environment, see `femcraft_rfem::PASSWORD_ENV`).
+    rfem_email: String,
+    rfem_license: String,
+    /// Where dialogs start and calculated models are put (default: the folder FemCraft was
+    /// started in).
+    working_dir: Option<PathBuf>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            section_db: None,
+            material_db: None,
+            rfem_server: None,
+            rfem_port: femcraft_rfem::DEFAULT_PORT,
+            rfem_email: String::new(),
+            rfem_license: String::new(),
+            working_dir: None,
+        }
+    }
+}
+
+impl AppSettings {
+    fn rfem(&self) -> femcraft_rfem::RfemConfig {
+        femcraft_rfem::RfemConfig {
+            server_exe: self
+                .rfem_server
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(femcraft_rfem::DEFAULT_SERVER)),
+            port: self.rfem_port,
+            email: Some(self.rfem_email.clone())
+                .filter(|e| !e.is_empty())
+                .or_else(|| femcraft_rfem::RfemConfig::default().email),
+            license: Some(self.rfem_license.clone())
+                .filter(|e| !e.is_empty())
+                .or_else(|| femcraft_rfem::RfemConfig::default().license),
+        }
+    }
+
+    /// Makes the choices take effect (library files, working directory).
+    fn apply(&self) {
+        use femcraft_rfdb::{LibraryKind, set_db_override};
+        set_db_override(LibraryKind::Section, self.section_db.clone());
+        set_db_override(LibraryKind::Material, self.material_db.clone());
+        if let Some(d) = self.working_dir.as_ref().filter(|d| d.is_dir()) {
+            let _ = std::env::set_current_dir(d);
+        }
+    }
+}
+
+/// The RFEM server dialog fields while it is open (applied with Save).
+struct RfemDraft {
+    server: String,
+    port: u16,
+    email: String,
+    license: String,
+    /// Typed password; empty keeps the saved one.
+    password: String,
+    error: Option<String>,
+}
+
+impl RfemDraft {
+    fn new(s: &AppSettings) -> Self {
+        Self {
+            server: s.rfem().server_exe.display().to_string(),
+            port: s.rfem_port,
+            email: s.rfem_email.clone(),
+            license: s.rfem_license.clone(),
+            password: String::new(),
+            error: None,
+        }
+    }
+}
+
+
+/// The library database in use for `kind`, for the Settings menu.
+fn library_db_in_use(kind: femcraft_rfdb::LibraryKind) -> String {
+    femcraft_rfdb::Library::find(&femcraft_rfdb::Library::default_dirs())
+        .map(|l| l.db_path(kind))
+        .filter(|p| p.is_file())
+        .map_or("not found".to_owned(), |p| p.display().to_string())
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -136,6 +232,11 @@ pub struct FemCraftApp {
     render_state: Option<eframe::egui_wgpu::RenderState>,
     /// MCP requests from the HTTP listener (see `femcraft_mcp::http`).
     mcp: Option<std::sync::mpsc::Receiver<femcraft_mcp::http::Request>>,
+    settings: AppSettings,
+    /// The RFEM server dialog (Settings > RFEM server…) while open.
+    rfem_dialog: Option<RfemDraft>,
+    /// A calculation running on another thread (Solve menu).
+    solve_job: Option<(u64, std::sync::mpsc::Receiver<Result<femcraft_rfem::Solved, String>>)>,
 }
 
 impl FemCraftApp {
@@ -166,6 +267,9 @@ impl FemCraftApp {
             tables: panels::TableState::default(),
             render_state: Some(render_state),
             mcp: None,
+            settings: AppSettings::default(),
+            rfem_dialog: None,
+            solve_job: None,
         };
         // Built-in MCP server on 127.0.0.1 (FEMCRAFT_MCP_PORT, 0 = off). A second instance
         // finds the port taken and runs without it.
@@ -187,12 +291,14 @@ impl FemCraftApp {
             }
             app.recent = saved.recent;
             app.ribbon_minimized = saved.ribbon_minimized;
+            app.settings = saved.settings;
             if let Some(d) = saved.display {
                 app.display = d.vis;
                 app.show_axes = d.show_axes;
                 app.grid = d.grid.into();
             }
         }
+        app.settings.apply();
         // `femcraft a.rf6 [b.rf6 ...] [--lc=N] [--local-axes]` opens the files directly.
         let args: Vec<String> = std::env::args().skip(1).collect();
         for path in args.iter().filter(|a| !a.starts_with("--")) {
@@ -234,6 +340,8 @@ impl FemCraftApp {
             .filter(|d| d.is_dir())
         {
             dialog = dialog.set_directory(dir);
+        } else {
+            dialog = dialog.set_directory(self.working_dir());
         }
         if let Some(paths) = dialog.pick_files() {
             for path in paths {
@@ -396,8 +504,14 @@ impl FemCraftApp {
             .set_title("Save RFEM model as")
             .add_filter("RFEM 6 model", &["rf6"])
             .set_file_name(d.title());
-        if let Some(dir) = d.path.parent().filter(|p| p.is_dir()) {
+        if let Some(dir) = d
+            .path
+            .parent()
+            .filter(|p| p.is_dir() && !p.as_os_str().is_empty())
+        {
             dialog = dialog.set_directory(dir);
+        } else {
+            dialog = dialog.set_directory(self.working_dir());
         }
         if let Some(mut path) = dialog.save_file() {
             if path.extension().is_none() {
@@ -566,6 +680,8 @@ impl FemCraftApp {
                     ui.separator();
                     ui.checkbox(&mut self.ribbon_minimized, "Minimise ribbon");
                 });
+                ui.menu_button("Solve", |ui| self.solve_menu(ui));
+                ui.menu_button("Settings", |ui| self.settings_menu(ui));
                 ui.menu_button("Windows", |ui| self.windows_menu(ui));
                 ui.menu_button("Help", |ui| {
                     ui.label(format!("FemCraft {}", env!("CARGO_PKG_VERSION")));
@@ -573,6 +689,366 @@ impl FemCraftApp {
                 });
             });
         });
+    }
+
+    /// The folder dialogs start in and calculated models go to.
+    fn working_dir(&self) -> PathBuf {
+        self.settings
+            .working_dir
+            .clone()
+            .filter(|d| d.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default()
+    }
+
+    /// One Settings item: a button showing the current location; returns the file or folder
+    /// chosen in the dialog it opens.
+    fn path_item(
+        ui: &mut egui::Ui,
+        label: &str,
+        shown: &str,
+        hint: &str,
+        dialog: rfd::FileDialog,
+        folder: bool,
+    ) -> Option<PathBuf> {
+        if !ui
+            .button(format!("{label}\n{shown}"))
+            .on_hover_text(hint)
+            .clicked()
+        {
+            return None;
+        }
+        ui.close();
+        if folder {
+            dialog.pick_folder()
+        } else {
+            dialog.pick_file()
+        }
+    }
+
+    /// Settings: click an item to choose its location.
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        use femcraft_rfdb::LibraryKind;
+        let auto = |p: &Option<PathBuf>, in_use: String| match p {
+            Some(p) => p.display().to_string(),
+            None => format!("{in_use}  (automatic)"),
+        };
+        let mut changed = false;
+        ui.weak("Click an item to choose its location");
+        ui.separator();
+
+        let shown = auto(&self.settings.section_db, library_db_in_use(LibraryKind::Section));
+        let mut d = rfd::FileDialog::new()
+            .set_title("Section database (sections.db)")
+            .add_filter("SQLite database", &["db"]);
+        if let Some(dir) = self.settings.section_db.as_ref().and_then(|p| p.parent()) {
+            d = d.set_directory(dir);
+        }
+        if let Some(p) = Self::path_item(
+            ui,
+            "Section database…",
+            &shown,
+            "sections.db: FemCraft's section library",
+            d,
+            false,
+        ) {
+            self.settings.section_db = Some(p);
+            changed = true;
+        }
+
+        let shown = auto(&self.settings.material_db, library_db_in_use(LibraryKind::Material));
+        let mut d = rfd::FileDialog::new()
+            .set_title("Material database (materials.db)")
+            .add_filter("SQLite database", &["db"]);
+        if let Some(dir) = self.settings.material_db.as_ref().and_then(|p| p.parent()) {
+            d = d.set_directory(dir);
+        }
+        if let Some(p) = Self::path_item(
+            ui,
+            "Material database…",
+            &shown,
+            "materials.db: FemCraft's material library",
+            d,
+            false,
+        ) {
+            self.settings.material_db = Some(p);
+            changed = true;
+        }
+
+        if ui
+            .button(format!(
+                "RFEM server…\n{}",
+                self.settings.rfem().server_exe.display()
+            ))
+            .on_hover_text("RFEM6Server.exe location, port and Dlubal login, used by Solve")
+            .clicked()
+        {
+            ui.close();
+            self.rfem_dialog = Some(RfemDraft::new(&self.settings));
+        }
+
+        let shown = auto(
+            &self.settings.working_dir,
+            std::env::current_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
+        );
+        let d = rfd::FileDialog::new()
+            .set_title("FemCraft working directory")
+            .set_directory(self.working_dir());
+        if let Some(p) = Self::path_item(
+            ui,
+            "Working directory…",
+            &shown,
+            "Where dialogs start and calculated models (folder 'solved') go",
+            d,
+            true,
+        ) {
+            self.settings.working_dir = Some(p);
+            changed = true;
+        }
+        ui.separator();
+        if ui.button("Reset to defaults").clicked() {
+            ui.close();
+            self.settings = AppSettings::default();
+            changed = true;
+        }
+        if changed {
+            self.settings.apply();
+        }
+    }
+
+    /// Settings > RFEM server…: location, port and Dlubal login of the RFEM server.
+    fn rfem_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.rfem_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("RFEM server")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("rfem_server_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("RFEM6Server.exe");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut d.server).desired_width(320.0));
+                            if ui.button("Browse…").clicked() {
+                                let mut f = rfd::FileDialog::new()
+                                    .set_title("RFEM server (RFEM6Server.exe)")
+                                    .add_filter("Program", &["exe"]);
+                                if let Some(dir) =
+                                    Path::new(&d.server).parent().filter(|p| p.is_dir())
+                                {
+                                    f = f.set_directory(dir);
+                                }
+                                if let Some(p) = f.pick_file() {
+                                    d.server = p.display().to_string();
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Web service port");
+                        ui.add(egui::DragValue::new(&mut d.port).range(1..=65535));
+                        ui.end_row();
+                        ui.label("Dlubal e-mail");
+                        ui.add(egui::TextEdit::singleline(&mut d.email).desired_width(320.0));
+                        ui.end_row();
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.password)
+                                .password(true)
+                                .desired_width(320.0),
+                        );
+                        ui.end_row();
+                        ui.label("Licence (optional)");
+                        ui.add(egui::TextEdit::singleline(&mut d.license).desired_width(320.0));
+                        ui.end_row();
+                    });
+                let saved = !d.email.is_empty() && femcraft_rfem::has_saved_password(&d.email);
+                ui.weak(if saved {
+                    "A password is saved for this e-mail (Windows Credential Manager); \
+                     leave the field empty to keep it."
+                } else {
+                    "The password is saved in the Windows Credential Manager, \
+                     not in the settings file."
+                });
+                ui.weak("Solve logs the server in with this account. An open RFEM window is used instead.");
+                if let Some(e) = &d.error {
+                    ui.colored_label(Color32::LIGHT_RED, e);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if saved && ui.button("Remove saved password").clicked() {
+                        match femcraft_rfem::store_password(&d.email, "") {
+                            Ok(()) => d.error = None,
+                            Err(e) => d.error = Some(e),
+                        }
+                    }
+                });
+            });
+        if save {
+            let email = d.email.trim().to_owned();
+            if !d.password.is_empty() {
+                if email.is_empty() {
+                    d.error = Some("Enter the e-mail the password belongs to".into());
+                    self.rfem_dialog = Some(d);
+                    return;
+                }
+                if let Err(e) = femcraft_rfem::store_password(&email, &d.password) {
+                    d.error = Some(format!("Could not save the password: {e}"));
+                    self.rfem_dialog = Some(d);
+                    return;
+                }
+            }
+            let default_exe = PathBuf::from(femcraft_rfem::DEFAULT_SERVER);
+            self.settings.rfem_server = Some(PathBuf::from(d.server.trim()))
+                .filter(|p| !p.as_os_str().is_empty() && *p != default_exe);
+            self.settings.rfem_port = d.port;
+            self.settings.rfem_email = email;
+            self.settings.rfem_license = d.license.trim().to_owned();
+            self.settings.apply();
+            self.notice = Some("RFEM server settings saved".into());
+        } else if open && !cancel {
+            self.rfem_dialog = Some(d);
+        }
+    }
+
+
+    /// Solve: calculate the active model with the RFEM server on another thread.
+    fn solve_menu(&mut self, ui: &mut egui::Ui) {
+        let busy = self.solve_job.is_some();
+        let label = if busy {
+            "Calculating…"
+        } else {
+            "Calculate with RFEM server"
+        };
+        if ui
+            .add_enabled(self.active.is_some() && !busy, egui::Button::new(label))
+            .on_hover_text("Saves the model, then runs calculate_all on the RFEM 6 server")
+            .clicked()
+        {
+            ui.close();
+            if let Err(e) = self.start_solve() {
+                self.notice = None;
+                self.message = Some(e);
+            }
+        }
+        ui.weak(format!(
+            "Server: {}",
+            self.settings.rfem().server_exe.display()
+        ));
+    }
+
+    /// The active model's `.rf6` path, saved first when it has unsaved edits.
+    fn saved_active_path(&mut self) -> Result<PathBuf, String> {
+        let (path, modified) = self
+            .active_doc()
+            .map(|d| (d.path.clone(), d.is_modified()))
+            .ok_or("no model is open")?;
+        if !path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rf6"))
+        {
+            return Err("the model is untitled; save it first (File > Save As)".into());
+        }
+        if modified {
+            self.save_to(&path)?;
+        }
+        Ok(path)
+    }
+
+    /// Saves the active model and starts calculating it.
+    fn start_solve(&mut self) -> Result<(), String> {
+        let path = self.saved_active_path()?;
+        let id = self.active.ok_or("no model is open")?;
+        let cfg = self.settings.rfem();
+        let out = self.working_dir().join("solved");
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.notice = Some(format!("Calculating {} with RFEM…", path.display()));
+        self.message = None;
+        self.solve_job = Some((id, rx));
+        std::thread::spawn(move || {
+            let _ = tx.send(femcraft_rfem::solve(&cfg, &path, &out));
+        });
+        Ok(())
+    }
+
+    /// Makes the calculated copy `solved` the model's own file and reloads the open model from
+    /// it in place, so the results simply appear in the same tab (view, selection and display
+    /// settings are kept). The file it replaces is kept as `<name>.rf6bak`. The calculated copy
+    /// is removed. A model edited meanwhile is not replaced: the calculated copy opens as a
+    /// separate tab instead. Returns the model's path.
+    fn adopt_solved(&mut self, id: u64, solved: &Path) -> Result<PathBuf, String> {
+        let Some(pos) = self.docs.iter().position(|d| d.id == id) else {
+            // The tab was closed meanwhile: show the calculated copy.
+            self.try_open(solved)?;
+            return Ok(solved.to_owned());
+        };
+        if self.docs[pos].is_modified() {
+            self.try_open(solved)?;
+            return Ok(solved.to_owned());
+        }
+        let target = self.docs[pos].path.clone();
+        std::fs::copy(&target, target.with_extension("rf6bak"))
+            .map_err(|e| format!("backup of {}: {e}", target.display()))?;
+        std::fs::copy(solved, &target)
+            .map_err(|e| format!("replace {}: {e}", target.display()))?;
+        // The scratch folder (`solved`) also holds RFEM's own backup and log files.
+        match solved.parent() {
+            Some(dir) if dir.file_name().is_some_and(|n| n == "solved") => {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            _ => {
+                let _ = std::fs::remove_file(solved);
+            }
+        }
+        let protos = Self::prototype_files();
+        self.docs[pos].reload(&target, protos)?;
+        Ok(target)
+    }
+
+    /// Picks up a finished calculation: the results appear in the open model.
+    fn poll_solve(&mut self, ctx: &egui::Context) {
+        let Some((id, rx)) = &self.solve_job else {
+            return;
+        };
+        let id = *id;
+        match rx.try_recv() {
+            Ok(Ok(done)) => {
+                self.solve_job = None;
+                match self.adopt_solved(id, &done.path) {
+                    Ok(_) => {
+                        self.message = None;
+                        self.notice = Some(format!("Calculated in {:.0} s", done.seconds));
+                    }
+                    Err(e) => {
+                        self.notice = None;
+                        self.message = Some(e);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                self.solve_job = None;
+                self.notice = None;
+                self.message = Some(e);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+            Err(_) => self.solve_job = None,
+        }
     }
 
     /// Windows: the open models (click to switch), close one or all.
@@ -1232,7 +1708,9 @@ impl eframe::App for FemCraftApp {
         {
             d.clear_selection();
         }
+        self.poll_solve(&ui.ctx().clone());
         self.menu_bar(ui);
+        self.rfem_dialog_ui(&ui.ctx().clone());
         self.ribbon(ui);
         self.status_bar(ui);
         for d in &mut self.docs {
@@ -1255,6 +1733,7 @@ impl eframe::App for FemCraftApp {
             tree: dock::for_saving(&self.tree),
             recent: self.recent.clone(),
             ribbon_minimized: self.ribbon_minimized,
+            settings: self.settings.clone(),
             display: Some(SavedDisplay {
                 vis: self.display.clone(),
                 show_axes: self.show_axes,
@@ -1580,6 +2059,20 @@ impl femcraft_mcp::Workspace for FemCraftApp {
         };
         self.save_to(&path)?;
         Ok(path)
+    }
+
+    fn solve(&mut self) -> Result<PathBuf, String> {
+        if self.solve_job.is_some() {
+            return Err("a calculation is already running".into());
+        }
+        let path = self.saved_active_path()?;
+        let id = self.active.ok_or("no model is open")?;
+        let done = femcraft_rfem::solve(
+            &self.settings.rfem(),
+            &path,
+            &self.working_dir().join("solved"),
+        )?;
+        self.adopt_solved(id, &done.path)
     }
 
     fn models(&self) -> Vec<femcraft_mcp::ModelInfo> {

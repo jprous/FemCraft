@@ -93,6 +93,8 @@ pub struct Document {
     pub results: Option<femcraft_rfdb::ResultSet>,
     /// The Results panel's current selection.
     pub results_view: crate::results_panel::ResultsView,
+    /// The result case last mirrored into the Display panel's load case.
+    synced_case: Option<(femcraft_rfdb::CaseKind, u32)>,
     /// Bumped on every edit, so the 3D view is rebuilt.
     pub revision: u64,
     pub load_cases: Vec<(u32, String)>,
@@ -150,6 +152,7 @@ impl Document {
             fe_mesh,
             results,
             results_view: crate::results_panel::ResultsView::default(),
+            synced_case: None,
             result_disp: None,
             result_legend: None,
             revision: 0,
@@ -166,6 +169,41 @@ impl Document {
             built_from: None,
             drag_box: None,
         })
+    }
+
+    /// Reloads the model from `path` in place, as when RFEM has calculated it: the data,
+    /// FE mesh and results are replaced while the camera, selection and display settings are
+    /// kept, so the results just become available in the open tab.
+    pub fn reload(&mut self, path: &Path, prototypes: Vec<PathBuf>) -> Result<(), String> {
+        let fresh = Self::open(self.id, path)?;
+        let Self {
+            mut rf,
+            fe_mesh,
+            results,
+            load_cases,
+            warnings,
+            vis,
+            ..
+        } = fresh;
+        rf.prototype_files = prototypes;
+        self.rf = rf;
+        self.fe_mesh = fe_mesh;
+        self.results = results;
+        self.warnings = warnings;
+        if !load_cases.iter().any(|(n, _)| *n == self.vis.load_case) {
+            self.vis.load_case = vis.load_case;
+        }
+        self.load_cases = load_cases;
+        self.selection
+            .retain(|id| self.rf.model.get(*id).is_some());
+        self.results_view = crate::results_panel::ResultsView::default();
+        self.synced_case = None;
+        self.result_disp = None;
+        self.result_legend = None;
+        self.path = path.to_owned();
+        self.revision += 1;
+        self.built_from = None;
+        Ok(())
     }
 
     /// A new, unsaved model from the blank model `template`, titled `name` (no extension, so
@@ -218,6 +256,16 @@ impl Document {
         // Picking a result quantity in the Results panel turns the Results display on.
         if std::mem::take(&mut self.results_view.picked) {
             self.vis.results = true;
+        }
+        // Choosing a load case in the Results panel shows that case's loads in the Display
+        // panel too (combinations and design situations have no loads of their own to show).
+        if self.results_view.selected != self.synced_case {
+            self.synced_case = self.results_view.selected;
+            if let Some((femcraft_rfdb::CaseKind::LoadCase, no)) = self.synced_case
+                && self.load_cases.iter().any(|(n, _)| *n == no)
+            {
+                self.vis.load_case = no;
+            }
         }
         // Load results for the selected case and pick an exaggeration factor before hashing.
         self.update_result_overlay();
@@ -349,6 +397,33 @@ impl Document {
             let mag = self.results_view.magnification.max(1.0);
             scene::add_result_surface(&mut self.scene, mesh, &disps, comp, mag, ext)
         };
+        // Member axes coloured by the quantity (members are plotted as lines).
+        let member_lines: HashSet<u32> = self
+            .rf
+            .model
+            .iter_kind(ObjectKind::Member)
+            .filter_map(|(_, m)| m.get("line").as_ref_no())
+            .collect();
+        let mut member_plotted = false;
+        let range = if scene::is_contact(comp) || member_lines.is_empty() {
+            range
+        } else {
+            let mag = self.results_view.magnification.max(1.0);
+            let m = scene::add_result_members(
+                &mut self.scene,
+                mesh,
+                &disps,
+                &member_lines,
+                comp,
+                mag,
+                ext,
+            );
+            member_plotted = m.is_some();
+            match (range, m) {
+                (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
+                (a, b) => a.or(b),
+            }
+        };
         if let Some((min, max)) = range {
             let (label, unit, factor) = comp.display();
             self.result_legend = Some(ResultLegend {
@@ -360,7 +435,7 @@ impl Document {
             });
         }
         // Deformed member axes only for a single case (an envelope has no one deformed shape).
-        if scene::is_contact(comp) || disps.len() != 1 {
+        if scene::is_contact(comp) || disps.len() != 1 || member_plotted {
             return;
         }
         let mag = self.results_view.magnification.max(1.0);

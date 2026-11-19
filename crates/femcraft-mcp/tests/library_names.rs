@@ -102,3 +102,44 @@ fn library_names_in_set_methods() {
         .unwrap();
     assert!((a20 - a).abs() < 1e-12, "library area {a}, got {a20}");
 }
+
+/// A parametric concrete size the library lacks is created on demand (and reused afterwards).
+#[test]
+fn concrete_size_created_on_demand() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/private/Prokon Model1 - FemCraft node2.rf6");
+    if !src.is_file() || Library::find(&Library::default_dirs()).is_none() {
+        eprintln!("skipped: model or library missing");
+        return;
+    }
+    let mut ws = Headless::new(None, vec![]);
+    call(&mut ws, "open_model", json!({"model_path": src})).unwrap();
+    let r = call(
+        &mut ws,
+        "set_section",
+        json!({"value": {"no": 30, "name": "R_M1 0.3048/0.6096", "material": 1}}),
+    )
+    .unwrap();
+    assert_eq!(r["library_item"], "R_M1 304.8/609.6");
+    let again = call(
+        &mut ws,
+        "set_section",
+        json!({"value": {"no": 31, "name": "R_M1 304.8/609.6", "material": 1}}),
+    )
+    .unwrap();
+    assert_eq!(again["library_item"], "R_M1 304.8/609.6");
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("concrete size.rf6");
+    call(&mut ws, "save_as", json!({"model_path": out})).unwrap();
+    let back = RfDocument::open(&out).unwrap();
+    let s = back
+        .model
+        .get(femcraft_model::ObjectId::new(
+            femcraft_model::ObjectKind::Section,
+            30,
+        ))
+        .unwrap();
+    assert!((s.get("A").as_f64().unwrap() - 0.3048 * 0.6096).abs() < 1e-9);
+    assert!((s.get("h").as_f64().unwrap() - 0.6096).abs() < 1e-9);
+}

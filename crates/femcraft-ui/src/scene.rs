@@ -538,6 +538,64 @@ pub fn add_member_deformation(
     }
 }
 
+/// Colours the member axes by a displacement quantity: every FE segment along a member line
+/// takes the RFEM colour band of its mean value, drawn thick on the displaced shape. Returns the
+/// value range `(min, max)` or `None` when `component` is not a displacement or no member line
+/// has results.
+pub fn add_result_members(
+    s: &mut Scene,
+    mesh: &femcraft_rfdb::FeMesh,
+    disps: &[&femcraft_rfdb::Displacements],
+    member_lines: &HashSet<u32>,
+    component: femcraft_rfdb::ResultComponent,
+    magnification: f64,
+    extremum: femcraft_rfdb::Extremum,
+) -> Option<(f32, f32)> {
+    /// Thicker than model lines so the colours read.
+    const RESULT_WIDTH: f32 = 4.5;
+    let first = disps.first()?;
+    let magnification = if disps.len() == 1 { magnification } else { 0.0 };
+    let value = |no: u32| {
+        let values: Vec<f64> = disps
+            .iter()
+            .filter_map(|d| d.node(no).and_then(|u| displacement_scalar(component, u)))
+            .collect();
+        extremum.reduce(values.into_iter())
+    };
+    let mut segments = Vec::new();
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for (line_no, chain) in &mesh.lines {
+        if !member_lines.contains(line_no) {
+            continue;
+        }
+        for pair in chain.windows(2) {
+            let (Some(pa), Some(pb), Some(va), Some(vb)) = (
+                displaced(mesh, first, pair[0], magnification),
+                displaced(mesh, first, pair[1], magnification),
+                value(pair[0]),
+                value(pair[1]),
+            ) else {
+                continue;
+            };
+            lo = lo.min(va).min(vb);
+            hi = hi.max(va).max(vb);
+            segments.push((pa, pb, 0.5 * (va + vb)));
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    let bands = femcraft_render::colorscale::BAND_COUNT;
+    let step = ((hi - lo) / bands as f64).max(f64::MIN_POSITIVE);
+    for (a, b, v) in segments {
+        let band = (((v - lo) / step).floor() as isize).clamp(0, bands as isize - 1) as usize;
+        let c = femcraft_render::colorscale::rfem_band(band);
+        s.lines.push(LineVertex::new(a, c).with_width(RESULT_WIDTH));
+        s.lines.push(LineVertex::new(b, c).with_width(RESULT_WIDTH));
+    }
+    Some((lo as f32, hi as f32))
+}
+
 pub fn build(model: &Model, vis: &Visibility) -> Scene {
     let mut s = Scene::default();
     let node = |no: u32| model.node_position(no).map(to_world);
@@ -1518,6 +1576,53 @@ mod tests {
         // A surface without a spring support paints nothing.
         let mut s2 = Scene::default();
         assert!(add_contact_surface(&mut s2, &mesh, &[&disp], &HashMap::new(), femcraft_rfdb::Extremum::Max).is_none());
+    }
+
+    /// Member results plot as one connected polyline per member line (no segment returns to the
+    /// start). Needs a solved members-only model in `FEMCRAFT_TEST_MEMBER_RESULTS`.
+    #[test]
+    fn member_results_form_a_polyline() {
+        use femcraft_rfdb::{CaseKind, Extremum, ResultComponent, RfDocument};
+        let Some(path) = std::env::var_os("FEMCRAFT_TEST_MEMBER_RESULTS") else {
+            return;
+        };
+        let doc = RfDocument::open(std::path::Path::new(&path)).unwrap();
+        let mesh = doc.fe_mesh().unwrap().unwrap();
+        let id = doc
+            .results()
+            .unwrap()
+            .unwrap()
+            .cases
+            .iter()
+            .find(|c| c.kind == CaseKind::LoadCase && c.no == 1)
+            .unwrap()
+            .solver_id;
+        let disp = doc.displacements(id, mesh.nodes.len()).unwrap().unwrap();
+        let members: HashSet<u32> = mesh.lines.iter().map(|l| l.0).collect();
+        let mut s = Scene::default();
+        add_result_members(
+            &mut s,
+            &mesh,
+            &[&disp],
+            &members,
+            ResultComponent::GlobalUz,
+            1000.0,
+            Extremum::Both,
+        )
+        .unwrap();
+        assert!(s.lines.len() >= 100 && s.lines.len() % 2 == 0);
+        // Each segment starts where the previous one ended, except at the start of a new member.
+        let mut breaks = 0;
+        for w in s.lines.chunks(2).collect::<Vec<_>>().windows(2) {
+            let (end, next) = (Vec3::from(w[0][1].pos), Vec3::from(w[1][0].pos));
+            if end.distance(next) > 1e-4 {
+                breaks += 1;
+            }
+            // Segments are short (one FE element), never a long chord.
+            let len = Vec3::from(w[1][0].pos).distance(Vec3::from(w[1][1].pos));
+            assert!(len < 1.0, "segment of length {len}");
+        }
+        assert!(breaks <= members.len(), "{breaks} breaks");
     }
 
     #[test]

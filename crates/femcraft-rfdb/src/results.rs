@@ -31,8 +31,13 @@ use crate::{Archive, Error};
 const HISTORY: &str = "solver_ids_history.xml";
 /// Sidecar with the solver / results format version.
 const VERSION_XML: &str = "!solver/solver_version.xml";
-/// Per-case result folders live directly under this prefix (`!solver/RN_...`).
-const RESULT_FOLDER_PREFIX: &str = "!solver/RN";
+/// Per-case result folders live directly under this prefix: `!solver/RN_...` (nodal results of
+/// surface / solid meshes) and `!solver/RO_...` (results of 1D member elements).
+const RESULT_FOLDER_PREFIXES: [&str; 2] = ["!solver/RN", "!solver/RO"];
+
+fn is_result_entry(e: &str) -> bool {
+    RESULT_FOLDER_PREFIXES.iter().any(|p| e.starts_with(p))
+}
 
 /// The four kinds of case a result can belong to, in the order RFEM lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -209,7 +214,7 @@ impl ResultSet {
         let has_results = archive
             .entries
             .iter()
-            .any(|e| e.starts_with(RESULT_FOLDER_PREFIX));
+            .any(|e| is_result_entry(e));
         if !has_results {
             return Ok(None);
         }
@@ -232,7 +237,7 @@ impl ResultSet {
         let solver_folders = archive
             .entries
             .iter()
-            .filter(|e| e.starts_with(RESULT_FOLDER_PREFIX))
+            .filter(|e| is_result_entry(e))
             .filter_map(|e| e.strip_prefix("!solver/").and_then(|r| r.split('/').next()))
             .filter(|f| seen.insert(f.to_string()))
             .map(str::to_owned)
@@ -847,7 +852,7 @@ impl Displacements {
             .iter()
             .find(|e| e.starts_with("!solver/RN") && e.ends_with(&suffix))
         else {
-            return Ok(None);
+            return Self::read_members(archive, solver_id, fe_nodes);
         };
         let bytes = archive.read_entry(entry)?;
         if bytes.len() < 240 {
@@ -881,6 +886,79 @@ impl Displacements {
                 *v = x;
             }
             nodal.push(rec);
+        }
+        Ok(Some(Displacements { nodal }))
+    }
+
+    /// Displacements of 1D member elements: `!solver/RO_*/Data.RO<solver_id>` (RFEM 6.16,
+    /// results v18.00). Same 601 header (`[3]` = 6 components, `[4]` = FE node count, `[5]` =
+    /// element count). The block at the byte offset in `i32[155]` holds, per element, the
+    /// displacements `[u_x, u_y, u_z, φ_x, φ_y, φ_z]` of its two end nodes (12 x f64), in
+    /// `Data.E1D` element order (pairs of FE node numbers). Both ends of neighbouring elements
+    /// agree, so the result is filled per FE node. Axes: member local, equal to global for
+    /// members along X.
+    fn read_members(
+        archive: &Archive,
+        solver_id: u32,
+        fe_nodes: usize,
+    ) -> Result<Option<Self>, Error> {
+        let suffix = format!("Data.RO{solver_id:06}");
+        let Some(entry) = archive
+            .entries
+            .iter()
+            .find(|e| e.starts_with("!solver/RO") && e.ends_with(&suffix))
+        else {
+            return Ok(None);
+        };
+        let bytes = archive.read_entry(entry)?;
+        if bytes.len() < 1024 {
+            return Err(Error::Format("member results file too short".into()));
+        }
+        let i32_at = |i: usize| i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        if i32_at(0) != RN_MAGIC || i32_at(3) != 6 {
+            return Ok(None);
+        }
+        let count = i32_at(4).max(0) as usize;
+        let elements = i32_at(5).max(0) as usize;
+        let offset = i32_at(155).max(0) as usize;
+        if count == 0 || elements == 0 || offset == 0 || offset + elements * 96 > bytes.len() {
+            return Err(Error::Format("unexpected member results layout".into()));
+        }
+        if fe_nodes != 0 && count != fe_nodes {
+            return Err(Error::Format(format!(
+                "results have {count} nodes, FE mesh has {fe_nodes}"
+            )));
+        }
+        // Element connectivity: the one beside the results, else the mesh's `Data.E1D`.
+        let folder = &entry[..entry.rfind('/').unwrap_or(0)];
+        let e1d_name = [format!("{folder}/Data.E1D"), "!solver/M/Data.E1D".to_owned()]
+            .into_iter()
+            .find(|n| archive.entries.iter().any(|e| e == n))
+            .ok_or_else(|| Error::Format("no Data.E1D for the member results".into()))?;
+        let e1d = archive.read_entry(&e1d_name)?;
+        if e1d.len() < elements * 8 {
+            return Err(Error::Format(
+                "Data.E1D is shorter than the element count".into(),
+            ));
+        }
+        let f64_at = |o: usize| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+        let mut nodal = vec![[0.0f64; 6]; count];
+        for el in 0..elements {
+            for end in 0..2 {
+                let at = el * 8 + end * 4;
+                let n = i32::from_le_bytes(e1d[at..at + 4].try_into().unwrap());
+                if n < 1 || n as usize > count {
+                    return Err(Error::Format(format!("FE element node {n} out of range")));
+                }
+                let base = offset + el * 96 + end * 48;
+                for k in 0..6 {
+                    let x = f64_at(base + k * 8);
+                    if !x.is_finite() {
+                        return Err(Error::Format("non-finite displacement value".into()));
+                    }
+                    nodal[n as usize - 1][k] = x;
+                }
+            }
         }
         Ok(Some(Displacements { nodal }))
     }

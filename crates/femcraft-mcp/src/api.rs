@@ -29,6 +29,11 @@ pub trait Workspace {
     fn open_model(&mut self, path: &Path) -> Result<String, String>;
     /// Saves the active model to `path`, or to its own file when `None`.
     fn save_model(&mut self, path: Option<&Path>) -> Result<PathBuf, String>;
+    /// Calculates the active model with the RFEM server (Settings > RFEM server); returns the
+    /// calculated copy, which is opened as a new model.
+    fn solve(&mut self) -> Result<PathBuf, String> {
+        Err("solving needs the FemCraft window (Settings > RFEM server)".into())
+    }
     fn models(&self) -> Vec<ModelInfo>;
     fn active(&mut self) -> Option<&mut RfDocument>;
     /// Called after the active model was edited (the GUI redraws it).
@@ -134,6 +139,16 @@ pub fn methods() -> Vec<MethodInfo> {
             name: "open_model".into(),
             description: "Opens an RFEM 6 .rf6 file and makes it the active model.".into(),
             schema: obj(json!({"model_path": {"type": "string"}}), &["model_path"]),
+            changes_model: false,
+        },
+        MethodInfo {
+            name: "calculate_all".into(),
+            description: "Calculates the active model with the RFEM 6 server (as RFEM's \
+                calculate_all). The model is saved first if it has unsaved edits; the calculated \
+                copy (in FemCraft's working directory, folder 'solved') opens as a new model \
+                and its path is returned."
+                .into(),
+            schema: obj(json!({}), &[]),
             changes_model: false,
         },
         MethodInfo {
@@ -289,6 +304,10 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
             let n = ws.open_model(&path("model_path")?)?;
             return Ok(json!({"name": n}));
         }
+        "calculate_all" => {
+            let p = ws.solve()?;
+            return Ok(json!({"solved": p.display().to_string()}));
+        }
         "save" => {
             let p = ws.save_model(None)?;
             return Ok(json!({"saved": p.display().to_string()}));
@@ -416,10 +435,22 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
                         keys.join(", ")
                     )
                 })?;
-                fields.push((
-                    spec.key,
-                    from_json(spec.ty, v).map_err(|e| format!("{k}: {e}"))?,
-                ));
+                let mut val = from_json(spec.ty, v).map_err(|e| format!("{k}: {e}"))?;
+                // RFEM stores load directions as integer codes; accept its API names too.
+                if spec.key == "load_direction"
+                    && let Value::Text(t) = &val
+                {
+                    val = Value::Int(
+                        load_direction_code(t).ok_or_else(|| {
+                            format!(
+                                "{k}: unknown load direction '{t}'; use a code or \
+                                 LOAD_DIRECTION_LOCAL_X/Y/Z, LOAD_DIRECTION_GLOBAL_X/Y/Z_OR_\
+                                 USER_DEFINED_U/V/W_TRUE"
+                            )
+                        })?,
+                    );
+                }
+                fields.push((spec.key, val));
             }
             // Materials and sections: `name` is an RFEM library name (as RFEM's API takes it);
             // the library item is copied into the model after the other fields are set.
@@ -431,10 +462,14 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
                 let wanted = v.as_str().unwrap_or("").to_owned();
                 let lib = Library::find(&Library::default_dirs())
                     .ok_or("no FemCraft library found (materials.db / sections.db)")?;
-                let item = lib
-                    .get(lib_kind, &wanted)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| {
+                let mut found = lib.get(lib_kind, &wanted).map_err(|e| e.to_string())?;
+                // A parametric concrete size the library lacks (`R_M1 0.3048/0.6096`, metres
+                // or mm) is created from an item of the same shape.
+                if found.is_none() && lib_kind == LibraryKind::Section {
+                    found = femcraft_rfdb::concrete::get_or_add_concrete(&lib, &wanted)
+                        .map_err(|e| e.to_string())?;
+                }
+                let item = found.ok_or_else(|| {
                         format!(
                             "no library {} named '{wanted}'; get_library_items lists them \
                              (RFEM's full name, or a designation only one item has)",
@@ -476,6 +511,22 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
         }
         _ => Err(format!("unknown method '{name}'")),
     }
+}
+
+/// RFEM's stored code for a load direction given by its API I name: line / member / surface
+/// loads use 0 / 1 / 2 = local x / y / z and 11 / 12 / 13 = global X / Y / Z (nodal loads
+/// 0 / 1 / 2 = global X / Y / Z, and take codes only).
+fn load_direction_code(name: &str) -> Option<i64> {
+    let n = name.trim().to_ascii_uppercase();
+    Some(match n.as_str() {
+        "LOAD_DIRECTION_LOCAL_X" => 0,
+        "LOAD_DIRECTION_LOCAL_Y" => 1,
+        "LOAD_DIRECTION_LOCAL_Z" => 2,
+        "LOAD_DIRECTION_GLOBAL_X_OR_USER_DEFINED_U_TRUE" => 11,
+        "LOAD_DIRECTION_GLOBAL_Y_OR_USER_DEFINED_V_TRUE" => 12,
+        "LOAD_DIRECTION_GLOBAL_Z_OR_USER_DEFINED_W_TRUE" => 13,
+        _ => return None,
+    })
 }
 
 /// The library behind an object kind's `name` (materials, sections).

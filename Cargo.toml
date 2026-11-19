@@ -21,6 +21,7 @@ femcraft-ui = { path = "crates/femcraft-ui" }
 femcraft-aster = { path = "crates/femcraft-aster" }
 femcraft-results = { path = "crates/femcraft-results" }
 femcraft-mcp = { path = "crates/femcraft-mcp" }
+femcraft-rfem = { path = "crates/femcraft-rfem" }
 
 [profile.dev.package."*"]
 # Optimise dependencies even in debug builds so the viewport stays smooth.

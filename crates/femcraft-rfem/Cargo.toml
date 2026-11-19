@@ -1,0 +1,11 @@
+[package]
+name = "femcraft-rfem"
+description = "FemCraft solver connection: RFEM 6 server (API I over SOAP)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
