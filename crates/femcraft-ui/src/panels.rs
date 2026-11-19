@@ -566,7 +566,11 @@ fn table_fields(kind: ObjectKind) -> Vec<&'static femcraft_model::FieldSpec> {
         K::SurfaceSupport => "surfaces",
         _ => "",
     };
-    kind.spec().fields.iter().filter(|f| f.key != assigned).collect()
+    kind.spec()
+        .fields
+        .iter()
+        .filter(|f| f.key != assigned)
+        .collect()
 }
 
 /// Numbers of the supports an object is assigned to (normally none or one).

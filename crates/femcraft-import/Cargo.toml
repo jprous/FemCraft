@@ -1,0 +1,18 @@
+[package]
+name = "femcraft-import"
+description = "FemCraft File > Import: STAAD.Pro, Prokon, Robot models; plate meshes rebuilt as surfaces"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cfb = "0.16.0"
+serde_json = "1"
+
+[dev-dependencies]
+femcraft-mcp.workspace = true
+femcraft-model.workspace = true
+femcraft-rfdb.workspace = true
+tempfile = "3.27.0"

@@ -146,7 +146,12 @@ impl LibraryCache {
                 continue;
             };
             if close(v[ca], a) && close(v[cy], iy) && close(v[cz], iz) {
-                let d = item.designation.split(" | ").next().unwrap_or("").to_owned();
+                let d = item
+                    .designation
+                    .split(" | ")
+                    .next()
+                    .unwrap_or("")
+                    .to_owned();
                 match &found {
                     Some(f) if *f != d => return None,
                     _ => found = Some(d),
@@ -243,7 +248,6 @@ fn concrete_name(family: &str, b_mm: f64, h_mm: f64, d_mm: f64) -> String {
         _ => String::new(),
     }
 }
-
 
 pub struct LibraryDialog {
     pub kind: LibraryKind,
@@ -807,9 +811,8 @@ impl LibraryDialog {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        let mut text = egui::RichText::new(number(
-                                            v * value_cols[*c].scale,
-                                        ));
+                                        let mut text =
+                                            egui::RichText::new(number(v * value_cols[*c].scale));
                                         if mirror {
                                             text = text.weak();
                                         }
@@ -821,7 +824,11 @@ impl LibraryDialog {
                     }
                     let r = row.response();
                     if r.clicked() {
-                        if self.editing.as_ref().is_some_and(|e| e.user_id != item.user_id) {
+                        if self
+                            .editing
+                            .as_ref()
+                            .is_some_and(|e| e.user_id != item.user_id)
+                        {
                             self.commit_edit(data);
                             self.editing = None;
                             self.reload = true;

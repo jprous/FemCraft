@@ -55,7 +55,10 @@ fn contact_supports(
 ) -> std::collections::HashMap<u32, scene::ContactSupport> {
     let mut out = std::collections::HashMap::new();
     for (_, sup) in model.iter_kind(ObjectKind::SurfaceSupport) {
-        let Some(cz) = sup.get("translation_z").as_f64().filter(|c| c.is_finite() && *c > 0.0)
+        let Some(cz) = sup
+            .get("translation_z")
+            .as_f64()
+            .filter(|c| c.is_finite() && *c > 0.0)
         else {
             continue;
         };
@@ -197,13 +200,14 @@ impl Document {
             self.vis.load_case = vis.load_case;
         }
         self.load_cases = load_cases;
-        self.selection
-            .retain(|id| self.rf.model.get(*id).is_some());
+        self.selection.retain(|id| self.rf.model.get(*id).is_some());
         self.results_view = crate::results_panel::ResultsView::default();
         // Freshly calculated: show the first result quantity (displacements) of the first case.
         if let Some(results) = &self.results {
             let first = |nodes: &[femcraft_rfdb::ResultNode]| {
-                fn find(nodes: &[femcraft_rfdb::ResultNode]) -> Option<femcraft_rfdb::ResultComponent> {
+                fn find(
+                    nodes: &[femcraft_rfdb::ResultNode],
+                ) -> Option<femcraft_rfdb::ResultComponent> {
                     nodes.iter().find_map(|n| match n {
                         femcraft_rfdb::ResultNode::Leaf(l)
                             if l.group == femcraft_rfdb::RadioGroup::Result =>
@@ -295,9 +299,10 @@ impl Document {
             }
         } else if self.vis.load_case != self.synced_lc
             && let Some(results) = &self.results
-            && let Some(case) = results.cases.iter().find(|c| {
-                c.kind == femcraft_rfdb::CaseKind::LoadCase && c.no == self.vis.load_case
-            })
+            && let Some(case) = results
+                .cases
+                .iter()
+                .find(|c| c.kind == femcraft_rfdb::CaseKind::LoadCase && c.no == self.vis.load_case)
         {
             // The user picked another load case in the Display panel: show its results too.
             self.results_view.selected = Some((case.kind, case.no));

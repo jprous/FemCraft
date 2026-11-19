@@ -56,6 +56,9 @@ struct AppSettings {
     /// Where dialogs start and calculated models are put (default: the folder FemCraft was
     /// started in).
     working_dir: Option<PathBuf>,
+    /// File > Import runs in the background with a progress window (on) or blocks the window
+    /// until it is done (off). Not in the menus: set `import_in_background` in `app.ron`.
+    import_in_background: bool,
 }
 
 impl Default for AppSettings {
@@ -68,6 +71,7 @@ impl Default for AppSettings {
             rfem_email: String::new(),
             rfem_license: String::new(),
             working_dir: None,
+            import_in_background: true,
         }
     }
 }
@@ -123,7 +127,6 @@ impl RfemDraft {
         }
     }
 }
-
 
 /// The library database in use for `kind`, for the Settings menu.
 fn library_db_in_use(kind: femcraft_rfdb::LibraryKind) -> String {
@@ -208,6 +211,29 @@ struct SolveJob {
     started: std::time::Instant,
 }
 
+/// An import running on another thread. Its model calls (`set_node`, ...) are sent back and
+/// answered here, on the UI thread, a few at a time per frame so the progress dialog stays
+/// alive; the import is idle while it waits for each answer.
+struct ImportJob {
+    format: femcraft_import::Format,
+    path: PathBuf,
+    requests: std::sync::mpsc::Receiver<ImportCall>,
+    done: std::sync::mpsc::Receiver<Result<femcraft_import::Report, String>>,
+    /// Fraction and stage, set by the importer.
+    progress: std::sync::Arc<std::sync::Mutex<(f32, String)>>,
+    calls: usize,
+    started: std::time::Instant,
+    /// The model being built: its calls go there and its 3D view waits for the end.
+    doc: u64,
+}
+
+/// One model call of an import and where to send its answer.
+type ImportCall = (
+    String,
+    serde_json::Value,
+    std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
+);
+
 pub struct FemCraftApp {
     grid: GridSettings,
     show_axes: bool,
@@ -235,6 +261,8 @@ pub struct FemCraftApp {
     message: Option<String>,
     /// Last confirmation (e.g. saved), shown in the status bar.
     notice: Option<String>,
+    /// File > Import: summary and notes of the last import, shown in a window.
+    import_report: Option<(String, Vec<String>)>,
 
     /// Dockable layout of the model tabs and panels.
     tree: egui_tiles::Tree<Pane>,
@@ -250,6 +278,9 @@ pub struct FemCraftApp {
     show_about: bool,
     /// A calculation running on another thread (Solve menu).
     solve_job: Option<SolveJob>,
+    import_job: Option<ImportJob>,
+    /// Document an import is building (no 3D rebuild per call; see `Workspace::changed`).
+    importing_doc: Option<u64>,
 }
 
 impl FemCraftApp {
@@ -275,6 +306,7 @@ impl FemCraftApp {
             ribbon_minimized: false,
             message: None,
             notice: None,
+            import_report: None,
             tree: dock::default_tree(),
             ribbon_tab: RibbonTab::Home,
             tables: panels::TableState::default(),
@@ -284,6 +316,8 @@ impl FemCraftApp {
             rfem_dialog: None,
             show_about: false,
             solve_job: None,
+            import_job: None,
+            importing_doc: None,
         };
         // Built-in MCP server on 127.0.0.1 (FEMCRAFT_MCP_PORT, 0 = off). A second instance
         // finds the port taken and runs without it.
@@ -510,6 +544,243 @@ impl FemCraftApp {
         }
     }
 
+    /// File > Import > format: a file dialog filtered on the format's extension, then the
+    /// file is built into a new untitled model (save it as `.rf6`).
+    fn import_dialog(&mut self, format: femcraft_import::Format) {
+        let (name, ext) = format.filter();
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(format!("Import {}", format.label()))
+            .add_filter(name, ext)
+            .add_filter("All files", &["*"])
+            .set_directory(self.working_dir())
+            .pick_file()
+        else {
+            return;
+        };
+        if let Err(e) = self.import(format, &path) {
+            self.message = Some(e);
+        }
+    }
+
+    fn import(&mut self, format: femcraft_import::Format, path: &Path) -> Result<(), String> {
+        if !format.supported() {
+            return Err(format!("Import of {} is not available yet", format.label()));
+        }
+        if self.import_job.is_some() {
+            return Err("An import is already running".into());
+        }
+        let blank = Self::blank_model_path()
+            .filter(|p| p.is_file())
+            .ok_or("no blank model: use File > New once to choose the template")?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+        // Check the file before opening a model for it.
+        femcraft_import::check(format, &bytes)
+            .map_err(|e| format!("Could not import {}: {e}", path.display()))?;
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Imported".into());
+        self.new_from(&blank, Some(&stem))?;
+        if !self.settings.import_in_background {
+            // Blocking: the window is frozen until the model is built (Settings menu).
+            self.importing_doc = self.active;
+            let started = std::time::Instant::now();
+            let result = femcraft_import::import_with_progress(
+                format,
+                &bytes,
+                &mut |name, args| femcraft_mcp::api::call(self, name, args),
+                &mut |_, _| {},
+            );
+            self.importing_doc = None;
+            self.finish_import(path, result?);
+            if let Some(n) = &mut self.notice {
+                n.push_str(&format!(" ({:.1} s)", started.elapsed().as_secs_f64()));
+            }
+            return Ok(());
+        }
+        // The conversion runs on its own thread; its model calls come back here.
+        let (req_tx, requests) = std::sync::mpsc::channel::<ImportCall>();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let progress = std::sync::Arc::new(std::sync::Mutex::new((0.0f32, String::new())));
+        let shared = progress.clone();
+        std::thread::Builder::new()
+            .name("femcraft-import".into())
+            .spawn(move || {
+                let mut call = |name: &str, args: &serde_json::Value| {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    req_tx
+                        .send((name.to_owned(), args.clone(), tx))
+                        .map_err(|_| "the import was cancelled".to_string())?;
+                    rx.recv()
+                        .map_err(|_| "the import was cancelled".to_string())?
+                };
+                let mut report = |f: f32, what: &str| {
+                    if let Ok(mut p) = shared.lock() {
+                        *p = (f, what.to_owned());
+                    }
+                };
+                let _ = done_tx.send(femcraft_import::import_with_progress(
+                    format,
+                    &bytes,
+                    &mut call,
+                    &mut report,
+                ));
+            })
+            .map_err(|e| format!("Could not start the import: {e}"))?;
+        self.import_job = Some(ImportJob {
+            format,
+            path: path.to_owned(),
+            requests,
+            done,
+            progress,
+            calls: 0,
+            started: std::time::Instant::now(),
+            doc: self.active.unwrap_or_default(),
+        });
+        self.importing_doc = self.active;
+        Ok(())
+    }
+
+    /// Answers the running import's model calls (for up to ~80 ms per frame) and picks up its
+    /// result.
+    fn poll_import(&mut self, ctx: &egui::Context) {
+        let Some(mut job) = self.import_job.take() else {
+            return;
+        };
+        // The calls act on the imported model even if another tab is active meanwhile.
+        let user_active = self.active;
+        self.active = Some(job.doc);
+        // Wait for each next call (the importer sends it right after our answer): with
+        // `try_recv` only about one call per frame was answered.
+        let budget = std::time::Duration::from_millis(80);
+        let t0 = std::time::Instant::now();
+        while let Some(left) = budget.checked_sub(t0.elapsed()) {
+            match job.requests.recv_timeout(left) {
+                Ok((name, args, reply)) => {
+                    job.calls += 1;
+                    let _ = reply.send(femcraft_mcp::api::call(self, &name, &args));
+                }
+                Err(_) => break,
+            }
+        }
+        match job.done.try_recv() {
+            Ok(result) => {
+                // Calls queued just before the end.
+                while let Ok((name, args, reply)) = job.requests.try_recv() {
+                    let _ = reply.send(femcraft_mcp::api::call(self, &name, &args));
+                }
+                self.importing_doc = None;
+                match result {
+                    Ok(report) => {
+                        self.finish_import(&job.path, report);
+                        if let Some(n) = &mut self.notice {
+                            n.push_str(&format!(" ({:.1} s)", job.started.elapsed().as_secs_f64()));
+                        }
+                    }
+                    Err(e) => {
+                        self.message =
+                            Some(format!("Could not import {}: {e}", job.path.display()));
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.active = user_active;
+                self.import_job = Some(job);
+                ctx.request_repaint();
+            }
+            Err(_) => {
+                self.importing_doc = None;
+                self.message = Some("The import stopped unexpectedly".into());
+            }
+        }
+    }
+
+    fn finish_import(&mut self, path: &Path, report: femcraft_import::Report) {
+        let (grid, axes) = (self.grid.clone(), self.show_axes);
+        if let Some(d) = self.active_doc_mut() {
+            // `changed` skipped every call of the import: rebuild the 3D view once now.
+            d.revision += 1;
+            d.load_cases = scene::load_cases(&d.rf.model);
+            d.refresh(&grid, axes);
+            d.zoom_to_model(&grid);
+        }
+        let mut notes = report.notes.clone();
+        notes.extend(report.errors.iter().map(|e| format!("Error: {e}")));
+        self.notice = Some(format!(
+            "{} Save it as .rf6 (File > Save As).",
+            report.summary()
+        ));
+        self.import_report = Some((format!("Imported {}", path.display()), notes));
+    }
+
+    /// Progress window shown while an import converts (the rest of the app stays usable).
+    fn import_progress_dialog(&self, ctx: &egui::Context) {
+        let Some(job) = &self.import_job else { return };
+        let (fraction, stage) = job.progress.lock().map(|p| p.clone()).unwrap_or_default();
+        let secs = job.started.elapsed().as_secs();
+        let name = job
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        egui::Window::new("Import")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading(format!("Importing {}", job.format.label()));
+            ui.add_space(8.0);
+            ui.label(name);
+            ui.add_space(6.0);
+            ui.add(
+                egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                    .show_percentage()
+                    .animate(true),
+            );
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(stage);
+            });
+            ui.add_space(6.0);
+            ui.weak(format!(
+                "Elapsed: {}:{:02}   Model calls: {}",
+                secs / 60,
+                secs % 60,
+                job.calls
+            ));
+            ui.weak("Please wait; the model opens when the conversion is done.");
+        });
+        ctx.request_repaint();
+    }
+
+    /// The notes of the last import (what was not converted).
+    fn import_report_ui(&mut self, ctx: &egui::Context) {
+        let Some((title, notes)) = &self.import_report else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Import report")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label(title);
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for n in notes {
+                            ui.label(format!("• {n}"));
+                        }
+                    });
+            });
+        if !open {
+            self.import_report = None;
+        }
+    }
+
     /// File > Save: writes the active model back to its file (`.rf6`).
     fn save(&mut self) {
         let Some(path) = self.active_doc().map(|d| d.path.clone()) else {
@@ -651,6 +922,14 @@ impl FemCraftApp {
                         self.open_dialog();
                     }
                     ui.menu_button("Open Recent", |ui| self.recent_menu(ui));
+                    ui.menu_button("Import", |ui| {
+                        for format in femcraft_import::Format::ALL {
+                            if ui.button(format.label()).clicked() {
+                                ui.close();
+                                self.import_dialog(format);
+                            }
+                        }
+                    });
                     ui.separator();
                     let has_doc = self.active.is_some();
                     if ui
@@ -767,7 +1046,10 @@ impl FemCraftApp {
         ui.weak("Click an item to choose its location");
         ui.separator();
 
-        let shown = auto(&self.settings.section_db, library_db_in_use(LibraryKind::Section));
+        let shown = auto(
+            &self.settings.section_db,
+            library_db_in_use(LibraryKind::Section),
+        );
         let mut d = rfd::FileDialog::new()
             .set_title("Section database (sections.db)")
             .add_filter("SQLite database", &["db"]);
@@ -786,7 +1068,10 @@ impl FemCraftApp {
             changed = true;
         }
 
-        let shown = auto(&self.settings.material_db, library_db_in_use(LibraryKind::Material));
+        let shown = auto(
+            &self.settings.material_db,
+            library_db_in_use(LibraryKind::Material),
+        );
         let mut d = rfd::FileDialog::new()
             .set_title("Material database (materials.db)")
             .add_filter("SQLite database", &["db"]);
@@ -955,7 +1240,6 @@ impl FemCraftApp {
         }
     }
 
-
     /// Solve: calculate the active model with the RFEM server on another thread.
     fn solve_menu(&mut self, ui: &mut egui::Ui) {
         use femcraft_rfem::Job;
@@ -974,7 +1258,10 @@ impl FemCraftApp {
             start = Some(Job::Calculate);
         }
         if ui
-            .add_enabled(self.active.is_some() && !busy, egui::Button::new("Mesh with RFEM"))
+            .add_enabled(
+                self.active.is_some() && !busy,
+                egui::Button::new("Mesh with RFEM"),
+            )
             .on_hover_text("Saves the model, then generates only the FE mesh on the RFEM 6 server")
             .clicked()
         {
@@ -1114,8 +1401,7 @@ impl FemCraftApp {
         let target = self.docs[pos].path.clone();
         std::fs::copy(&target, target.with_extension("rf6bak"))
             .map_err(|e| format!("backup of {}: {e}", target.display()))?;
-        std::fs::copy(solved, &target)
-            .map_err(|e| format!("replace {}: {e}", target.display()))?;
+        std::fs::copy(solved, &target).map_err(|e| format!("replace {}: {e}", target.display()))?;
         // The scratch folder (`solved`) also holds RFEM's own backup and log files.
         match solved.parent() {
             Some(dir) if dir.file_name().is_some_and(|n| n == "solved") => {
@@ -1858,7 +2144,11 @@ impl FemCraftApp {
 /// Flat status-bar toggle button in the style of AutoCAD's: highlighted while on.
 fn status_toggle(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
     let label = egui::RichText::new(text).monospace().small();
-    ui.add(egui::Button::new(label).selected(on).min_size(egui::vec2(52.0, 18.0)))
+    ui.add(
+        egui::Button::new(label)
+            .selected(on)
+            .min_size(egui::vec2(52.0, 18.0)),
+    )
 }
 
 /// Load case selector for a model.
@@ -1928,10 +2218,13 @@ impl eframe::App for FemCraftApp {
             d.clear_selection();
         }
         self.poll_solve(&ui.ctx().clone());
+        self.poll_import(&ui.ctx().clone());
         self.solve_dialog(&ui.ctx().clone());
+        self.import_progress_dialog(&ui.ctx().clone());
         self.menu_bar(ui);
         self.rfem_dialog_ui(&ui.ctx().clone());
         self.about_dialog(&ui.ctx().clone());
+        self.import_report_ui(&ui.ctx().clone());
         self.ribbon(ui);
         self.status_bar(ui);
         for d in &mut self.docs {
@@ -2307,6 +2600,10 @@ impl femcraft_mcp::Workspace for FemCraftApp {
     }
 
     fn changed(&mut self) {
+        // A model being imported is redrawn once, at the end (`finish_import`).
+        if self.active.is_some() && self.active == self.importing_doc {
+            return;
+        }
         if let Some(d) = self.active_doc_mut() {
             d.revision += 1; // rebuild the 3D view
             d.load_cases = scene::load_cases(&d.rf.model);

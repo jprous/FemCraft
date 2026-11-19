@@ -673,44 +673,69 @@ impl RfDocument {
         lib: &crate::Library,
         item: &crate::LibraryItem,
     ) -> Result<(), Error> {
+        self.assign_library_items(lib, &[(id, item.clone())])
+    }
+
+    /// [`Self::assign_library_item`] for several objects at once: pending edits are written
+    /// and the model reloaded once, not per item (each costs seconds on a full template).
+    pub fn assign_library_items(
+        &mut self,
+        lib: &crate::Library,
+        items: &[(ObjectId, crate::LibraryItem)],
+    ) -> Result<(), Error> {
         use crate::LibraryKind as L;
-        let main = match (id.kind, item.kind) {
-            (ObjectKind::Material, L::Material) => "Material",
-            (ObjectKind::Section, L::Section) => "Section",
-            _ => {
-                return Err(Error::Unsupported(format!(
-                    "a library {} for a {}",
-                    item.kind.name(),
-                    id.kind.name()
-                )));
-            }
+        if items.is_empty() {
+            return Ok(());
+        }
+        let main_of = |id: ObjectId, item: &crate::LibraryItem| match (id.kind, item.kind) {
+            (ObjectKind::Material, L::Material) => Ok("Material"),
+            (ObjectKind::Section, L::Section) => Ok("Section"),
+            _ => Err(Error::Unsupported(format!(
+                "a library {} for a {}",
+                item.kind.name(),
+                id.kind.name()
+            ))),
         };
+        for (id, item) in items {
+            main_of(*id, item)?;
+        }
         // As saving does: new objects get rows, edits are written (the reload keeps them).
         self.insert_new_objects()?;
         self.apply_edits()?;
-        let (table, key) = self
-            .db_key(id)
-            .map(|(t, k)| (t.to_owned(), k))
-            .ok_or_else(|| {
-                Error::Format(format!(
-                    "{} {} is not in the database",
-                    id.kind.name(),
-                    id.no
-                ))
-            })?;
-        let lib_conn =
-            Connection::open_with_flags(lib.db_path(item.kind), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let lib_schema = crate::build::Schema::read(&lib_conn)?;
-        let lib_main: i64 = lib_conn.query_row(
-            &format!("SELECT id FROM {} WHERE userID = ?1", quote(main)),
-            [item.user_id],
-            |r| r.get(0),
-        )?;
-        let proto =
-            crate::build::capture_library_item(&lib_conn, &lib_schema, id.kind, main, lib_main)?;
+        // Library database and its schema, read once per kind.
+        let mut libs: Vec<(L, Connection, std::sync::Arc<crate::build::Schema>)> = Vec::new();
         let mut b = crate::build::Builder::on_db(self.archive.db_path())?;
         b.begin()?;
-        b.replace_with(&proto, &table, key)?;
+        for (id, item) in items {
+            let main = main_of(*id, item)?;
+            let (table, key) = self
+                .db_key(*id)
+                .map(|(t, k)| (t.to_owned(), k))
+                .ok_or_else(|| {
+                    Error::Format(format!(
+                        "{} {} is not in the database",
+                        id.kind.name(),
+                        id.no
+                    ))
+                })?;
+            if !libs.iter().any(|l| l.0 == item.kind) {
+                let conn = Connection::open_with_flags(
+                    lib.db_path(item.kind),
+                    OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                let schema = crate::build::Schema::cached(&conn)?;
+                libs.push((item.kind, conn, schema));
+            }
+            let (_, lib_conn, lib_schema) = libs.iter().find(|l| l.0 == item.kind).unwrap();
+            let lib_main: i64 = lib_conn.query_row(
+                &format!("SELECT id FROM {} WHERE userID = ?1", quote(main)),
+                [item.user_id],
+                |r| r.get(0),
+            )?;
+            let proto =
+                crate::build::capture_library_item(lib_conn, lib_schema, id.kind, main, lib_main)?;
+            b.replace_with(&proto, &table, key)?;
+        }
         b.commit()?;
         self.reload()?;
         self.db_changed = true;

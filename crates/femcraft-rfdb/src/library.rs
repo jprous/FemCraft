@@ -406,7 +406,7 @@ impl Library {
         let path = self.db_path(LibraryKind::Section);
         let proto = {
             let conn = self.open(LibraryKind::Section)?;
-            let schema = crate::build::Schema::read(&conn)?;
+            let schema = crate::build::Schema::cached(&conn)?;
             let lib_main: i64 = conn.query_row(
                 "SELECT id FROM Section WHERE userID = ?1",
                 [template_user_id],
@@ -509,7 +509,7 @@ impl Library {
     /// other kind of section (no `SectionImplParametricMassive` row to find).
     fn delete_concrete_rows(&self, user_id: i64) -> Result<(), Error> {
         let conn = self.open_rw(LibraryKind::Section)?;
-        let schema = crate::build::Schema::read(&conn)?;
+        let schema = crate::build::Schema::cached(&conn)?;
         let found: Option<i64> = conn
             .query_row(
                 "SELECT id FROM Section WHERE userID = ?1",

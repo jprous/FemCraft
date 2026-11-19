@@ -80,6 +80,28 @@ pub struct Schema {
 }
 
 impl Schema {
+    /// [`Schema::read`], cached per database file and SQLite `schema_version` (inserting
+    /// rows keeps it; reading a full RFEM schema costs ~0.3 s and was repeated per object).
+    pub fn cached(conn: &Connection) -> Result<std::sync::Arc<Self>, Error> {
+        use std::sync::{Arc, Mutex, OnceLock};
+        type Cache = Mutex<HashMap<String, (i64, Arc<Schema>)>>;
+        static CACHE: OnceLock<Cache> = OnceLock::new();
+        let path = conn.path().unwrap_or("").to_owned();
+        if path.is_empty() {
+            return Ok(Arc::new(Self::read(conn)?));
+        }
+        let version: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+        let cache = CACHE.get_or_init(Default::default);
+        if let Some((v, s)) = cache.lock().unwrap().get(&path)
+            && *v == version
+        {
+            return Ok(s.clone());
+        }
+        let s = Arc::new(Self::read(conn)?);
+        cache.lock().unwrap().insert(path, (version, s.clone()));
+        Ok(s)
+    }
+
     pub fn read(conn: &Connection) -> Result<Self, Error> {
         let mut columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut required: HashMap<String, Vec<(String, String)>> = HashMap::new();
@@ -356,7 +378,7 @@ pub fn find_proto(
     let (table, key) = doc.db_key(id).expect("loaded objects have a key");
     let conn =
         Connection::open_with_flags(doc.archive.db_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let schema = Schema::read(&conn)?;
+    let schema = Schema::cached(&conn)?;
     capture(&conn, &schema, kind, table, key)
 }
 
@@ -365,7 +387,7 @@ pub fn find_proto(
 pub fn first_of_table(doc: &RfDocument, table: &str) -> Result<Option<Proto>, Error> {
     let conn =
         Connection::open_with_flags(doc.archive.db_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let schema = Schema::read(&conn)?;
+    let schema = Schema::cached(&conn)?;
     if !schema.columns.contains_key(table) {
         return Ok(None);
     }
@@ -413,7 +435,7 @@ pub struct Builder {
     archive: Option<Archive>,
     db: std::path::PathBuf,
     conn: Connection,
-    schema: Schema,
+    schema: std::sync::Arc<Schema>,
     next: HashMap<String, i64>,
     seq: u64,
 }
@@ -426,7 +448,7 @@ impl Builder {
         let conn = Connection::open(archive.db_path())?;
         // Rows are inserted in tree order, not dependency order; checked in `finish`.
         conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-        let schema = Schema::read(&conn)?;
+        let schema = Schema::cached(&conn)?;
         let mut b = Self {
             db: archive.db_path().to_owned(),
             archive: Some(archive),
@@ -450,7 +472,7 @@ impl Builder {
     pub(crate) fn on_db(db: &Path) -> Result<Self, Error> {
         let conn = Connection::open(db)?;
         conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-        let schema = Schema::read(&conn)?;
+        let schema = Schema::cached(&conn)?;
         Ok(Self {
             archive: None,
             db: db.to_owned(),

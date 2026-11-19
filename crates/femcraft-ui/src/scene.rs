@@ -238,8 +238,10 @@ pub fn add_fe_mesh(s: &mut Scene, mesh: &femcraft_rfdb::FeMesh) {
     const MESH: [f32; 4] = [0.55, 0.55, 0.58, 0.9];
     for (a, b) in mesh.edges() {
         if let (Some(a), Some(b)) = (mesh.node(a), mesh.node(b)) {
-            s.lines.push(LineVertex::new(to_world(a), MESH).with_width(MESH_WIDTH));
-            s.lines.push(LineVertex::new(to_world(b), MESH).with_width(MESH_WIDTH));
+            s.lines
+                .push(LineVertex::new(to_world(a), MESH).with_width(MESH_WIDTH));
+            s.lines
+                .push(LineVertex::new(to_world(b), MESH).with_width(MESH_WIDTH));
         }
     }
 }
@@ -396,7 +398,9 @@ impl Span {
 
     /// The scale range to force for `Both`; other extremes use the plotted values' range.
     fn range(&self, extremum: femcraft_rfdb::Extremum) -> Option<(f64, f64)> {
-        (extremum == femcraft_rfdb::Extremum::Both).then_some(self.0).flatten()
+        (extremum == femcraft_rfdb::Extremum::Both)
+            .then_some(self.0)
+            .flatten()
     }
 }
 
@@ -508,11 +512,18 @@ pub fn add_contact_surface(
                     .filter_map(|d| {
                         let u = d.node(no)?;
                         let sigma = sup.cz * (u[0] * n[0] + u[1] * n[1] + u[2] * n[2]);
-                        Some(if sup.tension_free { sigma.max(0.0) } else { sigma })
+                        Some(if sup.tension_free {
+                            sigma.max(0.0)
+                        } else {
+                            sigma
+                        })
                     })
                     .collect();
                 span.add(&sigma);
-                Some((displaced(mesh, first, no, 0.0, [1.0; 3])?, extremum.reduce(sigma.into_iter())?))
+                Some((
+                    displaced(mesh, first, no, 0.0, [1.0; 3])?,
+                    extremum.reduce(sigma.into_iter())?,
+                ))
             })
             .collect();
         elems.extend(verts);
@@ -635,7 +646,9 @@ pub fn add_result_members(
         let mut best: Option<([f64; 6], f64)> = None;
         for d in disps {
             let Some(u) = d.node(no) else { continue };
-            let Some(v) = displacement_scalar(component, u) else { continue };
+            let Some(v) = displacement_scalar(component, u) else {
+                continue;
+            };
             let better = match (shape, &best) {
                 (_, None) => true,
                 (Shape::Min, Some((_, bv))) => v < *bv,
@@ -1478,6 +1491,12 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
         }
     }
 
+    // Uniform surface load blocks are scaled slightly by magnitude: the largest load in the
+    // case keeps the full height, the smallest ones are half as deep.
+    let peak_uniform = in_case(K::SurfaceLoad)
+        .filter_map(|(_, l)| f(l, "uniform_magnitude"))
+        .filter(|v| v.is_finite())
+        .fold(0.0f64, |a, v| a.max(v.abs()));
     for (_, l) in in_case(K::SurfaceLoad) {
         let world =
             |no: u32| node(no).map(|p| dir_world(Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)));
@@ -1550,9 +1569,10 @@ fn loads(s: &mut Scene, model: &Model, lc: u32, surfaces: &[(u32, Vec<Vec3>)], l
             };
             let dw = dir_world(d * mag.signum() as f32);
             let c = poly.iter().copied().sum::<Vec3>() / poly.len() as f32;
-            surface_load_block(s, poly, dw, len);
+            let h = len * (0.5 + 0.5 * (mag.abs() / peak_uniform) as f32).clamp(0.5, 1.0);
+            surface_load_block(s, poly, dw, h);
             s.labels.push(Label {
-                pos: c - dw * len * 1.25,
+                pos: c - dw * h * 1.25,
                 text: kn(mag.abs(), "kN/m²"),
                 color: SURFACE_LOAD,
             });
@@ -1652,7 +1672,12 @@ mod tests {
     fn contact_stress_is_spring_times_normal_displacement() {
         use femcraft_rfdb::{Displacements, FeMesh};
         let mesh = FeMesh {
-            nodes: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            nodes: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
             elements: vec![[1, 2, 3, 4]],
             element_surface: vec![1],
             lines: vec![],
@@ -1666,15 +1691,32 @@ mod tests {
             ],
         };
         let mut sup = HashMap::new();
-        sup.insert(1, ContactSupport { cz: 6.0e6, tension_free: true });
+        sup.insert(
+            1,
+            ContactSupport {
+                cz: 6.0e6,
+                tension_free: true,
+            },
+        );
         let mut s = Scene::default();
-        let (lo, hi) = add_contact_surface(&mut s, &mesh, &[&disp], &sup, femcraft_rfdb::Extremum::Max).unwrap();
+        let (lo, hi) =
+            add_contact_surface(&mut s, &mesh, &[&disp], &sup, femcraft_rfdb::Extremum::Max)
+                .unwrap();
         // Uplift (-5 mm) is cut off to zero; the peak is 6e6 * 0.02 = 120 kN/m².
         assert!(lo.abs() < 1e-3 && (hi - 1.2e5).abs() < 1.0, "{lo}..{hi}");
         assert!(!s.result_triangles.is_empty());
         // A surface without a spring support paints nothing.
         let mut s2 = Scene::default();
-        assert!(add_contact_surface(&mut s2, &mesh, &[&disp], &HashMap::new(), femcraft_rfdb::Extremum::Max).is_none());
+        assert!(
+            add_contact_surface(
+                &mut s2,
+                &mesh,
+                &[&disp],
+                &HashMap::new(),
+                femcraft_rfdb::Extremum::Max
+            )
+            .is_none()
+        );
     }
 
     /// Member results plot as one connected polyline per member line (no segment returns to the
@@ -1749,7 +1791,15 @@ mod tests {
             ],
         };
         let mut s = Scene::default();
-        let range = add_result_surface(&mut s, &mesh, &[&disp], ResultComponent::GlobalUz, 100.0, Extremum::Both, true);
+        let range = add_result_surface(
+            &mut s,
+            &mesh,
+            &[&disp],
+            ResultComponent::GlobalUz,
+            100.0,
+            Extremum::Both,
+            true,
+        );
         // Discrete bands split the quad into many solid-colour triangles spanning the u_z values.
         let tris = &s.result_triangles;
         assert!(tris.len() >= 6 && tris.len() % 3 == 0);
@@ -1772,7 +1822,16 @@ mod tests {
         // A non-displacement component paints nothing.
         let mut s2 = Scene::default();
         assert!(
-            add_result_surface(&mut s2, &mesh, &[&disp], ResultComponent::SurfaceMx, 1.0, Extremum::Both, true).is_none()
+            add_result_surface(
+                &mut s2,
+                &mesh,
+                &[&disp],
+                ResultComponent::SurfaceMx,
+                1.0,
+                Extremum::Both,
+                true
+            )
+            .is_none()
         );
 
         // Member deformation: line 1 carries a member -> one orange segment.
@@ -1786,7 +1845,12 @@ mod tests {
     fn plain_results_are_thin_yellow_lines_and_follow_the_component() {
         use femcraft_rfdb::{Displacements, Extremum, FeMesh, ResultComponent};
         let mesh = FeMesh {
-            nodes: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            nodes: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
             elements: vec![[1, 2, 3, 4]],
             element_surface: vec![1],
             lines: vec![(1, vec![1, 2])],
@@ -1801,31 +1865,72 @@ mod tests {
         };
         // Surface, colours off: the displaced mesh net in yellow, no contour triangles.
         let mut s = Scene::default();
-        add_result_surface(&mut s, &mesh, &[&disp], ResultComponent::GlobalUz, 10.0, Extremum::Both, false)
-            .unwrap();
+        add_result_surface(
+            &mut s,
+            &mesh,
+            &[&disp],
+            ResultComponent::GlobalUz,
+            10.0,
+            Extremum::Both,
+            false,
+        )
+        .unwrap();
         assert!(s.result_triangles.is_empty());
         assert_eq!(s.lines.len(), 8, "four edges");
-        assert!(s.lines.iter().all(|v| v.color == RESULT_YELLOW && v.width == RESULT_NET_WIDTH));
+        assert!(
+            s.lines
+                .iter()
+                .all(|v| v.color == RESULT_YELLOW && v.width == RESULT_NET_WIDTH)
+        );
         // u_z only moves the shape along z: node 2 keeps its x (world x = model x).
         assert!(s.lines.iter().any(|v| (v.pos[0] - 1.0).abs() < 1e-6));
         // u_x only moves it along x: node 2 is now at x = 1.5.
         let mut sx = Scene::default();
-        add_result_surface(&mut sx, &mesh, &[&disp], ResultComponent::GlobalUx, 1.0, Extremum::Both, false)
-            .unwrap();
+        add_result_surface(
+            &mut sx,
+            &mesh,
+            &[&disp],
+            ResultComponent::GlobalUx,
+            1.0,
+            Extremum::Both,
+            false,
+        )
+        .unwrap();
         assert!(sx.lines.iter().any(|v| (v.pos[0] - 1.5).abs() < 1e-6));
         assert!(sx.lines.iter().all(|v| v.pos[2].abs() < 1e-6));
         // A rotation plots the full translation shape.
         let mut sp = Scene::default();
-        add_result_surface(&mut sp, &mesh, &[&disp], ResultComponent::GlobalPhiY, 10.0, Extremum::Both, false)
-            .unwrap();
+        add_result_surface(
+            &mut sp,
+            &mesh,
+            &[&disp],
+            ResultComponent::GlobalPhiY,
+            10.0,
+            Extremum::Both,
+            false,
+        )
+        .unwrap();
         assert!(sp.lines.iter().any(|v| v.pos[2].abs() > 0.05));
         // Members, colours off: a plain yellow line plot.
         let members: HashSet<u32> = [1].into_iter().collect();
         let mut sm = Scene::default();
-        add_result_members(&mut sm, &mesh, &[&disp], &members, ResultComponent::GlobalUz, 10.0, Extremum::Both, false)
-            .unwrap();
+        add_result_members(
+            &mut sm,
+            &mesh,
+            &[&disp],
+            &members,
+            ResultComponent::GlobalUz,
+            10.0,
+            Extremum::Both,
+            false,
+        )
+        .unwrap();
         assert_eq!(sm.lines.len(), 2);
-        assert!(sm.lines.iter().all(|v| v.color == RESULT_YELLOW && v.width == RESULT_PLAIN_WIDTH));
+        assert!(
+            sm.lines
+                .iter()
+                .all(|v| v.color == RESULT_YELLOW && v.width == RESULT_PLAIN_WIDTH)
+        );
     }
 
     #[test]
@@ -1837,20 +1942,39 @@ mod tests {
             element_surface: vec![],
             lines: vec![(1, vec![1, 2])],
         };
-        let up = Displacements { nodal: vec![[0.0; 6], [0.0, 0.0, 0.010, 0.0, 0.0, 0.0]] };
-        let down = Displacements { nodal: vec![[0.0; 6], [0.0, 0.0, -0.004, 0.0, 0.0, 0.0]] };
+        let up = Displacements {
+            nodal: vec![[0.0; 6], [0.0, 0.0, 0.010, 0.0, 0.0, 0.0]],
+        };
+        let down = Displacements {
+            nodal: vec![[0.0; 6], [0.0, 0.0, -0.004, 0.0, 0.0, 0.0]],
+        };
         let members: HashSet<u32> = [1].into_iter().collect();
         let tip_z = |ext| {
             let mut s = Scene::default();
-            add_result_members(&mut s, &mesh, &[&up, &down], &members, ResultComponent::GlobalUz, 10.0, ext, true)
-                .unwrap();
+            add_result_members(
+                &mut s,
+                &mesh,
+                &[&up, &down],
+                &members,
+                ResultComponent::GlobalUz,
+                10.0,
+                ext,
+                true,
+            )
+            .unwrap();
             // The tip of each drawn segment (second vertex); world z = -model z.
             s.lines.chunks(2).map(|c| c[1].pos[2]).collect::<Vec<_>>()
         };
         let both = tip_z(Extremum::Both);
         assert_eq!(both.len(), 2, "two shapes in one view");
-        assert!(both.iter().any(|z| (z + 0.10).abs() < 1e-5), "max shape: {both:?}");
-        assert!(both.iter().any(|z| (z - 0.04).abs() < 1e-5), "min shape: {both:?}");
+        assert!(
+            both.iter().any(|z| (z + 0.10).abs() < 1e-5),
+            "max shape: {both:?}"
+        );
+        assert!(
+            both.iter().any(|z| (z - 0.04).abs() < 1e-5),
+            "min shape: {both:?}"
+        );
         assert_eq!(tip_z(Extremum::Max).len(), 1);
         assert!((tip_z(Extremum::Max)[0] + 0.10).abs() < 1e-5);
         assert!((tip_z(Extremum::Min)[0] - 0.04).abs() < 1e-5);
