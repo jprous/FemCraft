@@ -197,6 +197,29 @@ impl Document {
         self.selection
             .retain(|id| self.rf.model.get(*id).is_some());
         self.results_view = crate::results_panel::ResultsView::default();
+        // Freshly calculated: show the first result quantity (displacements) of the first case.
+        if let Some(results) = &self.results {
+            let first = |nodes: &[femcraft_rfdb::ResultNode]| {
+                fn find(nodes: &[femcraft_rfdb::ResultNode]) -> Option<femcraft_rfdb::ResultComponent> {
+                    nodes.iter().find_map(|n| match n {
+                        femcraft_rfdb::ResultNode::Leaf(l)
+                            if l.group == femcraft_rfdb::RadioGroup::Result =>
+                        {
+                            Some(l.component)
+                        }
+                        femcraft_rfdb::ResultNode::Leaf(_) => None,
+                        femcraft_rfdb::ResultNode::Category { children, .. } => find(children),
+                    })
+                }
+                find(nodes)
+            };
+            let tree = femcraft_rfdb::results::result_tree(&self.rf.model);
+            if let (Some(case), Some(comp)) = (results.cases.first(), first(&tree)) {
+                self.results_view.selected = Some((case.kind, case.no));
+                self.results_view.active = Some(comp);
+                self.results_view.picked = true; // switches the Results display on
+            }
+        }
         self.synced_case = None;
         self.result_disp = None;
         self.result_legend = None;

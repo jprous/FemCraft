@@ -34,6 +34,10 @@ pub trait Workspace {
     fn solve(&mut self) -> Result<PathBuf, String> {
         Err("solving needs the FemCraft window (Settings > RFEM server)".into())
     }
+    /// Generates only the FE mesh of the active model with the RFEM server (no results).
+    fn mesh(&mut self) -> Result<PathBuf, String> {
+        Err("meshing needs the FemCraft window (Settings > RFEM server)".into())
+    }
     fn models(&self) -> Vec<ModelInfo>;
     fn active(&mut self) -> Option<&mut RfDocument>;
     /// Called after the active model was edited (the GUI redraws it).
@@ -139,6 +143,16 @@ pub fn methods() -> Vec<MethodInfo> {
             name: "open_model".into(),
             description: "Opens an RFEM 6 .rf6 file and makes it the active model.".into(),
             schema: obj(json!({"model_path": {"type": "string"}}), &["model_path"]),
+            changes_model: false,
+        },
+        MethodInfo {
+            name: "generate_mesh".into(),
+            description: "Generates only the FE mesh of the active model with the RFEM 6 server \
+                (as RFEM's generate_mesh), without calculating. The model is saved first if it \
+                has unsaved edits; the mesh is stored in the model's file and the open model \
+                is reloaded (see get_mesh)."
+                .into(),
+            schema: obj(json!({}), &[]),
             changes_model: false,
         },
         MethodInfo {
@@ -303,6 +317,10 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
         "open_model" => {
             let n = ws.open_model(&path("model_path")?)?;
             return Ok(json!({"name": n}));
+        }
+        "generate_mesh" => {
+            let p = ws.mesh()?;
+            return Ok(json!({"meshed": p.display().to_string()}));
         }
         "calculate_all" => {
             let p = ws.solve()?;

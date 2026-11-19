@@ -238,7 +238,47 @@ pub struct Solved {
 
 /// Calculates `input` with the RFEM server into `out_dir/<name>.rf6`.
 pub fn solve(cfg: &RfemConfig, input: &Path, out_dir: &Path) -> Result<Solved, String> {
+    run_job(cfg, Job::Calculate, input, out_dir)
+}
+
+/// What the server does with the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Job {
+    /// `calculate_all`: mesh and solve; the file gets results and the FE mesh.
+    Calculate,
+    /// `generate_mesh`: only the FE mesh (`!solver/M/`), no results.
+    Mesh,
+}
+
+impl Job {
+    fn method(self) -> &'static str {
+        match self {
+            Job::Calculate => "calculate_all",
+            Job::Mesh => "generate_mesh",
+        }
+    }
+}
+
+/// Generates the FE mesh of `input` with the RFEM server into `out_dir/<name>.rf6`.
+pub fn mesh(cfg: &RfemConfig, input: &Path, out_dir: &Path) -> Result<Solved, String> {
+    run_job(cfg, Job::Mesh, input, out_dir)
+}
+
+/// Copies `input` to `out_dir`, runs `job` on the copy and returns it.
+pub fn run_job(cfg: &RfemConfig, job: Job, input: &Path, out_dir: &Path) -> Result<Solved, String> {
+    run_job_with(cfg, job, input, out_dir, &|_| {})
+}
+
+/// [`run_job`], reporting what it is doing (for a progress dialog) through `progress`.
+pub fn run_job_with(
+    cfg: &RfemConfig,
+    job: Job,
+    input: &Path,
+    out_dir: &Path,
+    progress: &dyn Fn(&str),
+) -> Result<Solved, String> {
     let t0 = Instant::now();
+    progress("Preparing the model…");
     if !input.is_file() {
         return Err(format!(
             "{} does not exist; save the model first",
@@ -255,9 +295,10 @@ pub fn solve(cfg: &RfemConfig, input: &Path, out_dir: &Path) -> Result<Solved, S
     let mut child = None;
     let started_server = !answers(addr);
     if started_server {
+        progress("Starting the RFEM server (this can take half a minute)…");
         child = Some(start_server(cfg, addr)?);
     }
-    let result = run(addr, &target);
+    let result = run(addr, &target, job, progress);
     if let Some(mut c) = child {
         let _ = c.kill();
         let _ = c.wait();
@@ -327,7 +368,7 @@ fn start_server(cfg: &RfemConfig, addr: SocketAddr) -> Result<Child, String> {
 }
 
 /// Open, calculate, save, close; the file is complete when it stops changing.
-fn run(addr: SocketAddr, file: &Path) -> Result<(), String> {
+fn run(addr: SocketAddr, file: &Path, job: Job, progress: &dyn Fn(&str)) -> Result<(), String> {
     let path = file.to_string_lossy().into_owned();
     let before = std::fs::metadata(file).and_then(|m| m.modified()).ok();
     let indexes = || {
@@ -336,13 +377,18 @@ fn run(addr: SocketAddr, file: &Path) -> Result<(), String> {
             .unwrap_or_default()
     };
     let before_open = indexes();
+    progress("Opening the model in RFEM…");
     let r = call(addr, "/", "open_model", &[("model_path", path.clone())])?;
     let url = element(&r, "value").ok_or("RFEM did not return the opened model")?;
     // Each open model is served on its own port (`http://127.0.0.1:8083/`).
     let maddr = url_addr(&url).unwrap_or(addr);
     let mp = url_path(&url);
     let outcome = (|| {
-        let r = call(maddr, &mp, "calculate_all", &[("skip_warnings", "true".into())])?;
+        progress(match job {
+            Job::Calculate => "RFEM is calculating…",
+            Job::Mesh => "RFEM is generating the FE mesh…",
+        });
+        let r = call(maddr, &mp, job.method(), &[("skip_warnings", "true".into())])?;
         if element(&r, "succeeded").as_deref() == Some("false") {
             let what = element(&r, "messages").unwrap_or_default();
             let object = element(&r, "object").unwrap_or_default();
@@ -350,10 +396,12 @@ fn run(addr: SocketAddr, file: &Path) -> Result<(), String> {
             let msg = element(&r, "message").unwrap_or_default();
             return Err(format!("RFEM could not calculate: {what} {object} {field} {msg}"));
         }
+        progress("Saving the model with RFEM…");
         call(maddr, &mp, "save", &[("file_path", path.clone())])?;
         wait_written(file, before)
     })();
     // Close the model we opened (never one that was open before), whatever happened.
+    progress("Closing the model…");
     if let Some(index) = indexes().into_iter().find(|i| !before_open.contains(i)) {
         let _ = call(
             addr,

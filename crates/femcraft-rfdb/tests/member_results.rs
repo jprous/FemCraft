@@ -32,3 +32,21 @@ fn member_displacements_are_read() {
     let peak = d.nodal.iter().map(|u| u[2]).fold(0.0, f64::max);
     assert!(peak > 1e-5 && peak < 1e-3, "peak uz {peak}");
 }
+
+/// Saving with the `!solver/` prefix dropped (Solve > Delete results) gives an unsolved model.
+#[test]
+fn dropping_solver_data_removes_results() {
+    let Some(path) = std::env::var_os("FEMCRAFT_TEST_MEMBER_RESULTS") else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("femcraft-del-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("unsolved.rf6");
+    let mut doc = RfDocument::open(std::path::Path::new(&path)).unwrap();
+    doc.archive.drop_prefixes.push("!solver/".into());
+    doc.save(&out).unwrap();
+    let back = RfDocument::open(&out).unwrap();
+    assert!(back.results().unwrap().is_none(), "results survived");
+    assert!(back.fe_mesh().unwrap().is_none(), "mesh survived");
+    let _ = std::fs::remove_dir_all(&dir);
+}

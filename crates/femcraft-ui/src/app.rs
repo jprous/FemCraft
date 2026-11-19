@@ -197,6 +197,17 @@ impl From<SavedGrid> for GridSettings {
     }
 }
 
+/// A calculation / meshing run by the RFEM server on another thread.
+struct SolveJob {
+    /// The model tab it belongs to.
+    doc: u64,
+    job: femcraft_rfem::Job,
+    rx: std::sync::mpsc::Receiver<Result<femcraft_rfem::Solved, String>>,
+    /// What the server side is doing now (shown in the progress dialog).
+    status: std::sync::Arc<std::sync::Mutex<String>>,
+    started: std::time::Instant,
+}
+
 pub struct FemCraftApp {
     grid: GridSettings,
     show_axes: bool,
@@ -236,7 +247,7 @@ pub struct FemCraftApp {
     /// The RFEM server dialog (Settings > RFEM server…) while open.
     rfem_dialog: Option<RfemDraft>,
     /// A calculation running on another thread (Solve menu).
-    solve_job: Option<(u64, std::sync::mpsc::Receiver<Result<femcraft_rfem::Solved, String>>)>,
+    solve_job: Option<SolveJob>,
 }
 
 impl FemCraftApp {
@@ -928,19 +939,62 @@ impl FemCraftApp {
 
     /// Solve: calculate the active model with the RFEM server on another thread.
     fn solve_menu(&mut self, ui: &mut egui::Ui) {
+        use femcraft_rfem::Job;
         let busy = self.solve_job.is_some();
         let label = if busy {
             "Calculating…"
         } else {
             "Calculate with RFEM server"
         };
+        let mut start = None;
         if ui
             .add_enabled(self.active.is_some() && !busy, egui::Button::new(label))
             .on_hover_text("Saves the model, then runs calculate_all on the RFEM 6 server")
             .clicked()
         {
+            start = Some(Job::Calculate);
+        }
+        if ui
+            .add_enabled(self.active.is_some() && !busy, egui::Button::new("Mesh with RFEM"))
+            .on_hover_text("Saves the model, then generates only the FE mesh on the RFEM 6 server")
+            .clicked()
+        {
+            start = Some(Job::Mesh);
+        }
+        if let Some(job) = start {
             ui.close();
-            if let Err(e) = self.start_solve() {
+            if let Err(e) = self.start_solve(job) {
+                self.notice = None;
+                self.message = Some(e);
+            }
+        }
+        let has_results = self
+            .active_doc()
+            .is_some_and(|d| d.results.is_some() && !d.is_modified());
+        if ui
+            .add_enabled(has_results && !busy, egui::Button::new("Delete results"))
+            .on_hover_text("Removes the calculated results (and FE mesh) from the model file")
+            .clicked()
+        {
+            ui.close();
+            if let Err(e) = self.delete_results("Results deleted") {
+                self.notice = None;
+                self.message = Some(e);
+            }
+        }
+        let has_mesh = self
+            .active_doc()
+            .is_some_and(|d| d.fe_mesh.is_some() && !d.is_modified());
+        if ui
+            .add_enabled(has_mesh && !busy, egui::Button::new("Delete mesh"))
+            .on_hover_text(
+                "Removes the FE mesh from the model file. Results belong to the mesh, so any \
+                 results are removed with it.",
+            )
+            .clicked()
+        {
+            ui.close();
+            if let Err(e) = self.delete_results("Mesh deleted") {
                 self.notice = None;
                 self.message = Some(e);
             }
@@ -949,6 +1003,23 @@ impl FemCraftApp {
             "Server: {}",
             self.settings.rfem().server_exe.display()
         ));
+    }
+
+    /// Solve > Delete results / Delete mesh: writes the active model without its `!solver/`
+    /// data (mesh and results, which cannot exist without it) and reloads it, so it is an
+    /// unmeshed, unsolved model again. `done` is the status-bar message.
+    fn delete_results(&mut self, done: &str) -> Result<(), String> {
+        let path = self.saved_active_path()?;
+        let protos = Self::prototype_files();
+        let d = self.active_doc_mut().ok_or("no model is open")?;
+        if !d.rf.archive.drop_prefixes.iter().any(|p| p == "!solver/") {
+            d.rf.archive.drop_prefixes.push("!solver/".into());
+        }
+        d.save_as(&path)?;
+        d.reload(&path, protos)?;
+        self.message = None;
+        self.notice = Some(done.to_owned());
+        Ok(())
     }
 
     /// The active model's `.rf6` path, saved first when it has unsaved edits.
@@ -970,17 +1041,33 @@ impl FemCraftApp {
     }
 
     /// Saves the active model and starts calculating it.
-    fn start_solve(&mut self) -> Result<(), String> {
+    fn start_solve(&mut self, job: femcraft_rfem::Job) -> Result<(), String> {
         let path = self.saved_active_path()?;
         let id = self.active.ok_or("no model is open")?;
         let cfg = self.settings.rfem();
         let out = self.working_dir().join("solved");
         let (tx, rx) = std::sync::mpsc::channel();
-        self.notice = Some(format!("Calculating {} with RFEM…", path.display()));
+        let what = match job {
+            femcraft_rfem::Job::Calculate => "Calculating",
+            femcraft_rfem::Job::Mesh => "Meshing",
+        };
+        self.notice = Some(format!("{what} {} with RFEM…", path.display()));
         self.message = None;
-        self.solve_job = Some((id, rx));
+        let status = std::sync::Arc::new(std::sync::Mutex::new(String::from("Starting…")));
+        self.solve_job = Some(SolveJob {
+            doc: id,
+            job,
+            rx,
+            status: status.clone(),
+            started: std::time::Instant::now(),
+        });
         std::thread::spawn(move || {
-            let _ = tx.send(femcraft_rfem::solve(&cfg, &path, &out));
+            let report = |s: &str| {
+                if let Ok(mut st) = status.lock() {
+                    *st = s.to_owned();
+                }
+            };
+            let _ = tx.send(femcraft_rfem::run_job_with(&cfg, job, &path, &out, &report));
         });
         Ok(())
     }
@@ -990,7 +1077,12 @@ impl FemCraftApp {
     /// settings are kept). The file it replaces is kept as `<name>.rf6bak`. The calculated copy
     /// is removed. A model edited meanwhile is not replaced: the calculated copy opens as a
     /// separate tab instead. Returns the model's path.
-    fn adopt_solved(&mut self, id: u64, solved: &Path) -> Result<PathBuf, String> {
+    fn adopt_solved(
+        &mut self,
+        id: u64,
+        solved: &Path,
+        job: femcraft_rfem::Job,
+    ) -> Result<PathBuf, String> {
         let Some(pos) = self.docs.iter().position(|d| d.id == id) else {
             // The tab was closed meanwhile: show the calculated copy.
             self.try_open(solved)?;
@@ -1016,22 +1108,73 @@ impl FemCraftApp {
         }
         let protos = Self::prototype_files();
         self.docs[pos].reload(&target, protos)?;
+        if job == femcraft_rfem::Job::Mesh {
+            // The point of meshing is to see the mesh: switch Display > Mesh on.
+            self.docs[pos].vis.fe_mesh = true;
+        }
         Ok(target)
+    }
+
+    /// Runs `job` on the active model and waits for it (MCP); the open tab is updated in place.
+    fn run_blocking(&mut self, job: femcraft_rfem::Job) -> Result<PathBuf, String> {
+        if self.solve_job.is_some() {
+            return Err("a calculation is already running".into());
+        }
+        let path = self.saved_active_path()?;
+        let id = self.active.ok_or("no model is open")?;
+        let done = femcraft_rfem::run_job(
+            &self.settings.rfem(),
+            job,
+            &path,
+            &self.working_dir().join("solved"),
+        )?;
+        self.adopt_solved(id, &done.path, job)
+    }
+
+    /// The modal progress dialog shown while the RFEM server works: nothing else can be
+    /// clicked until it is done.
+    fn solve_dialog(&self, ctx: &egui::Context) {
+        let Some(sj) = &self.solve_job else { return };
+        let title = match sj.job {
+            femcraft_rfem::Job::Calculate => "Calculating with RFEM",
+            femcraft_rfem::Job::Mesh => "Meshing with RFEM",
+        };
+        let status = sj.status.lock().map(|s| s.clone()).unwrap_or_default();
+        let secs = sj.started.elapsed().as_secs();
+        #[allow(deprecated)]
+        let id = egui::Id::new("solve_progress"); // a fixed id: the modal keeps its state
+        egui::Modal::new(id).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.heading(title);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(status);
+            });
+            ui.add_space(6.0);
+            ui.weak(format!("Elapsed: {}:{:02}", secs / 60, secs % 60));
+            ui.weak("Please wait; the model updates by itself when RFEM is done.");
+        });
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
 
     /// Picks up a finished calculation: the results appear in the open model.
     fn poll_solve(&mut self, ctx: &egui::Context) {
-        let Some((id, rx)) = &self.solve_job else {
+        let Some(sj) = &self.solve_job else {
             return;
         };
-        let id = *id;
-        match rx.try_recv() {
+        let (id, job) = (sj.doc, sj.job);
+        match sj.rx.try_recv() {
             Ok(Ok(done)) => {
                 self.solve_job = None;
-                match self.adopt_solved(id, &done.path) {
+                match self.adopt_solved(id, &done.path, job) {
                     Ok(_) => {
                         self.message = None;
-                        self.notice = Some(format!("Calculated in {:.0} s", done.seconds));
+                        let what = match job {
+                            femcraft_rfem::Job::Calculate => "Calculated",
+                            femcraft_rfem::Job::Mesh => "Meshed",
+                        };
+                        self.notice = Some(format!("{what} in {:.0} s", done.seconds));
                     }
                     Err(e) => {
                         self.notice = None;
@@ -1709,6 +1852,7 @@ impl eframe::App for FemCraftApp {
             d.clear_selection();
         }
         self.poll_solve(&ui.ctx().clone());
+        self.solve_dialog(&ui.ctx().clone());
         self.menu_bar(ui);
         self.rfem_dialog_ui(&ui.ctx().clone());
         self.ribbon(ui);
@@ -2062,17 +2206,11 @@ impl femcraft_mcp::Workspace for FemCraftApp {
     }
 
     fn solve(&mut self) -> Result<PathBuf, String> {
-        if self.solve_job.is_some() {
-            return Err("a calculation is already running".into());
-        }
-        let path = self.saved_active_path()?;
-        let id = self.active.ok_or("no model is open")?;
-        let done = femcraft_rfem::solve(
-            &self.settings.rfem(),
-            &path,
-            &self.working_dir().join("solved"),
-        )?;
-        self.adopt_solved(id, &done.path)
+        self.run_blocking(femcraft_rfem::Job::Calculate)
+    }
+
+    fn mesh(&mut self) -> Result<PathBuf, String> {
+        self.run_blocking(femcraft_rfem::Job::Mesh)
     }
 
     fn models(&self) -> Vec<femcraft_mcp::ModelInfo> {

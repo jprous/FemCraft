@@ -85,7 +85,9 @@ Plan and milestone status: `docs/ROADMAP.md`.
   the solve scratch folder is `<working dir>\solved`; when it finishes `App::adopt_solved` copies
   the calculated file over the model's file (old one kept as `<name>.rf6bak`), deletes the scratch
   folder and `Document::reload`s the open tab in place, so results just appear; a model edited
-  meanwhile opens the calculated copy as a new tab instead). Picking a load case in the Results
+  meanwhile opens the calculated copy as a new tab instead). Solve > "Mesh with RFEM" /
+  MCP `generate_mesh` run `generate_mesh` instead of `calculate_all` (`femcraft_rfem::Job`):
+  the file gets `!solver/M/` (FE mesh) but no result folders (tested, ~69 s). Picking a load case in the Results
   panel also sets the Display panel's load case. `crates/femcraft-rfem`: `solve()` copies the
   model, starts `RFEM6Server.exe` when nothing answers on the port (needs `--email` /
   `--password` / `--license`; entered in Settings > RFEM server… (dialog), password kept in the
