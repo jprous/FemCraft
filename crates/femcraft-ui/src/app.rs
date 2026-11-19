@@ -1658,6 +1658,14 @@ impl FemCraftApp {
                 v.loads,
                 egui::Checkbox::new(&mut v.load_values, "Load values"),
             );
+            ui.add_enabled(
+                v.results,
+                egui::Checkbox::new(&mut v.result_colours, "Colour results"),
+            )
+            .on_hover_text(
+                "Off: results are plain thin yellow lines (members: the line plot; surfaces: \
+                 the displaced mesh net, no contour)",
+            );
             ui.end_row();
         });
         let loads_on = d.vis.loads;

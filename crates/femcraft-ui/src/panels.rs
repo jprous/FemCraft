@@ -492,6 +492,9 @@ pub fn tables(
         return false;
     };
     let result = value.and_then(|v| {
+        if key == SUPPORT_COLUMN {
+            return assign_support(model, id, v);
+        }
         if model.get(id).is_none() {
             add_object(model, id)?;
         }
@@ -536,6 +539,95 @@ fn library_dialog(ctx: &egui::Context, doc: u64, state: &mut TableState) {
     }
 }
 
+/// Key of the virtual "Support" column that ends the Nodes / Lines / Members / Surfaces tables.
+const SUPPORT_COLUMN: &str = "@support";
+
+/// For an object kind that can carry a support: the support kind and the field of the support
+/// that lists the objects it is assigned to.
+fn assignment(kind: ObjectKind) -> Option<(ObjectKind, &'static str)> {
+    use ObjectKind as K;
+    match kind {
+        K::Node => Some((K::NodalSupport, "nodes")),
+        K::Line => Some((K::LineSupport, "lines")),
+        K::Member => Some((K::MemberSupport, "members")),
+        K::Surface => Some((K::SurfaceSupport, "surfaces")),
+        _ => None,
+    }
+}
+
+/// The columns a table shows. A support table lists only the support definitions; which
+/// objects have the support is shown (and set) in the object's own table, column "Support".
+fn table_fields(kind: ObjectKind) -> Vec<&'static femcraft_model::FieldSpec> {
+    use ObjectKind as K;
+    let assigned = match kind {
+        K::NodalSupport => "nodes",
+        K::LineSupport => "lines",
+        K::MemberSupport => "members",
+        K::SurfaceSupport => "surfaces",
+        _ => "",
+    };
+    kind.spec().fields.iter().filter(|f| f.key != assigned).collect()
+}
+
+/// Numbers of the supports an object is assigned to (normally none or one).
+fn supports_of(model: &Model, kind: ObjectKind, no: u32) -> Vec<u32> {
+    let Some((support_kind, key)) = assignment(kind) else {
+        return Vec::new();
+    };
+    model
+        .iter_kind(support_kind)
+        .filter(|(_, o)| o.get(key).as_ref_list().contains(&no))
+        .map(|(id, _)| id.no)
+        .collect()
+}
+
+/// Gives an object the support `value` (a support number, or null for none): it is removed
+/// from every other support of that kind and added to the chosen one.
+fn assign_support(model: &mut Model, id: ObjectId, value: Value) -> Result<(), String> {
+    let (support_kind, key) = assignment(id.kind).ok_or("this kind has no supports")?;
+    let target = match value {
+        Value::Ref(n) => Some(n),
+        _ => None,
+    };
+    if let Some(n) = target
+        && model.get(ObjectId::new(support_kind, n)).is_none()
+    {
+        return Err(format!("{} {n} does not exist", singular(support_kind)));
+    }
+    let supports: Vec<ObjectId> = model.iter_kind(support_kind).map(|(i, _)| i).collect();
+    for sid in supports {
+        let mut list = model
+            .get(sid)
+            .map(|o| o.get(key).as_ref_list().to_vec())
+            .unwrap_or_default();
+        let has = list.contains(&id.no);
+        let wants = target == Some(sid.no);
+        if has && !wants {
+            list.retain(|n| *n != id.no);
+        } else if wants && !has {
+            list.push(id.no);
+            list.sort_unstable();
+        } else {
+            continue;
+        }
+        model
+            .set(sid, key, Value::RefList(list))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Reads the typed text of a Support cell: empty = no support, else a support number.
+fn parse_support(text: &str) -> Result<Value, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(Value::Null);
+    }
+    t.parse::<u32>()
+        .map(Value::Ref)
+        .map_err(|_| format!("'{t}' is not a support number"))
+}
+
 /// The rows of one object kind; clicking a row selects the object, double-clicking an editable
 /// cell edits it. Returns an edit to apply: (object, field, parsed value or error).
 fn object_table(
@@ -548,6 +640,8 @@ fn object_table(
 ) -> Option<(ObjectId, &'static str, Result<Value, String>)> {
     let kind = state.kind;
     let spec = kind.spec();
+    let fields = table_fields(kind);
+    let has_support_col = assignment(kind).is_some();
     let is_load = spec.is_load() && kind != ObjectKind::LoadCase;
     let mut rows: Vec<(ObjectId, &Object)> = model.iter_kind(kind).collect();
     // The empty row: the next free number (in the shown load case for loads).
@@ -588,7 +682,7 @@ fn object_table(
             table
                 .columns(
                     Column::initial(110.0).at_least(40.0).clip(true),
-                    spec.fields.len(),
+                    fields.len() + has_support_col as usize,
                 )
                 .header(22.0, |mut header| {
                     header.col(|ui| {
@@ -599,7 +693,7 @@ fn object_table(
                             ui.strong("LC");
                         });
                     }
-                    for f in spec.fields {
+                    for f in &fields {
                         header.col(|ui| {
                             let text = match f.ty {
                                 FieldType::Float(u) if !u.is_empty() => {
@@ -616,6 +710,15 @@ fn object_table(
                             } else {
                                 ui.strong(text).on_hover_text(f.key);
                             }
+                        });
+                    }
+                    if has_support_col {
+                        header.col(|ui| {
+                            ui.label(egui::RichText::new("Support").strong().color(editable_color))
+                                .on_hover_text(
+                                    "Number of the line in the supports table this object refers to \
+                                     (empty: no support). Double-click to change it.",
+                                );
                         });
                     }
                 })
@@ -637,7 +740,7 @@ fn object_table(
                                 ui.label(id.load_case.to_string());
                             });
                         }
-                        for f in spec.fields {
+                        for f in &fields {
                             row.col(|ui| {
                                 let value = obj.get(f.key);
                                 // Only fields the file stores for this object (e.g. a surface
@@ -778,6 +881,59 @@ fn object_table(
                                 }
                             });
                         }
+                        if has_support_col {
+                            row.col(|ui| {
+                                let this_cell = state
+                                    .editing
+                                    .as_ref()
+                                    .is_some_and(|(_, e, k, _)| *e == id && *k == SUPPORT_COLUMN);
+                                if this_cell {
+                                    let (enter, escape) = ui.input(|i| {
+                                        (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape))
+                                    });
+                                    let text = &mut state.editing.as_mut().unwrap().3;
+                                    let r = ui.add(
+                                        egui::TextEdit::singleline(text).desired_width(f32::INFINITY),
+                                    );
+                                    if state.focus_editor {
+                                        r.request_focus();
+                                        state.focus_editor = false;
+                                    }
+                                    if escape {
+                                        state.editing = None;
+                                    } else if r.lost_focus() || enter {
+                                        let typed = state.editing.take().unwrap().3;
+                                        edit = Some((id, SUPPORT_COLUMN, parse_support(&typed)));
+                                    }
+                                    return;
+                                }
+                                let current = if is_new {
+                                    String::new()
+                                } else {
+                                    supports_of(model, kind, id.no)
+                                        .iter()
+                                        .map(u32::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                };
+                                let label = ui.add(
+                                    egui::Label::new(current.clone()).sense(egui::Sense::click()),
+                                );
+                                let cell = ui.interact(
+                                    ui.max_rect(),
+                                    ui.scope_id().with("support_cell"),
+                                    egui::Sense::click(),
+                                );
+                                let label = label.union(cell);
+                                if !is_new && label.double_clicked() {
+                                    state.editing = Some((doc, id, SUPPORT_COLUMN, current));
+                                    state.focus_editor = true;
+                                } else if label.clicked() && !is_new {
+                                    let ctrl = label.ctx.input(|i| i.modifiers.ctrl);
+                                    click_select(ctrl, selection, id);
+                                }
+                            });
+                        }
                         let response = row.response();
                         if response.clicked() && !is_new {
                             let ctrl = response.ctx.input(|i| i.modifiers.ctrl);
@@ -814,5 +970,55 @@ fn parametric_section_name(kind: ObjectKind, obj: &femcraft_model::Object) -> Op
             Some(format!("2LE(BB) {p}/H"))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn support_column_assigns_one_support_per_object() {
+        let mut m = Model::default();
+        for no in 1..=3 {
+            m.add(ObjectId::new(ObjectKind::Node, no)).unwrap();
+        }
+        for (no, nodes) in [(1, vec![1, 2]), (2, vec![3])] {
+            let id = ObjectId::new(ObjectKind::NodalSupport, no);
+            m.add(id).unwrap();
+            m.set(id, "nodes", Value::RefList(nodes)).unwrap();
+        }
+        let list = |m: &Model, no: u32| {
+            m.get(ObjectId::new(ObjectKind::NodalSupport, no))
+                .unwrap()
+                .get("nodes")
+                .as_ref_list()
+                .to_vec()
+        };
+        assert_eq!(supports_of(&m, ObjectKind::Node, 2), vec![1]);
+        // Node 2 moves to support 2.
+        assign_support(&mut m, ObjectId::new(ObjectKind::Node, 2), Value::Ref(2)).unwrap();
+        assert_eq!(supports_of(&m, ObjectKind::Node, 2), vec![2]);
+        assert_eq!(list(&m, 1), vec![1]);
+        assert_eq!(list(&m, 2), vec![2, 3]);
+        // Empty cell: no support. Unknown support: refused, nothing changes.
+        assign_support(&mut m, ObjectId::new(ObjectKind::Node, 2), Value::Null).unwrap();
+        assert!(supports_of(&m, ObjectKind::Node, 2).is_empty());
+        assert!(assign_support(&mut m, ObjectId::new(ObjectKind::Node, 1), Value::Ref(9)).is_err());
+        assert_eq!(supports_of(&m, ObjectKind::Node, 1), vec![1]);
+        assert_eq!(parse_support(" "), Ok(Value::Null));
+        assert_eq!(parse_support("3"), Ok(Value::Ref(3)));
+        assert!(parse_support("x").is_err());
+    }
+
+    #[test]
+    fn support_tables_list_only_definitions() {
+        let keys = |k| table_fields(k).iter().map(|f| f.key).collect::<Vec<_>>();
+        assert!(!keys(ObjectKind::NodalSupport).contains(&"nodes"));
+        assert!(!keys(ObjectKind::LineSupport).contains(&"lines"));
+        assert!(!keys(ObjectKind::MemberSupport).contains(&"members"));
+        assert!(!keys(ObjectKind::SurfaceSupport).contains(&"surfaces"));
+        assert!(keys(ObjectKind::NodalSupport).contains(&"spring_x"));
+        assert!(keys(ObjectKind::Node).contains(&"coordinate_1"));
     }
 }

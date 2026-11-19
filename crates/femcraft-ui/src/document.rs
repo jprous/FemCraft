@@ -95,6 +95,8 @@ pub struct Document {
     pub results_view: crate::results_panel::ResultsView,
     /// The result case last mirrored into the Display panel's load case.
     synced_case: Option<(femcraft_rfdb::CaseKind, u32)>,
+    /// The Display panel's load case as last seen, to tell when the user changed it.
+    synced_lc: u32,
     /// Bumped on every edit, so the 3D view is rebuilt.
     pub revision: u64,
     pub load_cases: Vec<(u32, String)>,
@@ -153,6 +155,7 @@ impl Document {
             results,
             results_view: crate::results_panel::ResultsView::default(),
             synced_case: None,
+            synced_lc: vis.load_case,
             result_disp: None,
             result_legend: None,
             revision: 0,
@@ -221,6 +224,7 @@ impl Document {
             }
         }
         self.synced_case = None;
+        self.synced_lc = self.vis.load_case;
         self.result_disp = None;
         self.result_legend = None;
         self.path = path.to_owned();
@@ -289,7 +293,17 @@ impl Document {
             {
                 self.vis.load_case = no;
             }
+        } else if self.vis.load_case != self.synced_lc
+            && let Some(results) = &self.results
+            && let Some(case) = results.cases.iter().find(|c| {
+                c.kind == femcraft_rfdb::CaseKind::LoadCase && c.no == self.vis.load_case
+            })
+        {
+            // The user picked another load case in the Display panel: show its results too.
+            self.results_view.selected = Some((case.kind, case.no));
+            self.synced_case = self.results_view.selected;
         }
+        self.synced_lc = self.vis.load_case;
         // Load results for the selected case and pick an exaggeration factor before hashing.
         self.update_result_overlay();
         let key = (
@@ -418,8 +432,10 @@ impl Document {
             scene::add_contact_surface(&mut self.scene, mesh, &disps, &supports, ext)
         } else {
             let mag = self.results_view.magnification.max(1.0);
-            scene::add_result_surface(&mut self.scene, mesh, &disps, comp, mag, ext)
+            let coloured = self.vis.result_colours;
+            scene::add_result_surface(&mut self.scene, mesh, &disps, comp, mag, ext, coloured)
         };
+        let coloured = self.vis.result_colours;
         // Member axes coloured by the quantity (members are plotted as lines).
         let member_lines: HashSet<u32> = self
             .rf
@@ -440,6 +456,7 @@ impl Document {
                 comp,
                 mag,
                 ext,
+                coloured,
             );
             member_plotted = m.is_some();
             match (range, m) {
@@ -447,6 +464,8 @@ impl Document {
                 (a, b) => a.or(b),
             }
         };
+        // Plain yellow lines carry no colour scale. (The contact stress is always coloured.)
+        let range = range.filter(|_| coloured || scene::is_contact(comp));
         if let Some((min, max)) = range {
             let (label, unit, factor) = comp.display();
             self.result_legend = Some(ResultLegend {
