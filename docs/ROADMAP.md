@@ -1,12 +1,14 @@
 # FemCraft roadmap
 
 FemCraft aims to be a familiar FEM pre-processor, solver front-end and post-processor in one
-application:
+application for FEA models:
 
-1. Open and save RFEM 6 models: `.rf6` (zipped) and `.rfc` (unzipped database), keeping the
-   same table structure as RFEM.
-2. Solve models with Salome-Meca / code_aster.
+1. Open and save RFEM 6 models (the native format for now): `.rf6` (zipped) and `.rfc`
+   (unzipped database), keeping the same table structure as RFEM.
+2. Solve models with the RFEM 6 solver, and later with Salome-Meca / code_aster.
 3. View results in the same application.
+4. Later: import models from other programs (Prokon Frame `.A03`, Robot, STAAD.Pro, Tekla
+   Structural Designer `.tsmd`, Midas).
 
 The strategy is to tackle the riskiest part first - reading and writing `.rf6` - and build the
 interface on top of a working file layer rather than ahead of it.

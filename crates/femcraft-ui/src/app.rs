@@ -1161,7 +1161,7 @@ impl FemCraftApp {
         let modal = egui::Modal::new(id).show(ctx, |ui| {
             ui.set_width(520.0);
             ui.heading(format!("FemCraft {}", env!("CARGO_PKG_VERSION")));
-            ui.label("A 3D structural modelling workspace for RFEM 6 models.");
+            ui.label("A 3D structural modelling workspace for FEA models.");
             ui.weak("Independent of, and not endorsed by, Dlubal Software. RFEM is a trademark of its owner.");
             ui.weak("Licensed under MIT or Apache-2.0.");
             ui.separator();
