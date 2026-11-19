@@ -99,6 +99,13 @@ Plan and milestone status: `docs/ROADMAP.md`.
   instead. Tested end to end with the server (5 span beam, 66 s incl. start-up): it needs
   `--start-soap-server <port>` (else "No valid port specified for WS server", exit 1) and keeps
   HTTP connections open, so read by Content-Length (not to EOF).
+- Which layout a results file has is read from its header, not the folder name (frames also use
+  `RN_` folders): `i32[5]` > 0 and `i32[155]` > 0 = element-end block of 1D elements (decoded
+  as below; nodes no 1D element touches keep the plausible values of the nodal block at
+  `i32[48]`); otherwise (`i32[5]` = 0, `i32[155]` = -1, surface / solid meshes) the nodal block at
+  `i32[48]`. Reading the nodal block of a frame gives garbage (1e30). Mixed 1D + 2D models: not
+  seen yet. Envelopes (design situation / result combination) of members draw the Max and / or Min
+  deformed shape (Both = both in one view); surfaces keep the undeformed envelope contour.
 - Results of 1D members live in `!solver/RO_<id>_<case> - SA1/Data.RO<id>` (surfaces / solids:
   `RN_*`). Same 601 header; the displacement block is at the byte offset in `i32[155]`: per
   element (`Data.E1D` pairs of FE nodes) 2 ends x 6 f64 `[ux,uy,uz,φx,φy,φz]` (member local axes;
@@ -109,6 +116,10 @@ Plan and milestone status: `docs/ROADMAP.md`.
   13 = global X / Y / Z (13 = Z down, positive magnitude = downwards). MCP accepts the API names
   (`LOAD_DIRECTION_GLOBAL_Z_OR_USER_DEFINED_W_TRUE` -> 13); text written into the column made RFEM
   use the local axes.
+- Support tables list only the support definitions (the `nodes` / `lines` / `members` / `surfaces`
+  assignment fields stay in the model but are not columns); the Nodes / Lines / Members / Surfaces
+  tables end in a virtual editable "Support" column (`panels::assign_support` moves the object
+  between the supports' lists).
 - Nodal support spring / restraint "rigid" is `inf` (JSON string `"inf"`; `null` writes NULL and
   RFEM refuses to calculate).
 - `crates/femcraft-aster`, `-results` placeholders.

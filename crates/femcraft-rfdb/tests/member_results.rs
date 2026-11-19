@@ -13,6 +13,12 @@ fn member_displacements_are_read() {
     let doc = RfDocument::open(std::path::Path::new(&path)).unwrap();
     let results = doc.results().unwrap().expect("RO_ folders count as results");
     assert!(!results.is_empty(), "no result cases found");
+    // Only calculated cases are listed (the history also names a never-calculated CO1 / DS1).
+    assert!(
+        results.cases.iter().all(|c| c.kind == CaseKind::LoadCase),
+        "{:?}",
+        results.cases.iter().map(|c| (c.kind, c.no)).collect::<Vec<_>>()
+    );
     let mesh = doc.fe_mesh().unwrap().expect("FE mesh");
     let case = results
         .cases
@@ -49,4 +55,79 @@ fn dropping_solver_data_removes_results() {
     assert!(back.results().unwrap().is_none(), "results survived");
     assert!(back.fe_mesh().unwrap().is_none(), "mesh survived");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A frame (1D mesh only) keeps its results in `RN_` folders; they decode as member
+/// displacements, not as the nodal block of surface meshes (which holds garbage there).
+/// `FEMCRAFT_TEST_FRAME_RESULTS` names such a solved model.
+#[test]
+fn frame_results_in_rn_folders_decode() {
+    let Some(path) = std::env::var_os("FEMCRAFT_TEST_FRAME_RESULTS") else {
+        return;
+    };
+    let doc = RfDocument::open(std::path::Path::new(&path)).unwrap();
+    let results = doc.results().unwrap().expect("results");
+    let mesh = doc.fe_mesh().unwrap().expect("FE mesh");
+    for case in results.cases.iter().filter(|c| c.kind == CaseKind::LoadCase) {
+        let d = doc
+            .displacements(case.solver_id, mesh.nodes.len())
+            .unwrap()
+            .expect("displacements");
+        let max = d.max_translation();
+        assert!(max > 1e-5 && max < 1.0, "LC{}: max translation {max} m", case.no);
+    }
+}
+
+/// A surface / solid model keeps the nodal block layout: the header of its results has no
+/// element-end block, and its displacements decode as before. `FEMCRAFT_TEST_SURFACE_RESULTS`
+/// names such a solved model.
+#[test]
+fn surface_results_keep_the_nodal_layout() {
+    let Some(path) = std::env::var_os("FEMCRAFT_TEST_SURFACE_RESULTS") else {
+        return;
+    };
+    let doc = RfDocument::open(std::path::Path::new(&path)).unwrap();
+    let results = doc.results().unwrap().expect("results");
+    let mesh = doc.fe_mesh().unwrap().expect("FE mesh");
+    assert!(!mesh.elements.is_empty(), "a surface mesh");
+    let mut decoded = 0;
+    for case in &results.cases {
+        for id in case.result_ids() {
+            if let Some(d) = doc.displacements(id, mesh.nodes.len()).unwrap() {
+                let max = d.max_translation();
+                assert!(max < 1.0, "{}: max translation {max} m", case.label());
+                decoded += 1;
+            }
+        }
+    }
+    assert!(decoded > 0, "no displacements decoded");
+}
+
+/// Design situations of imported models list their explicit load combinations (the link is
+/// `LoadCombinationImplStatic.designSituation_id`) and decode through them.
+/// `FEMCRAFT_TEST_FRAME_RESULTS` names such a model (the Prokon frame).
+#[test]
+fn design_situations_envelope_explicit_combinations() {
+    let Some(path) = std::env::var_os("FEMCRAFT_TEST_FRAME_RESULTS") else {
+        return;
+    };
+    let doc = RfDocument::open(std::path::Path::new(&path)).unwrap();
+    let results = doc.results().unwrap().expect("results");
+    let mesh = doc.fe_mesh().unwrap().expect("FE mesh");
+    let ds: Vec<_> = results
+        .cases
+        .iter()
+        .filter(|c| c.kind == CaseKind::DesignSituation)
+        .collect();
+    assert!(!ds.is_empty(), "no design situations");
+    for case in ds {
+        assert!(!case.members.is_empty(), "DS{} lists no combinations", case.no);
+        for id in case.result_ids() {
+            assert!(
+                doc.displacements(id, mesh.nodes.len()).unwrap().is_some(),
+                "DS{}: no displacements for solver id {id}",
+                case.no
+            );
+        }
+    }
 }

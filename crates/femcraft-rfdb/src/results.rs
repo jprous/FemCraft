@@ -234,7 +234,7 @@ impl ResultSet {
 
         // Distinct result folder names, in archive order.
         let mut seen = std::collections::HashSet::new();
-        let solver_folders = archive
+        let solver_folders: Vec<String> = archive
             .entries
             .iter()
             .filter(|e| is_result_entry(e))
@@ -242,6 +242,7 @@ impl ResultSet {
             .filter(|f| seen.insert(f.to_string()))
             .map(str::to_owned)
             .collect();
+        drop_uncalculated(&mut cases, &solver_folders);
 
         // `<results_version value="18.00"/>`: the version is the element's `value` attribute.
         let results_version = archive.read_entry(VERSION_XML).ok().and_then(|b| {
@@ -265,6 +266,29 @@ impl ResultSet {
     pub fn cases_of(&self, kind: CaseKind) -> impl Iterator<Item = &ResultCase> {
         self.cases.iter().filter(move |c| c.kind == kind)
     }
+}
+
+/// The solver id in a result folder name (`RN_28_CO20 - SA2` / `RO_4_LC2 - SA1` -> 28 / 4).
+fn folder_solver_id(folder: &str) -> Option<u32> {
+    let rest = folder.strip_prefix("RN_").or_else(|| folder.strip_prefix("RO_"))?;
+    rest.split('_').next()?.parse().ok()
+}
+
+/// RFEM's history also lists cases that were never calculated (for example a combination that
+/// was deleted since): leave out the cases without result folders. A design situation or result
+/// combination stays when any combination it envelopes has results. Only done when every
+/// folder is named by solver id (folders named by uuid cannot be matched to cases).
+fn drop_uncalculated(cases: &mut Vec<ResultCase>, folders: &[String]) {
+    if folders.is_empty() || folders.iter().any(|f| folder_solver_id(f).is_none()) {
+        return;
+    }
+    let has = |id: u32| folders.iter().any(|f| folder_solver_id(f) == Some(id));
+    cases.retain(|c| match c.kind {
+        CaseKind::LoadCase | CaseKind::LoadCombination => has(c.solver_id),
+        CaseKind::DesignSituation | CaseKind::ResultCombination => {
+            c.members.iter().any(|&m| has(m))
+        }
+    });
 }
 
 /// Reads `(solver_id, user_id, object_type)` from the history sidecar into a deduplicated list
@@ -376,6 +400,29 @@ fn fill_members(conn: &Connection, cases: &mut [ResultCase]) {
                 key
             };
             case.members = ids(sql, key);
+        }
+        // Explicit load combinations (imported models) name their design situation themselves.
+        if case.kind == CaseKind::DesignSituation
+            && let Ok(ds_id) = conn.query_row(
+                "SELECT id FROM DesignSituation WHERE userID=?1",
+                [case.no],
+                |r| r.get::<_, i64>(0),
+            )
+            && let Ok(mut stmt) = conn.prepare(
+                "SELECT lc.userID FROM LoadCombination lc \
+                 JOIN LoadCombinationImplStatic i ON i.id = lc.impl_id \
+                 WHERE lc.impl_table = 'LoadCombinationImplStatic' AND i.designSituation_id = ?1 \
+                 ORDER BY lc.userID",
+            )
+            && let Ok(rows) = stmt.query_map([ds_id], |r| r.get::<_, i64>(0))
+        {
+            for no in rows.flatten() {
+                if let Some(sid) = solver_of.get(&(no as u32))
+                    && !case.members.contains(sid)
+                {
+                    case.members.push(*sid);
+                }
+            }
         }
     }
 }
@@ -862,6 +909,11 @@ impl Displacements {
         if i32_at(0) != RN_MAGIC {
             return Ok(None);
         }
+        // A mesh of 1D elements only (a frame): its results, in `RN_` or `RO_` folders, have
+        // the element-end layout; the nodal block below holds something else there.
+        if Self::is_member_mesh(archive, &bytes) {
+            return Self::read_members_entry(archive, entry, fe_nodes);
+        }
         let components = i32_at(3) as usize;
         let count = i32_at(4).max(0) as usize;
         let offset = i32_at(48).max(0) as usize;
@@ -880,8 +932,10 @@ impl Displacements {
             let mut rec = [0.0f64; 6];
             for (k, v) in rec.iter_mut().enumerate() {
                 let x = f64_at(base + k * 8);
-                if !x.is_finite() {
-                    return Err(Error::Format("non-finite displacement value".into()));
+                if !x.is_finite() || x.abs() > 1e9 {
+                    return Err(Error::Format(
+                        "implausible displacement value: not a nodal displacement block".into(),
+                    ));
                 }
                 *v = x;
             }
@@ -910,6 +964,29 @@ impl Displacements {
         else {
             return Ok(None);
         };
+        Self::read_members_entry(archive, entry, fe_nodes)
+    }
+
+    /// True when the results file's own header says it holds the element-end block of 1D
+    /// elements: a positive offset in `i32[155]` (-1 in a surface mesh's results) and a
+    /// positive element count in `i32[5]` (0 there), with `Data.E1D` to place them. The
+    /// header, not the folder name (`RN_` or `RO_`), tells the layouts apart.
+    fn is_member_mesh(archive: &Archive, bytes: &[u8]) -> bool {
+        if bytes.len() < 1024 {
+            return false;
+        }
+        let i32_at = |i: usize| i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        i32_at(5) > 0
+            && i32_at(155) > 0
+            && archive.entries.iter().any(|e| e == "!solver/M/Data.E1D")
+    }
+
+    /// The member displacements of the results file `entry` (see [`Self::read_members`]).
+    fn read_members_entry(
+        archive: &Archive,
+        entry: &str,
+        fe_nodes: usize,
+    ) -> Result<Option<Self>, Error> {
         let bytes = archive.read_entry(entry)?;
         if bytes.len() < 1024 {
             return Err(Error::Format("member results file too short".into()));
@@ -943,6 +1020,17 @@ impl Displacements {
         }
         let f64_at = |o: usize| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
         let mut nodal = vec![[0.0f64; 6]; count];
+        // Nodes of a mixed mesh that no 1D element touches (surface nodes) keep the values of
+        // the nodal block, when that block is plausible there; the element ends override.
+        let nodal_off = i32_at(48).max(0) as usize;
+        if nodal_off > 0 && nodal_off + count * 48 <= bytes.len() {
+            for (i, rec) in nodal.iter_mut().enumerate() {
+                let vals: Vec<f64> = (0..6).map(|k| f64_at(nodal_off + i * 48 + k * 8)).collect();
+                if vals.iter().all(|v| v.is_finite() && v.abs() < 1e9) {
+                    rec.copy_from_slice(&vals);
+                }
+            }
+        }
         for el in 0..elements {
             for end in 0..2 {
                 let at = el * 8 + end * 4;
@@ -1010,6 +1098,35 @@ mod tests {
         assert_eq!(cases[1].no, 20);
         assert_eq!(cases[1].tag(), "CO20");
         assert_eq!(cases[2].kind, CaseKind::DesignSituation);
+    }
+
+    #[test]
+    fn uncalculated_cases_are_left_out() {
+        let case = |kind, no, solver_id, members: Vec<u32>| ResultCase {
+            kind,
+            no,
+            name: String::new(),
+            solver_id,
+            members,
+        };
+        let mut cases = vec![
+            case(CaseKind::LoadCase, 1, 1, vec![]),
+            case(CaseKind::LoadCombination, 1, 2, vec![]),
+            case(CaseKind::DesignSituation, 1, 3, vec![2]),
+            case(CaseKind::DesignSituation, 2, 9, vec![1]),
+        ];
+        let folders = vec!["RO_1_LC1 - SA1".to_owned(), "RN_4_LC2 - SA1".to_owned()];
+        assert_eq!(folder_solver_id("RN_28_CO20 - SA2"), Some(28));
+        drop_uncalculated(&mut cases, &folders);
+        let kept: Vec<_> = cases.iter().map(|c| (c.kind, c.no)).collect();
+        assert_eq!(
+            kept,
+            vec![(CaseKind::LoadCase, 1), (CaseKind::DesignSituation, 2)]
+        );
+        // Folders named by uuid: nothing can be matched, nothing is dropped.
+        let mut all = vec![case(CaseKind::LoadCase, 1, 1, vec![])];
+        drop_uncalculated(&mut all, &["RN_0a1b2c".to_owned()]);
+        assert_eq!(all.len(), 1);
     }
 
     #[test]

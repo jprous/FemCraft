@@ -80,6 +80,9 @@ pub struct Visibility {
     pub fe_mesh: bool,
     /// Result overlay (contour) for the selected result.
     pub results: bool,
+    /// Results drawn in the RFEM colour bands; off: plain yellow lines (members: the line plot,
+    /// surfaces: the displaced mesh net, no contour).
+    pub result_colours: bool,
     /// Load case whose loads are shown.
     pub load_case: u32,
     /// Spacing of support glyphs along lines and surface edges (the grid spacing), metres.
@@ -100,6 +103,7 @@ impl Default for Visibility {
             local_axes: false,
             fe_mesh: true,
             results: true,
+            result_colours: true,
             load_case: 1,
             glyph_spacing: 1.0,
         }
@@ -270,15 +274,54 @@ fn displaced(
     disp: &femcraft_rfdb::Displacements,
     no: u32,
     magnification: f64,
+    mask: [f64; 3],
 ) -> Option<Vec3> {
     let p = mesh.node(no)?;
     let u = disp.node(no)?;
     Some(to_world([
-        p[0] + u[0] * magnification,
-        p[1] + u[1] * magnification,
-        p[2] + u[2] * magnification,
+        p[0] + u[0] * mask[0] * magnification,
+        p[1] + u[1] * mask[1] * magnification,
+        p[2] + u[2] * mask[2] * magnification,
     ]))
 }
+
+/// [`displaced`] with an explicit displacement record `u`.
+fn displaced_by(
+    mesh: &femcraft_rfdb::FeMesh,
+    no: u32,
+    u: [f64; 6],
+    magnification: f64,
+    mask: [f64; 3],
+) -> Option<Vec3> {
+    let p = mesh.node(no)?;
+    Some(to_world([
+        p[0] + u[0] * mask[0] * magnification,
+        p[1] + u[1] * mask[1] * magnification,
+        p[2] + u[2] * mask[2] * magnification,
+    ]))
+}
+
+/// Which translations move the plotted geometry: a single translation component moves the
+/// shape along that axis only; |u| and the rotations (which would not be visible otherwise)
+/// show the full translation.
+fn geometry_mask(c: femcraft_rfdb::ResultComponent) -> [f64; 3] {
+    use femcraft_rfdb::ResultComponent as C;
+    match c {
+        C::GlobalUx | C::SurfaceUx | C::MemberUx => [1.0, 0.0, 0.0],
+        C::GlobalUy | C::SurfaceUy | C::MemberUy => [0.0, 1.0, 0.0],
+        C::GlobalUz | C::SurfaceUz | C::MemberUz => [0.0, 0.0, 1.0],
+        _ => [1.0, 1.0, 1.0],
+    }
+}
+
+/// Yellow of the plain (uncoloured) result lines.
+const RESULT_YELLOW: [f32; 4] = [1.0, 0.9, 0.0, 1.0];
+/// Width of a colour-banded result line.
+const RESULT_WIDTH: f32 = 4.5;
+/// Width of the plain yellow result lines (a little over a third of the coloured ones).
+const RESULT_PLAIN_WIDTH: f32 = 1.6;
+/// Width of the displaced mesh net of a surface result (thinner: there are many lines).
+const RESULT_NET_WIDTH: f32 = 1.0;
 
 /// Adds the contour of a displacement result as discrete RFEM colour bands: the FE surface mesh
 /// displaced by `magnification`, every triangle split at the band boundaries so each value range
@@ -296,9 +339,11 @@ pub fn add_result_surface(
     component: femcraft_rfdb::ResultComponent,
     magnification: f64,
     extremum: femcraft_rfdb::Extremum,
+    coloured: bool,
 ) -> Option<(f32, f32)> {
     let first = disps.first()?;
     let magnification = if disps.len() == 1 { magnification } else { 0.0 };
+    let mask = geometry_mask(component);
     // Per FE node (1-based): displaced world position and the plotted scalar.
     let mut span = Span::default();
     let node: Vec<Option<(Vec3, f64)>> = (1..=mesh.nodes.len() as u32)
@@ -309,11 +354,24 @@ pub fn add_result_surface(
                 .collect();
             span.add(&values);
             Some((
-                displaced(mesh, first, no, magnification)?,
+                displaced(mesh, first, no, magnification, mask)?,
                 extremum.reduce(values.into_iter())?,
             ))
         })
         .collect();
+    if !coloured {
+        // The displaced mesh net in plain yellow, no contour.
+        for (a, b) in mesh.edges() {
+            let at = |no: u32| node.get(no as usize - 1).copied().flatten();
+            if let (Some(pa), Some(pb)) = (at(a), at(b)) {
+                s.lines
+                    .push(LineVertex::new(pa.0, RESULT_YELLOW).with_width(RESULT_NET_WIDTH));
+                s.lines
+                    .push(LineVertex::new(pb.0, RESULT_YELLOW).with_width(RESULT_NET_WIDTH));
+            }
+        }
+        return span.0.map(|(lo, hi)| (lo as f32, hi as f32));
+    }
     let at = |no: u32| node.get((no as usize).checked_sub(1)?).copied().flatten();
     let elems: Vec<Vec<(Vec3, f64)>> = mesh
         .elements
@@ -454,7 +512,7 @@ pub fn add_contact_surface(
                     })
                     .collect();
                 span.add(&sigma);
-                Some((displaced(mesh, first, no, 0.0)?, extremum.reduce(sigma.into_iter())?))
+                Some((displaced(mesh, first, no, 0.0, [1.0; 3])?, extremum.reduce(sigma.into_iter())?))
             })
             .collect();
         elems.extend(verts);
@@ -529,8 +587,8 @@ pub fn add_member_deformation(
         }
         for pair in chain.windows(2) {
             if let (Some(a), Some(b)) = (
-                displaced(mesh, disp, pair[0], magnification),
-                displaced(mesh, disp, pair[1], magnification),
+                displaced(mesh, disp, pair[0], magnification, [1.0; 3]),
+                displaced(mesh, disp, pair[1], magnification, [1.0; 3]),
             ) {
                 s.line(a, b, DEFORM_LINE);
             }
@@ -550,40 +608,81 @@ pub fn add_result_members(
     component: femcraft_rfdb::ResultComponent,
     magnification: f64,
     extremum: femcraft_rfdb::Extremum,
+    coloured: bool,
 ) -> Option<(f32, f32)> {
-    /// Thicker than model lines so the colours read.
-    const RESULT_WIDTH: f32 = 4.5;
-    let first = disps.first()?;
-    let magnification = if disps.len() == 1 { magnification } else { 0.0 };
-    let value = |no: u32| {
-        let values: Vec<f64> = disps
-            .iter()
-            .filter_map(|d| d.node(no).and_then(|u| displacement_scalar(component, u)))
-            .collect();
-        extremum.reduce(values.into_iter())
+    use femcraft_rfdb::Extremum;
+    disps.first()?;
+    let mask = geometry_mask(component);
+    // The shapes to draw. One case: its own displacements. An envelope: the shape that reaches
+    // the maximum at every node, the one that reaches the minimum, or (Both) both in one view.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Shape {
+        Case,
+        Max,
+        Min,
+    }
+    let shapes: &[Shape] = if disps.len() == 1 {
+        &[Shape::Case]
+    } else {
+        match extremum {
+            Extremum::Max => &[Shape::Max],
+            Extremum::Min => &[Shape::Min],
+            Extremum::Both => &[Shape::Max, Shape::Min],
+        }
+    };
+    // Displacement record and plotted value of a node on a shape.
+    let at = |no: u32, shape: Shape| -> Option<([f64; 6], f64)> {
+        let mut best: Option<([f64; 6], f64)> = None;
+        for d in disps {
+            let Some(u) = d.node(no) else { continue };
+            let Some(v) = displacement_scalar(component, u) else { continue };
+            let better = match (shape, &best) {
+                (_, None) => true,
+                (Shape::Min, Some((_, bv))) => v < *bv,
+                (_, Some((_, bv))) => v > *bv,
+            };
+            if better {
+                best = Some((u, v));
+            }
+        }
+        best
     };
     let mut segments = Vec::new();
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for (line_no, chain) in &mesh.lines {
-        if !member_lines.contains(line_no) {
-            continue;
-        }
-        for pair in chain.windows(2) {
-            let (Some(pa), Some(pb), Some(va), Some(vb)) = (
-                displaced(mesh, first, pair[0], magnification),
-                displaced(mesh, first, pair[1], magnification),
-                value(pair[0]),
-                value(pair[1]),
-            ) else {
+    for &shape in shapes {
+        for (line_no, chain) in &mesh.lines {
+            if !member_lines.contains(line_no) {
                 continue;
-            };
-            lo = lo.min(va).min(vb);
-            hi = hi.max(va).max(vb);
-            segments.push((pa, pb, 0.5 * (va + vb)));
+            }
+            for pair in chain.windows(2) {
+                let (Some((ua, va)), Some((ub, vb))) = (at(pair[0], shape), at(pair[1], shape))
+                else {
+                    continue;
+                };
+                let (Some(pa), Some(pb)) = (
+                    displaced_by(mesh, pair[0], ua, magnification, mask),
+                    displaced_by(mesh, pair[1], ub, magnification, mask),
+                ) else {
+                    continue;
+                };
+                lo = lo.min(va).min(vb);
+                hi = hi.max(va).max(vb);
+                segments.push((pa, pb, 0.5 * (va + vb)));
+            }
         }
     }
     if segments.is_empty() {
         return None;
+    }
+    if !coloured {
+        // Line plot only: a thin yellow line along each displaced shape.
+        for (a, b, _) in segments {
+            s.lines
+                .push(LineVertex::new(a, RESULT_YELLOW).with_width(RESULT_PLAIN_WIDTH));
+            s.lines
+                .push(LineVertex::new(b, RESULT_YELLOW).with_width(RESULT_PLAIN_WIDTH));
+        }
+        return Some((lo as f32, hi as f32));
     }
     let bands = femcraft_render::colorscale::BAND_COUNT;
     let step = ((hi - lo) / bands as f64).max(f64::MIN_POSITIVE);
@@ -1608,6 +1707,7 @@ mod tests {
             ResultComponent::GlobalUz,
             1000.0,
             Extremum::Both,
+            true,
         )
         .unwrap();
         assert!(s.lines.len() >= 100 && s.lines.len() % 2 == 0);
@@ -1649,7 +1749,7 @@ mod tests {
             ],
         };
         let mut s = Scene::default();
-        let range = add_result_surface(&mut s, &mesh, &[&disp], ResultComponent::GlobalUz, 100.0, Extremum::Both);
+        let range = add_result_surface(&mut s, &mesh, &[&disp], ResultComponent::GlobalUz, 100.0, Extremum::Both, true);
         // Discrete bands split the quad into many solid-colour triangles spanning the u_z values.
         let tris = &s.result_triangles;
         assert!(tris.len() >= 6 && tris.len() % 3 == 0);
@@ -1672,7 +1772,7 @@ mod tests {
         // A non-displacement component paints nothing.
         let mut s2 = Scene::default();
         assert!(
-            add_result_surface(&mut s2, &mesh, &[&disp], ResultComponent::SurfaceMx, 1.0, Extremum::Both).is_none()
+            add_result_surface(&mut s2, &mesh, &[&disp], ResultComponent::SurfaceMx, 1.0, Extremum::Both, true).is_none()
         );
 
         // Member deformation: line 1 carries a member -> one orange segment.
@@ -1680,6 +1780,80 @@ mod tests {
         let members: HashSet<u32> = [1].into_iter().collect();
         add_member_deformation(&mut s3, &mesh, &disp, &members, 1.0);
         assert_eq!(s3.lines.len(), 2, "one segment = two line vertices");
+    }
+
+    #[test]
+    fn plain_results_are_thin_yellow_lines_and_follow_the_component() {
+        use femcraft_rfdb::{Displacements, Extremum, FeMesh, ResultComponent};
+        let mesh = FeMesh {
+            nodes: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            elements: vec![[1, 2, 3, 4]],
+            element_surface: vec![1],
+            lines: vec![(1, vec![1, 2])],
+        };
+        let disp = Displacements {
+            nodal: vec![
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.5, 0.0, 0.010, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.020, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.010, 0.0, 0.0, 0.0],
+            ],
+        };
+        // Surface, colours off: the displaced mesh net in yellow, no contour triangles.
+        let mut s = Scene::default();
+        add_result_surface(&mut s, &mesh, &[&disp], ResultComponent::GlobalUz, 10.0, Extremum::Both, false)
+            .unwrap();
+        assert!(s.result_triangles.is_empty());
+        assert_eq!(s.lines.len(), 8, "four edges");
+        assert!(s.lines.iter().all(|v| v.color == RESULT_YELLOW && v.width == RESULT_NET_WIDTH));
+        // u_z only moves the shape along z: node 2 keeps its x (world x = model x).
+        assert!(s.lines.iter().any(|v| (v.pos[0] - 1.0).abs() < 1e-6));
+        // u_x only moves it along x: node 2 is now at x = 1.5.
+        let mut sx = Scene::default();
+        add_result_surface(&mut sx, &mesh, &[&disp], ResultComponent::GlobalUx, 1.0, Extremum::Both, false)
+            .unwrap();
+        assert!(sx.lines.iter().any(|v| (v.pos[0] - 1.5).abs() < 1e-6));
+        assert!(sx.lines.iter().all(|v| v.pos[2].abs() < 1e-6));
+        // A rotation plots the full translation shape.
+        let mut sp = Scene::default();
+        add_result_surface(&mut sp, &mesh, &[&disp], ResultComponent::GlobalPhiY, 10.0, Extremum::Both, false)
+            .unwrap();
+        assert!(sp.lines.iter().any(|v| v.pos[2].abs() > 0.05));
+        // Members, colours off: a plain yellow line plot.
+        let members: HashSet<u32> = [1].into_iter().collect();
+        let mut sm = Scene::default();
+        add_result_members(&mut sm, &mesh, &[&disp], &members, ResultComponent::GlobalUz, 10.0, Extremum::Both, false)
+            .unwrap();
+        assert_eq!(sm.lines.len(), 2);
+        assert!(sm.lines.iter().all(|v| v.color == RESULT_YELLOW && v.width == RESULT_PLAIN_WIDTH));
+    }
+
+    #[test]
+    fn envelope_members_draw_the_max_and_min_shapes() {
+        use femcraft_rfdb::{Displacements, Extremum, FeMesh, ResultComponent};
+        let mesh = FeMesh {
+            nodes: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            elements: vec![],
+            element_surface: vec![],
+            lines: vec![(1, vec![1, 2])],
+        };
+        let up = Displacements { nodal: vec![[0.0; 6], [0.0, 0.0, 0.010, 0.0, 0.0, 0.0]] };
+        let down = Displacements { nodal: vec![[0.0; 6], [0.0, 0.0, -0.004, 0.0, 0.0, 0.0]] };
+        let members: HashSet<u32> = [1].into_iter().collect();
+        let tip_z = |ext| {
+            let mut s = Scene::default();
+            add_result_members(&mut s, &mesh, &[&up, &down], &members, ResultComponent::GlobalUz, 10.0, ext, true)
+                .unwrap();
+            // The tip of each drawn segment (second vertex); world z = -model z.
+            s.lines.chunks(2).map(|c| c[1].pos[2]).collect::<Vec<_>>()
+        };
+        let both = tip_z(Extremum::Both);
+        assert_eq!(both.len(), 2, "two shapes in one view");
+        assert!(both.iter().any(|z| (z + 0.10).abs() < 1e-5), "max shape: {both:?}");
+        assert!(both.iter().any(|z| (z - 0.04).abs() < 1e-5), "min shape: {both:?}");
+        assert_eq!(tip_z(Extremum::Max).len(), 1);
+        assert!((tip_z(Extremum::Max)[0] + 0.10).abs() < 1e-5);
+        assert!((tip_z(Extremum::Min)[0] - 0.04).abs() < 1e-5);
     }
 
     #[test]
