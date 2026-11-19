@@ -1191,7 +1191,10 @@ impl FemCraftApp {
                 }
             });
         });
-        if close || modal.should_close() {
+        // Not `modal.should_close()`: the click that chose Help > About reaches the backdrop in
+        // the same frame and would close the dialog at once.
+        let _ = modal;
+        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.show_about = false;
         }
     }
