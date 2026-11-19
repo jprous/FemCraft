@@ -1,7 +1,11 @@
 # FemCraft
 
-A 3D structural modelling workspace written in Rust: build finite-element models, open and save
-RFEM 6 files, calculate them with RFEM's own solver and view the results, all in one application.
+A 3D structural modelling workspace for FEA models, written in Rust: build finite-element
+models, calculate them and view the results, all in one application. FemCraft's native file
+format today is RFEM 6 (`.rf6`), and the models are solved with RFEM's own solver.
+
+Planned: importing models from other structural programs (Prokon Frame `.A03`, Autodesk Robot,
+STAAD.Pro, Tekla Structural Designer `.tsmd` and Midas), and solving with Salome-Meca / code_aster.
 
 Built with [egui](https://github.com/emilk/egui) for the interface and
 [wgpu](https://wgpu.rs) for the GPU-rendered 3D viewport.
@@ -11,8 +15,8 @@ Built with [egui](https://github.com/emilk/egui) for the interface and
 
 ## Features (v0.1.0)
 
-- **RFEM 6 files**: open, edit and save `.rf6`; RFEM opens the files FemCraft writes. File > New
-  from a template; several models open at once, each in its own tab.
+- **Model files**: open, edit and save RFEM 6 `.rf6` files (RFEM opens the files FemCraft
+  writes). File > New from a template; several models open at once, each in its own tab.
 - **Modelling**: materials, sections (incl. parametric concrete rectangles / squares / circles in
   any size), thicknesses, nodes, lines, members, surfaces, openings, supports, load cases and
   nodal / line / member / surface loads, edited in tables with a Navigator tree.
@@ -39,7 +43,7 @@ How far each milestone of the [roadmap](docs/ROADMAP.md) has come:
 | Milestone | Progress | State |
 | --- | --- | --- |
 | M0 Foundations (workspace, CI) | `██████████` 100 % | done |
-| M1 `.rf6` reader and viewer | `█████████░` 90 % | done; `.rfc` and a few rare load kinds still unseen |
+| M1 `.rf6` reader and viewer (native format) | `█████████░` 90 % | done; `.rfc` and a few rare load kinds still unseen |
 | M2 Saving that RFEM accepts | `█████████░` 90 % | edits, new objects, library items confirmed in RFEM |
 | M3 Object model and change tracking | `█████░░░░░` 50 % | typed objects and dirty tracking; undo / redo and delete missing |
 | M4 Application layout | `███████░░░` 70 % | docks, ribbon, tables, settings; view cube and command palette missing |
