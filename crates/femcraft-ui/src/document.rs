@@ -48,6 +48,25 @@ fn format_legend_value(v: f64) -> String {
     }
 }
 
+/// Spring surface supports by surface number (finite `translation_z` only: a rigid support has
+/// no spring, so no contact stress from displacements).
+fn contact_supports(
+    model: &femcraft_model::Model,
+) -> std::collections::HashMap<u32, scene::ContactSupport> {
+    let mut out = std::collections::HashMap::new();
+    for (_, sup) in model.iter_kind(ObjectKind::SurfaceSupport) {
+        let Some(cz) = sup.get("translation_z").as_f64().filter(|c| c.is_finite() && *c > 0.0)
+        else {
+            continue;
+        };
+        let tension_free = sup.get("nonlinearity").as_i64().is_some_and(|n| n != 0);
+        for &n in sup.get("surfaces").as_ref_list() {
+            out.insert(n, scene::ContactSupport { cz, tension_free });
+        }
+    }
+    out
+}
+
 /// Diagonal of the FE mesh's bounding box (model units), used to scale the deformation factor.
 fn mesh_span(mesh: &femcraft_rfdb::FeMesh) -> f64 {
     let mut lo = [f64::INFINITY; 3];
@@ -88,7 +107,7 @@ pub struct Document {
 
     /// Decoded nodal displacements for the selected result case (by solver id; inner `None` when
     /// the case has no displacement file, so it is not re-decoded every frame).
-    result_disp: Option<(u32, Option<femcraft_rfdb::Displacements>)>,
+    result_disp: Option<(Vec<u32>, Option<Vec<femcraft_rfdb::Displacements>>)>,
     /// Colour-scale legend for the active result overlay, drawn over the viewport.
     result_legend: Option<ResultLegend>,
 
@@ -196,6 +215,10 @@ impl Document {
     pub fn refresh(&mut self, grid: &GridSettings, show_axes: bool) {
         // Support glyphs along lines / surface edges follow the grid spacing.
         self.vis.glyph_spacing = grid.spacing;
+        // Picking a result quantity in the Results panel turns the Results display on.
+        if std::mem::take(&mut self.results_view.picked) {
+            self.vis.results = true;
+        }
         // Load results for the selected case and pick an exaggeration factor before hashing.
         self.update_result_overlay();
         let key = (
@@ -241,14 +264,16 @@ impl Document {
         self.built_from = Some(key);
     }
 
-    /// The active result overlay: `(solver id, component)` when a displacement quantity is chosen
-    /// for a selected case and the model is unedited (results belong to the saved geometry).
-    fn active_overlay(&self) -> Option<(u32, femcraft_rfdb::ResultComponent)> {
+    /// The active result overlay: `(solver ids, component)` when a displacement or contact
+    /// quantity is chosen for a selected case and the model is unedited (results belong to the
+    /// saved geometry). A design situation / result combination lists the combinations it
+    /// envelopes.
+    fn active_overlay(&self) -> Option<(Vec<u32>, femcraft_rfdb::ResultComponent)> {
         if self.rf.is_modified() || !self.vis.results {
             return None;
         }
         let comp = self.results_view.active?;
-        if !scene::is_displacement(comp) {
+        if !scene::is_displacement(comp) && !scene::is_contact(comp) {
             return None;
         }
         let (kind, no) = self.results_view.selected?;
@@ -258,30 +283,32 @@ impl Document {
             .cases
             .iter()
             .find(|c| (c.kind, c.no) == (kind, no))?;
-        Some((case.solver_id, comp))
+        Some((case.result_ids(), comp))
     }
 
     /// Loads the selected case's displacements (once per case) and, when the factor is unset,
     /// picks one so the peak displacement is a visible fraction of the model.
     fn update_result_overlay(&mut self) {
-        let Some((solver_id, _)) = self.active_overlay() else {
+        let Some((ids, _)) = self.active_overlay() else {
             return;
         };
         let fe_nodes = self.fe_mesh.as_ref().map_or(0, |m| m.nodes.len());
-        if self.result_disp.as_ref().map(|(s, _)| *s) != Some(solver_id) {
-            let decoded = match self.rf.displacements(solver_id, fe_nodes) {
-                Ok(d) => d,
-                Err(e) => {
-                    self.warnings.push(format!("Results not read: {e}"));
-                    None
+        if self.result_disp.as_ref().map(|(s, _)| s) != Some(&ids) {
+            let mut sets = Vec::new();
+            for &id in &ids {
+                match self.rf.displacements(id, fe_nodes) {
+                    Ok(Some(d)) => sets.push(d),
+                    Ok(None) => {}
+                    Err(e) => self.warnings.push(format!("Results not read: {e}")),
                 }
-            };
-            self.result_disp = Some((solver_id, decoded));
+            }
+            let decoded = (!sets.is_empty()).then_some(sets);
+            self.result_disp = Some((ids, decoded));
         }
         if self.results_view.magnification <= 0.0
-            && let (Some((_, Some(disp))), Some(mesh)) = (&self.result_disp, &self.fe_mesh)
+            && let (Some((_, Some(sets))), Some(mesh)) = (&self.result_disp, &self.fe_mesh)
         {
-            let max_u = disp.max_translation();
+            let max_u = sets.iter().map(|d| d.max_translation()).fold(0.0, f64::max);
             if max_u > 0.0 {
                 let factor = (0.05 * mesh_span(mesh) / max_u).clamp(1.0, 100_000.0);
                 self.results_view.magnification = factor.round();
@@ -292,12 +319,13 @@ impl Document {
     /// A hash of the result selection, so the scene rebuilds when it changes.
     fn result_signature(&self) -> u64 {
         use std::hash::{Hash, Hasher};
-        let Some((solver_id, comp)) = self.active_overlay() else {
+        let Some((ids, comp)) = self.active_overlay() else {
             return 0;
         };
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        solver_id.hash(&mut h);
+        ids.hash(&mut h);
         comp.hash(&mut h);
+        self.results_view.extremum.hash(&mut h);
         self.results_view.magnification.to_bits().hash(&mut h);
         h.finish()
     }
@@ -309,12 +337,19 @@ impl Document {
         let Some((_, comp)) = self.active_overlay() else {
             return;
         };
-        let (Some((_, Some(disp))), Some(mesh)) = (&self.result_disp, &self.fe_mesh) else {
+        let (Some((_, Some(sets))), Some(mesh)) = (&self.result_disp, &self.fe_mesh) else {
             return;
         };
-        let mag = self.results_view.magnification.max(1.0);
-        if let Some((min, max)) = scene::add_result_surface(&mut self.scene, mesh, disp, comp, mag)
-        {
+        let disps: Vec<&femcraft_rfdb::Displacements> = sets.iter().collect();
+        let ext = self.results_view.extremum;
+        let range = if scene::is_contact(comp) {
+            let supports = contact_supports(&self.rf.model);
+            scene::add_contact_surface(&mut self.scene, mesh, &disps, &supports, ext)
+        } else {
+            let mag = self.results_view.magnification.max(1.0);
+            scene::add_result_surface(&mut self.scene, mesh, &disps, comp, mag, ext)
+        };
+        if let Some((min, max)) = range {
             let (label, unit, factor) = comp.display();
             self.result_legend = Some(ResultLegend {
                 label,
@@ -324,6 +359,11 @@ impl Document {
                 max,
             });
         }
+        // Deformed member axes only for a single case (an envelope has no one deformed shape).
+        if scene::is_contact(comp) || disps.len() != 1 {
+            return;
+        }
+        let mag = self.results_view.magnification.max(1.0);
         let member_lines: HashSet<u32> = self
             .rf
             .model
@@ -331,7 +371,7 @@ impl Document {
             .filter_map(|(_, m)| m.get("line").as_ref_no())
             .collect();
         if !member_lines.is_empty() {
-            scene::add_member_deformation(&mut self.scene, mesh, disp, &member_lines, mag);
+            scene::add_member_deformation(&mut self.scene, mesh, disps[0], &member_lines, mag);
         }
     }
 

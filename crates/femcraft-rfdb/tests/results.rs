@@ -105,3 +105,32 @@ fn count_leaves(nodes: &[ResultNode], n: &mut usize) {
         }
     }
 }
+
+/// Design situations envelope their load combinations: members are resolved, and every member
+/// has a displacement file.
+#[test]
+fn design_situations_list_member_combinations() {
+    let Some(src) = model_path() else { return };
+    let doc = RfDocument::open(&src).unwrap();
+    let Some(results) = doc.results().unwrap() else {
+        return;
+    };
+    for c in results.cases_of(CaseKind::DesignSituation) {
+        assert!(c.has_extremes());
+        assert!(!c.members.is_empty(), "{} has no member combinations", c.tag());
+        let fe_nodes = doc.fe_mesh().unwrap().map_or(0, |m| m.nodes.len());
+        for &id in &c.result_ids() {
+            assert!(doc.displacements(id, fe_nodes).unwrap().is_some(), "{} id {id}", c.tag());
+        }
+    }
+}
+
+#[test]
+fn extremum_reduces_values() {
+    use femcraft_rfdb::Extremum;
+    let v = [3.0, -5.0, 1.0];
+    assert_eq!(Extremum::Max.reduce(v.into_iter()), Some(3.0));
+    assert_eq!(Extremum::Min.reduce(v.into_iter()), Some(-5.0));
+    assert_eq!(Extremum::Both.reduce(v.into_iter()), Some(-5.0));
+    assert_eq!(Extremum::Max.reduce(std::iter::empty()), None);
+}

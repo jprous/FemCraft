@@ -18,7 +18,7 @@ pub use document::{KindReport, LoadReport, RfDocument};
 pub use library::{Library, LibraryFilter, LibraryItem, LibraryKind, LibraryValue};
 pub use mesh::FeMesh;
 pub use results::{
-    CaseKind, Displacements, RadioGroup, ResultCase, ResultComponent, ResultLeaf, ResultNode,
+    CaseKind, Displacements, Extremum, RadioGroup, ResultCase, ResultComponent, ResultLeaf, ResultNode,
     ResultSet,
 };
 

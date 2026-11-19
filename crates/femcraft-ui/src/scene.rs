@@ -5,7 +5,7 @@
 //! `(x, y, z)` is drawn at `(x, -y, -z)` (a 180 degree turn about X, which keeps the axes
 //! right-handed and shows the model the way RFEM does).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use femcraft_model::{Model, Object, ObjectId, ObjectKind as K, Value};
 use femcraft_render::viewport::LineVertex;
@@ -282,7 +282,9 @@ fn displaced(
 
 /// Adds the contour of a displacement result as discrete RFEM colour bands: the FE surface mesh
 /// displaced by `magnification`, every triangle split at the band boundaries so each value range
-/// fills as one solid colour that matches the legend's blocks. Returns the value range
+/// fills as one solid colour that matches the legend's blocks. `disps` holds one displacement set
+/// per case enveloped (a single set for a load case / combination); with several, each node takes
+/// the `extremum` of its values and the mesh is drawn undeformed. Returns the value range
 /// `(min, max)`, or `None` when `component` is not a (decoded) displacement.
 ///
 /// No element outlines are drawn: without a depth buffer a net of lines over the displaced surface
@@ -290,46 +292,174 @@ fn displaced(
 pub fn add_result_surface(
     s: &mut Scene,
     mesh: &femcraft_rfdb::FeMesh,
-    disp: &femcraft_rfdb::Displacements,
+    disps: &[&femcraft_rfdb::Displacements],
     component: femcraft_rfdb::ResultComponent,
     magnification: f64,
+    extremum: femcraft_rfdb::Extremum,
 ) -> Option<(f32, f32)> {
+    let first = disps.first()?;
+    let magnification = if disps.len() == 1 { magnification } else { 0.0 };
     // Per FE node (1-based): displaced world position and the plotted scalar.
+    let mut span = Span::default();
     let node: Vec<Option<(Vec3, f64)>> = (1..=mesh.nodes.len() as u32)
         .map(|no| {
+            let values: Vec<f64> = disps
+                .iter()
+                .filter_map(|d| d.node(no).and_then(|u| displacement_scalar(component, u)))
+                .collect();
+            span.add(&values);
             Some((
-                displaced(mesh, disp, no, magnification)?,
-                disp.node(no)
-                    .and_then(|u| displacement_scalar(component, u))?,
+                displaced(mesh, first, no, magnification)?,
+                extremum.reduce(values.into_iter())?,
             ))
         })
         .collect();
     let at = |no: u32| node.get((no as usize).checked_sub(1)?).copied().flatten();
+    let elems: Vec<Vec<(Vec3, f64)>> = mesh
+        .elements
+        .iter()
+        .filter_map(|e| element_corners(e).iter().map(|&no| at(no)).collect())
+        .collect();
+    band_elements(s, &elems, span.range(extremum))
+}
 
+/// Lowest and highest value over every enveloped case and node. "Both" plots the full range
+/// from the lowest minimum to the highest maximum.
+#[derive(Default)]
+struct Span(Option<(f64, f64)>);
+
+impl Span {
+    fn add(&mut self, values: &[f64]) {
+        for &v in values {
+            let (lo, hi) = self.0.unwrap_or((v, v));
+            self.0 = Some((lo.min(v), hi.max(v)));
+        }
+    }
+
+    /// The scale range to force for `Both`; other extremes use the plotted values' range.
+    fn range(&self, extremum: femcraft_rfdb::Extremum) -> Option<(f64, f64)> {
+        (extremum == femcraft_rfdb::Extremum::Both).then_some(self.0).flatten()
+    }
+}
+
+/// Corner node numbers of an element: a triangle (`d == 0` or `d == c`) or a quad.
+fn element_corners(e: &[u32; 4]) -> &[u32] {
+    if e[3] != 0 && e[3] != e[2] {
+        &e[..4]
+    } else {
+        &e[..3]
+    }
+}
+
+/// Fills the elements (corner positions with values) in solid colour bands over their value range
+/// and returns that range.
+fn band_elements(
+    s: &mut Scene,
+    elems: &[Vec<(Vec3, f64)>],
+    forced: Option<(f64, f64)>,
+) -> Option<(f32, f32)> {
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for nd in node.iter().flatten() {
-        lo = lo.min(nd.1);
-        hi = hi.max(nd.1);
+    for v in elems.iter().flatten() {
+        lo = lo.min(v.1);
+        hi = hi.max(v.1);
+    }
+    if let Some((flo, fhi)) = forced {
+        lo = lo.min(flo);
+        hi = hi.max(fhi);
     }
     if !lo.is_finite() || !hi.is_finite() {
         return None;
     }
     let bands = femcraft_render::colorscale::BAND_COUNT;
     let step = ((hi - lo) / bands as f64).max(f64::MIN_POSITIVE);
-
-    for e in &mesh.elements {
-        // Triangle (d == 0 or d == c) or quad; fan from the first node.
-        let quad = e[3] != 0 && e[3] != e[2];
-        let corners: &[u32] = if quad { &e[..4] } else { &e[..3] };
-        let Some(verts): Option<Vec<(Vec3, f64)>> = corners.iter().map(|&no| at(no)).collect()
-        else {
-            continue;
-        };
+    for verts in elems {
         for k in 1..verts.len() - 1 {
             band_fill_triangle(s, [verts[0], verts[k], verts[k + 1]], lo, step, bands);
         }
     }
     Some((lo as f32, hi as f32))
+}
+
+/// Spring stiffness of a surface support that produces contact stress (SI: N/m³).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContactSupport {
+    /// Spring along the surface's local z (`translation_z`).
+    pub cz: f64,
+    /// Failure if the contact stress is negative (tension-free): negative σ_z shows as zero.
+    pub tension_free: bool,
+}
+
+/// True for a quantity plotted from support springs and displacements (contact stress σ_z).
+/// RFEM does not store contact stresses in the results; they are `c_z × u_z` (checked against
+/// RFEM to ~0.5 % on `Chamber 4x4x6.rf6`, Dead Load).
+pub fn is_contact(c: femcraft_rfdb::ResultComponent) -> bool {
+    matches!(c, femcraft_rfdb::ResultComponent::SurfaceContactSigmaZ)
+}
+
+/// Unit normal of an element (from its first three corners), oriented towards +Z (model axes,
+/// RFEM's z points down) when it is closer to vertical than horizontal.
+fn element_normal(mesh: &femcraft_rfdb::FeMesh, e: &[u32; 4]) -> Option<[f64; 3]> {
+    let (a, b, c) = (mesh.node(e[0])?, mesh.node(e[1])?, mesh.node(e[2])?);
+    let (u, v) = (
+        [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+        [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+    );
+    let mut n = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if len < 1e-12 {
+        return None;
+    }
+    n.iter_mut().for_each(|x| *x /= len);
+    if n[2].abs() > 0.5 && n[2] < 0.0 {
+        n.iter_mut().for_each(|x| *x = -*x);
+    }
+    Some(n)
+}
+
+/// Adds the contact-stress contour: only elements of surfaces that carry a spring support
+/// (`supports`: surface no -> stiffness), drawn undeformed, coloured by sigma_z = c_z * u_n at each
+/// FE node. `disps` holds one displacement set per case enveloped; each node takes the
+/// `extremum` over them. Returns the value range `(min, max)` in Pa, or `None` when nothing is
+/// supported.
+pub fn add_contact_surface(
+    s: &mut Scene,
+    mesh: &femcraft_rfdb::FeMesh,
+    disps: &[&femcraft_rfdb::Displacements],
+    supports: &HashMap<u32, ContactSupport>,
+    extremum: femcraft_rfdb::Extremum,
+) -> Option<(f32, f32)> {
+    let first = disps.first()?;
+    let mut elems: Vec<Vec<(Vec3, f64)>> = Vec::new();
+    let mut span = Span::default();
+    for (i, e) in mesh.elements.iter().enumerate() {
+        let Some(sup) = mesh.element_surface.get(i).and_then(|n| supports.get(n)) else {
+            continue;
+        };
+        let Some(n) = element_normal(mesh, e) else {
+            continue;
+        };
+        let verts: Option<Vec<(Vec3, f64)>> = element_corners(e)
+            .iter()
+            .map(|&no| {
+                let sigma: Vec<f64> = disps
+                    .iter()
+                    .filter_map(|d| {
+                        let u = d.node(no)?;
+                        let sigma = sup.cz * (u[0] * n[0] + u[1] * n[1] + u[2] * n[2]);
+                        Some(if sup.tension_free { sigma.max(0.0) } else { sigma })
+                    })
+                    .collect();
+                span.add(&sigma);
+                Some((displaced(mesh, first, no, 0.0)?, extremum.reduce(sigma.into_iter())?))
+            })
+            .collect();
+        elems.extend(verts);
+    }
+    band_elements(s, &elems, span.range(extremum))
 }
 
 /// Splits one triangle (vertices carry `(displaced position, value)`) into the colour bands it
@@ -1362,8 +1492,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn contact_stress_is_spring_times_normal_displacement() {
+        use femcraft_rfdb::{Displacements, FeMesh};
+        let mesh = FeMesh {
+            nodes: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            elements: vec![[1, 2, 3, 4]],
+            element_surface: vec![1],
+            lines: vec![],
+        };
+        let disp = Displacements {
+            nodal: vec![
+                [0.0, 0.0, 0.010, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.020, 0.0, 0.0, 0.0],
+                [0.0, 0.0, -0.005, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.010, 0.0, 0.0, 0.0],
+            ],
+        };
+        let mut sup = HashMap::new();
+        sup.insert(1, ContactSupport { cz: 6.0e6, tension_free: true });
+        let mut s = Scene::default();
+        let (lo, hi) = add_contact_surface(&mut s, &mesh, &[&disp], &sup, femcraft_rfdb::Extremum::Max).unwrap();
+        // Uplift (-5 mm) is cut off to zero; the peak is 6e6 * 0.02 = 120 kN/m².
+        assert!(lo.abs() < 1e-3 && (hi - 1.2e5).abs() < 1.0, "{lo}..{hi}");
+        assert!(!s.result_triangles.is_empty());
+        // A surface without a spring support paints nothing.
+        let mut s2 = Scene::default();
+        assert!(add_contact_surface(&mut s2, &mesh, &[&disp], &HashMap::new(), femcraft_rfdb::Extremum::Max).is_none());
+    }
+
+    #[test]
     fn result_surface_colours_and_displaces() {
-        use femcraft_rfdb::{Displacements, FeMesh, ResultComponent};
+        use femcraft_rfdb::{Displacements, Extremum, FeMesh, ResultComponent};
         // One quad: 4 FE nodes, element [1,2,3,4].
         let mesh = FeMesh {
             nodes: vec![
@@ -1385,7 +1544,7 @@ mod tests {
             ],
         };
         let mut s = Scene::default();
-        let range = add_result_surface(&mut s, &mesh, &disp, ResultComponent::GlobalUz, 100.0);
+        let range = add_result_surface(&mut s, &mesh, &[&disp], ResultComponent::GlobalUz, 100.0, Extremum::Both);
         // Discrete bands split the quad into many solid-colour triangles spanning the u_z values.
         let tris = &s.result_triangles;
         assert!(tris.len() >= 6 && tris.len() % 3 == 0);
@@ -1408,7 +1567,7 @@ mod tests {
         // A non-displacement component paints nothing.
         let mut s2 = Scene::default();
         assert!(
-            add_result_surface(&mut s2, &mesh, &disp, ResultComponent::SurfaceMx, 1.0).is_none()
+            add_result_surface(&mut s2, &mesh, &[&disp], ResultComponent::SurfaceMx, 1.0, Extremum::Both).is_none()
         );
 
         // Member deformation: line 1 carries a member -> one orange segment.

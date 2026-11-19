@@ -9,7 +9,7 @@
 use eframe::egui;
 use femcraft_model::Model;
 use femcraft_rfdb::results::result_tree;
-use femcraft_rfdb::{CaseKind, RadioGroup, ResultComponent, ResultLeaf, ResultNode, ResultSet};
+use femcraft_rfdb::{CaseKind, Extremum, RadioGroup, ResultComponent, ResultLeaf, ResultNode, ResultSet};
 
 /// What the user has picked in the Results panel (kept per document).
 #[derive(Debug, Clone, Default)]
@@ -22,6 +22,11 @@ pub struct ResultsView {
     pub layer: Option<ResultComponent>,
     /// Deformation exaggeration factor; `0.0` means "auto" (the document picks one on first use).
     pub magnification: f64,
+    /// Max / Min / Both for design situations and result combinations; independent of the
+    /// quantity radio buttons.
+    pub extremum: Extremum,
+    /// Set when the user picks a quantity; the document then switches the Results display on.
+    pub picked: bool,
 }
 
 impl ResultsView {
@@ -39,6 +44,7 @@ impl ResultsView {
             RadioGroup::Result => self.active = Some(leaf.component),
             RadioGroup::LayerSide => self.layer = Some(leaf.component),
         }
+        self.picked = true;
     }
 }
 
@@ -75,6 +81,10 @@ pub fn results_panel(
     // Reserve space at the bottom for the deformation factor (shown for displacement results)
     // and the version line, so the scrolling tree does not cover them.
     let show_factor = model.is_some() && view.active.is_some_and(crate::scene::is_displacement);
+    let has_extremes = view
+        .selected
+        .and_then(|(k, n)| results.cases.iter().find(|c| (c.kind, c.no) == (k, n)))
+        .is_some_and(|c| c.has_extremes());
     let version = results.results_version.clone();
     let reserve = if show_factor { 36.0 } else { 0.0 } + if version.is_some() { 20.0 } else { 0.0 };
     let tree_height = (ui.available_height() - reserve).max(60.0);
@@ -82,7 +92,12 @@ pub fn results_panel(
     egui::ScrollArea::vertical()
         .max_height(tree_height)
         .auto_shrink([false, false])
-        .show(ui, |ui| result_nodes_ui(ui, model, view));
+        .show(ui, |ui| {
+            if has_extremes {
+                extremum_ui(ui, view);
+            }
+            result_nodes_ui(ui, model, view)
+        });
 
     if show_factor {
         ui.separator();
@@ -91,6 +106,21 @@ pub fn results_panel(
     if let Some(version) = version {
         ui.weak(format!("RFEM results v{version}"));
     }
+}
+
+/// The Max / Min / Both radio group for envelope cases (design situations, result combinations).
+fn extremum_ui(ui: &mut egui::Ui, view: &mut ResultsView) {
+    egui::CollapsingHeader::new("Extreme values")
+        .id_salt("extreme_values")
+        .default_open(true)
+        .show(ui, |ui| {
+            for e in Extremum::ALL {
+                if ui.radio(view.extremum == e, e.label()).clicked() {
+                    view.extremum = e;
+                    view.picked = true;
+                }
+            }
+        });
 }
 
 /// The deformation exaggeration factor, pinned at the bottom: editable value with ± steppers and
