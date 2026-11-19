@@ -46,6 +46,8 @@ interface on top of a working file layer rather than ahead of it.
 
 ### M0 - Foundations (done)
 
+**Progress: 100 %** `##########`
+
 - Upgrade to the current egui / eframe / wgpu to stay level with SolidCraft and BIMCraft.
 - Split into a crate workspace:
   - `femcraft-model` - domain objects and edit commands, no UI
@@ -58,6 +60,8 @@ interface on top of a working file layer rather than ahead of it.
 - GitHub Actions CI building and testing on Windows.
 
 ### M1 - File format research and read-only viewer
+
+**Progress: 90 %** `#########.` (v0.1.0)
 
 1. Open the ZIP (`zip`), read `model.db` (`rusqlite`), keep every sidecar file unchanged.
 2. Schema catalogue tool: dump all tables and columns and recognise the object / impl / child
@@ -92,6 +96,8 @@ all of them. Lessons: concrete surfaces need a `ConcreteExposureCondition` and a
 
 ### M2 - Saving that RFEM accepts
 
+**Progress: 90 %** `#########.` (v0.1.0)
+
 - Never build a database from scratch. Start from a database RFEM saved, keep every table
   FemCraft does not understand exactly as it was, and change only edited rows.
 - Test 1: open and save without changes gives an identical database, and RFEM opens it.
@@ -100,6 +106,8 @@ all of them. Lessons: concrete surfaces need a `ConcreteExposureCondition` and a
 - Mark results as out of date after any edit.
 
 ### M3 - Object model and change tracking
+
+**Progress: 50 %** `#####.....` (typed objects, dirty tracking; undo / redo, delete, dependency rules missing)
 
 - Typed objects: Node, Line, Member, Surface, Opening, Material, Section, Thickness, Support,
   Hinge, LoadCase, LoadCombination, loads. Each keeps the database columns FemCraft does not
@@ -112,6 +120,8 @@ all of them. Lessons: concrete surfaces need a `ConcreteExposureCondition` and a
 - Selection and visibility live in view state, not in the model (as RFEM's `views.xml`).
 
 ### M4 - Application layout (can run alongside M1-M3)
+
+**Progress: 70 %** `#######...` (docks, ribbon, tables, Settings / Solve / Help menus; view cube, action registry, command palette missing)
 
 Skeleton done: ribbon bar on top (File menu, Home / View / Model / Loads tabs, tool groups with
 placeholders), dockable layout on `egui_tiles`: model view and panes (Display, Navigator tree, object
@@ -137,6 +147,8 @@ Floating windows wait for `egui_dock` to support the egui version in use.
 
 ### M5 - Model space drawing and interaction
 
+**Progress: 30 %** `###.......` (depth-correct drawing, symbols, box selection; drawing tools, right-click menu, ID picking missing)
+
 - Depth buffer and batched drawing per object type:
   - nodes as points
   - members as lines or as their real cross-section shape
@@ -151,6 +163,8 @@ Floating windows wait for `egui_dock` to support the egui version in use.
   nodes, midpoints and intersections (`rstar` spatial index).
 
 ### M6 - Solver: Salome-Meca / code_aster
+
+**Progress: 60 %** `######....` Solving through the RFEM 6 server (`RFEM6Server.exe`: calculate, mesh, delete results / mesh, progress dialog) works since v0.1.0. Salome-Meca / code_aster: not started.
 
 - Meshing: FemCraft writes a Salome Python script (GEOM + SMESH) that builds geometry and
   mesh, with one named group per FemCraft object (`M12`, `S3`, `SUP5`), exported as MED.
@@ -175,6 +189,8 @@ Floating windows wait for `egui_dock` to support the egui version in use.
 - Validation against hand calculations and against RFEM results for the same models.
 
 ### M7 - Post-processing
+
+**Progress: 40 %** `####......` (deformations, contours, envelopes, member displacement lines; forces, member diagrams, result tables, export missing)
 
 - Results stored in a separate `results.db`, keyed by load case / combination and object.
 - In the model view: deformed shape with scale, contour colours on surfaces with legend,

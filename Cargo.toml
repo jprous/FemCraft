@@ -26,3 +26,7 @@ femcraft-rfem = { path = "crates/femcraft-rfem" }
 [profile.dev.package."*"]
 # Optimise dependencies even in debug builds so the viewport stays smooth.
 opt-level = 2
+
+[profile.release]
+# Smaller portable build; no symbol names or local paths in the executable.
+strip = true

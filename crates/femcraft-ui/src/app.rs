@@ -246,6 +246,8 @@ pub struct FemCraftApp {
     settings: AppSettings,
     /// The RFEM server dialog (Settings > RFEM server…) while open.
     rfem_dialog: Option<RfemDraft>,
+    /// Help > About FemCraft is open.
+    show_about: bool,
     /// A calculation running on another thread (Solve menu).
     solve_job: Option<SolveJob>,
 }
@@ -280,6 +282,7 @@ impl FemCraftApp {
             mcp: None,
             settings: AppSettings::default(),
             rfem_dialog: None,
+            show_about: false,
             solve_job: None,
         };
         // Built-in MCP server on 127.0.0.1 (FEMCRAFT_MCP_PORT, 0 = off). A second instance
@@ -406,7 +409,21 @@ impl FemCraftApp {
 
     /// Where the blank model behind File > New is kept (next to the saved UI state).
     pub fn blank_model_path() -> Option<PathBuf> {
-        eframe::storage_dir("FemCraft").map(|d| d.join("new model.rf6"))
+        let path = eframe::storage_dir("FemCraft").map(|d| d.join("new model.rf6"))?;
+        // A portable install carries the template in `template` next to the executable: it is
+        // copied to the data folder the first time, so File > New works without asking.
+        if !path.is_file()
+            && let Some(bundled) = std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| d.join("template").join("new model.rf6")))
+                .filter(|b| b.is_file())
+        {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::copy(bundled, &path);
+        }
+        Some(path)
     }
 
     /// RFEM files new objects are copied from when a model has none of that kind yet: the
@@ -695,8 +712,10 @@ impl FemCraftApp {
                 ui.menu_button("Settings", |ui| self.settings_menu(ui));
                 ui.menu_button("Windows", |ui| self.windows_menu(ui));
                 ui.menu_button("Help", |ui| {
-                    ui.label(format!("FemCraft {}", env!("CARGO_PKG_VERSION")));
-                    ui.weak("Open / edit RFEM 6 models");
+                    if ui.button("About FemCraft…").clicked() {
+                        ui.close();
+                        self.show_about = true;
+                    }
                 });
             });
         });
@@ -1129,6 +1148,52 @@ impl FemCraftApp {
             &self.working_dir().join("solved"),
         )?;
         self.adopt_solved(id, &done.path, job)
+    }
+
+    /// Help > About FemCraft: version and the change log.
+    fn about_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let mut close = false;
+        #[allow(deprecated)]
+        let id = egui::Id::new("about_femcraft");
+        let modal = egui::Modal::new(id).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.heading(format!("FemCraft {}", env!("CARGO_PKG_VERSION")));
+            ui.label("A 3D structural modelling workspace for RFEM 6 models.");
+            ui.weak("Independent of, and not endorsed by, Dlubal Software. RFEM is a trademark of its owner.");
+            ui.weak("Licensed under MIT or Apache-2.0.");
+            ui.separator();
+            ui.strong("Change log");
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for line in include_str!("../../../CHANGELOG.md").lines() {
+                        if let Some(t) = line.strip_prefix("### ") {
+                            ui.add_space(4.0);
+                            ui.strong(t);
+                        } else if let Some(t) = line.strip_prefix("## ") {
+                            ui.add_space(6.0);
+                            ui.heading(t);
+                        } else if line.starts_with("# ") || line.trim().is_empty() {
+                            // title / blank
+                        } else {
+                            ui.label(line.replacen("- ", "• ", 1));
+                        }
+                    }
+                });
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || modal.should_close() {
+            self.show_about = false;
+        }
     }
 
     /// The modal progress dialog shown while the RFEM server works: nothing else can be
@@ -1855,6 +1920,7 @@ impl eframe::App for FemCraftApp {
         self.solve_dialog(&ui.ctx().clone());
         self.menu_bar(ui);
         self.rfem_dialog_ui(&ui.ctx().clone());
+        self.about_dialog(&ui.ctx().clone());
         self.ribbon(ui);
         self.status_bar(ui);
         for d in &mut self.docs {
