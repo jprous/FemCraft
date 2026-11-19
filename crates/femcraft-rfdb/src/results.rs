@@ -31,8 +31,13 @@ use crate::{Archive, Error};
 const HISTORY: &str = "solver_ids_history.xml";
 /// Sidecar with the solver / results format version.
 const VERSION_XML: &str = "!solver/solver_version.xml";
-/// Per-case result folders live directly under this prefix (`!solver/RN_...`).
-const RESULT_FOLDER_PREFIX: &str = "!solver/RN";
+/// Per-case result folders live directly under this prefix: `!solver/RN_...` (nodal results of
+/// surface / solid meshes) and `!solver/RO_...` (results of 1D member elements).
+const RESULT_FOLDER_PREFIXES: [&str; 2] = ["!solver/RN", "!solver/RO"];
+
+fn is_result_entry(e: &str) -> bool {
+    RESULT_FOLDER_PREFIXES.iter().any(|p| e.starts_with(p))
+}
 
 /// The four kinds of case a result can belong to, in the order RFEM lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -94,6 +99,52 @@ impl CaseKind {
     ];
 }
 
+/// Which extreme of an envelope (design situation / result combination) is plotted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Extremum {
+    Max,
+    Min,
+    /// The full range: scale from the lowest minimum to the highest maximum; each point shows
+    /// whichever of its max and min is larger in magnitude.
+    #[default]
+    Both,
+}
+
+impl Extremum {
+    pub const ALL: [Extremum; 3] = [Extremum::Max, Extremum::Min, Extremum::Both];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Extremum::Max => "Max",
+            Extremum::Min => "Min",
+            Extremum::Both => "Both",
+        }
+    }
+
+    /// Reduces the per-member values at one point (`None` for no values).
+    pub fn reduce(self, values: impl Iterator<Item = f64>) -> Option<f64> {
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for v in values {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        if lo > hi {
+            return None;
+        }
+        Some(match self {
+            Extremum::Max => hi,
+            Extremum::Min => lo,
+            Extremum::Both => {
+                if hi.abs() >= lo.abs() {
+                    hi
+                } else {
+                    lo
+                }
+            }
+        })
+    }
+}
+
 /// One case that has solver results.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultCase {
@@ -104,9 +155,31 @@ pub struct ResultCase {
     pub name: String,
     /// Solver analysis id from the history file (0 when it could not be read).
     pub solver_id: u32,
+    /// Solver ids of the load combinations a design situation or result combination envelopes
+    /// (RFEM stores no results file of its own for them); empty for load cases / combinations.
+    pub members: Vec<u32>,
 }
 
 impl ResultCase {
+    /// True when the case is an envelope with a minimum and maximum (design situation or
+    /// result combination).
+    pub fn has_extremes(&self) -> bool {
+        matches!(
+            self.kind,
+            CaseKind::DesignSituation | CaseKind::ResultCombination
+        )
+    }
+
+    /// Solver ids whose result files make up this case: its own file for a load case or
+    /// combination, the enveloped combinations for a design situation / result combination.
+    pub fn result_ids(&self) -> Vec<u32> {
+        if self.has_extremes() && !self.members.is_empty() {
+            self.members.clone()
+        } else {
+            vec![self.solver_id]
+        }
+    }
+
     /// `LC1`, `CO20`, ... — the tag plus number.
     pub fn tag(&self) -> String {
         format!("{}{}", self.kind.tag(), self.no)
@@ -141,7 +214,7 @@ impl ResultSet {
         let has_results = archive
             .entries
             .iter()
-            .any(|e| e.starts_with(RESULT_FOLDER_PREFIX));
+            .any(|e| is_result_entry(e));
         if !has_results {
             return Ok(None);
         }
@@ -154,6 +227,7 @@ impl ResultSet {
             Connection::open_with_flags(archive.db_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
         {
             fill_case_names(&conn, &mut cases);
+            fill_members(&conn, &mut cases);
         }
 
         cases.sort_by_key(|c| (c.kind, c.no));
@@ -163,7 +237,7 @@ impl ResultSet {
         let solver_folders = archive
             .entries
             .iter()
-            .filter(|e| e.starts_with(RESULT_FOLDER_PREFIX))
+            .filter(|e| is_result_entry(e))
             .filter_map(|e| e.strip_prefix("!solver/").and_then(|r| r.split('/').next()))
             .filter(|f| seen.insert(f.to_string()))
             .map(str::to_owned)
@@ -220,6 +294,7 @@ fn parse_history(bytes: &[u8]) -> Vec<ResultCase> {
             no,
             name: String::new(),
             solver_id,
+            members: Vec::new(),
         })
         .collect()
 }
@@ -235,6 +310,72 @@ fn fill_case_names(conn: &Connection, cases: &mut [ResultCase]) {
             if let Some(name) = names.get(&case.no) {
                 case.name = name.clone();
             }
+        }
+    }
+}
+
+/// Fills `members` of design situations (their generated action combinations' load
+/// combinations) and result combinations (their generated sub-combinations), as solver ids.
+fn fill_members(conn: &Connection, cases: &mut [ResultCase]) {
+    let solver_of: BTreeMap<u32, u32> = cases
+        .iter()
+        .filter(|c| c.kind == CaseKind::LoadCombination)
+        .map(|c| (c.no, c.solver_id))
+        .collect();
+    let ids = |sql: &str, key: i64| -> Vec<u32> {
+        let Ok(mut stmt) = conn.prepare(sql) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([key], |r| r.get::<_, i64>(0)) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for lc_id in rows.flatten() {
+            let no: Option<i64> = conn
+                .query_row("SELECT userID FROM LoadCombination WHERE id=?1", [lc_id], |r| {
+                    r.get(0)
+                })
+                .ok();
+            if let Some(sid) = no.and_then(|n| solver_of.get(&(n as u32))) {
+                if !out.contains(sid) {
+                    out.push(*sid);
+                }
+            }
+        }
+        out
+    };
+    for case in cases.iter_mut() {
+        let (table, sql) = match case.kind {
+            CaseKind::DesignSituation => (
+                "DesignSituation",
+                "SELECT g.reference_id FROM ActionCombinationImpl a                  JOIN ActionCombinationImpl_generatedCombinations g ON g.id = a.id                  WHERE a.designSituation_id = ?1 AND g.reference_table = 'LoadCombination'",
+            ),
+            CaseKind::ResultCombination => (
+                "ResultCombination",
+                "SELECT reference_id FROM ResultCombinationImpl_generatedSubCombinations                  WHERE id = ?1 AND reference_table = 'LoadCombination'",
+            ),
+            _ => continue,
+        };
+        let key: Option<i64> = conn
+            .query_row(
+                &format!("SELECT impl_id FROM {table} WHERE userID=?1"),
+                [case.no],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(key) = key {
+            // A design situation's `impl_id` equals its row id in RFEM files; use the row id.
+            let key = if case.kind == CaseKind::DesignSituation {
+                conn.query_row(
+                    &format!("SELECT id FROM {table} WHERE userID=?1"),
+                    [case.no],
+                    |r| r.get(0),
+                )
+                .unwrap_or(key)
+            } else {
+                key
+            };
+            case.members = ids(sql, key);
         }
     }
 }
@@ -415,6 +556,7 @@ impl ResultComponent {
             GlobalPhiX | SurfacePhiX | MemberPhiX => ("φ_x", "mrad", 1000.0),
             GlobalPhiY | SurfacePhiY | MemberPhiY => ("φ_y", "mrad", 1000.0),
             GlobalPhiZ | SurfacePhiZ | MemberPhiZ => ("φ_z", "mrad", 1000.0),
+            SurfaceContactSigmaZ => ("σ_z", "kN/m²", 1e-3),
             _ => ("", "", 1.0),
         }
     }
@@ -710,7 +852,7 @@ impl Displacements {
             .iter()
             .find(|e| e.starts_with("!solver/RN") && e.ends_with(&suffix))
         else {
-            return Ok(None);
+            return Self::read_members(archive, solver_id, fe_nodes);
         };
         let bytes = archive.read_entry(entry)?;
         if bytes.len() < 240 {
@@ -744,6 +886,79 @@ impl Displacements {
                 *v = x;
             }
             nodal.push(rec);
+        }
+        Ok(Some(Displacements { nodal }))
+    }
+
+    /// Displacements of 1D member elements: `!solver/RO_*/Data.RO<solver_id>` (RFEM 6.16,
+    /// results v18.00). Same 601 header (`[3]` = 6 components, `[4]` = FE node count, `[5]` =
+    /// element count). The block at the byte offset in `i32[155]` holds, per element, the
+    /// displacements `[u_x, u_y, u_z, φ_x, φ_y, φ_z]` of its two end nodes (12 x f64), in
+    /// `Data.E1D` element order (pairs of FE node numbers). Both ends of neighbouring elements
+    /// agree, so the result is filled per FE node. Axes: member local, equal to global for
+    /// members along X.
+    fn read_members(
+        archive: &Archive,
+        solver_id: u32,
+        fe_nodes: usize,
+    ) -> Result<Option<Self>, Error> {
+        let suffix = format!("Data.RO{solver_id:06}");
+        let Some(entry) = archive
+            .entries
+            .iter()
+            .find(|e| e.starts_with("!solver/RO") && e.ends_with(&suffix))
+        else {
+            return Ok(None);
+        };
+        let bytes = archive.read_entry(entry)?;
+        if bytes.len() < 1024 {
+            return Err(Error::Format("member results file too short".into()));
+        }
+        let i32_at = |i: usize| i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        if i32_at(0) != RN_MAGIC || i32_at(3) != 6 {
+            return Ok(None);
+        }
+        let count = i32_at(4).max(0) as usize;
+        let elements = i32_at(5).max(0) as usize;
+        let offset = i32_at(155).max(0) as usize;
+        if count == 0 || elements == 0 || offset == 0 || offset + elements * 96 > bytes.len() {
+            return Err(Error::Format("unexpected member results layout".into()));
+        }
+        if fe_nodes != 0 && count != fe_nodes {
+            return Err(Error::Format(format!(
+                "results have {count} nodes, FE mesh has {fe_nodes}"
+            )));
+        }
+        // Element connectivity: the one beside the results, else the mesh's `Data.E1D`.
+        let folder = &entry[..entry.rfind('/').unwrap_or(0)];
+        let e1d_name = [format!("{folder}/Data.E1D"), "!solver/M/Data.E1D".to_owned()]
+            .into_iter()
+            .find(|n| archive.entries.iter().any(|e| e == n))
+            .ok_or_else(|| Error::Format("no Data.E1D for the member results".into()))?;
+        let e1d = archive.read_entry(&e1d_name)?;
+        if e1d.len() < elements * 8 {
+            return Err(Error::Format(
+                "Data.E1D is shorter than the element count".into(),
+            ));
+        }
+        let f64_at = |o: usize| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+        let mut nodal = vec![[0.0f64; 6]; count];
+        for el in 0..elements {
+            for end in 0..2 {
+                let at = el * 8 + end * 4;
+                let n = i32::from_le_bytes(e1d[at..at + 4].try_into().unwrap());
+                if n < 1 || n as usize > count {
+                    return Err(Error::Format(format!("FE element node {n} out of range")));
+                }
+                let base = offset + el * 96 + end * 48;
+                for k in 0..6 {
+                    let x = f64_at(base + k * 8);
+                    if !x.is_finite() {
+                        return Err(Error::Format("non-finite displacement value".into()));
+                    }
+                    nodal[n as usize - 1][k] = x;
+                }
+            }
         }
         Ok(Some(Displacements { nodal }))
     }
@@ -814,6 +1029,7 @@ mod tests {
             no: 1,
             name: "Self-weight".into(),
             solver_id: 1,
+            members: Vec::new(),
         };
         assert_eq!(named.label(), "LC1 Self-weight");
         let auto = ResultCase {
@@ -821,6 +1037,7 @@ mod tests {
             no: 20,
             name: String::new(),
             solver_id: 9,
+            members: Vec::new(),
         };
         assert_eq!(auto.label(), "CO20");
     }

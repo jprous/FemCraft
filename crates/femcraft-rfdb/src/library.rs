@@ -98,6 +98,30 @@ pub struct LibraryFilter {
     pub limit: usize,
 }
 
+/// Database files chosen in FemCraft's Settings (materials, sections); they win over the
+/// folder search. Process-wide, so the GUI and its MCP server agree.
+static DB_OVERRIDES: std::sync::Mutex<[Option<PathBuf>; 2]> = std::sync::Mutex::new([None, None]);
+
+fn override_slot(kind: LibraryKind) -> usize {
+    match kind {
+        LibraryKind::Material => 0,
+        LibraryKind::Section => 1,
+    }
+}
+
+/// Uses `path` as the `kind` database instead of the one found in the library folders
+/// (`None` = back to the search).
+pub fn set_db_override(kind: LibraryKind, path: Option<PathBuf>) {
+    if let Ok(mut o) = DB_OVERRIDES.lock() {
+        o[override_slot(kind)] = path;
+    }
+}
+
+/// The database file the library uses for `kind` when `dir` is searched.
+pub fn db_override(kind: LibraryKind) -> Option<PathBuf> {
+    DB_OVERRIDES.lock().ok()?[override_slot(kind)].clone()
+}
+
 /// The library databases found in one folder.
 pub struct Library {
     pub dir: PathBuf,
@@ -125,6 +149,14 @@ impl Library {
 
     /// The first folder holding a library database.
     pub fn find(dirs: &[PathBuf]) -> Option<Self> {
+        // A database chosen in Settings: its folder stands in for the search.
+        for kind in [LibraryKind::Section, LibraryKind::Material] {
+            if let Some(f) = db_override(kind).filter(|f| f.is_file())
+                && let Some(dir) = f.parent()
+            {
+                return Some(Self { dir: dir.to_owned() });
+            }
+        }
         dirs.iter()
             .find(|d| {
                 [LibraryKind::Material, LibraryKind::Section]
@@ -135,6 +167,9 @@ impl Library {
     }
 
     pub fn db_path(&self, kind: LibraryKind) -> PathBuf {
+        if let Some(f) = db_override(kind).filter(|f| f.is_file()) {
+            return f;
+        }
         self.dir.join(kind.file_name())
     }
 

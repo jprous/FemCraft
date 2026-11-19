@@ -20,6 +20,7 @@ use crate::{Archive, Error};
 pub const XYZ: &str = "!solver/M/Data.XYZ";
 pub const E2D: &str = "!solver/M/Data.E2D";
 pub const GET: &str = "!solver/M/Data.GET";
+pub const MTO: &str = "!solver/M/Data.MTO";
 pub const LIN: &str = "!solver/M/Data.LIN";
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -47,13 +48,41 @@ impl FeMesh {
                 Ok(Vec::new())
             }
         };
-        Self::parse(
+        let mut mesh = Self::parse(
             &archive.read_entry(XYZ)?,
             &opt(E2D)?,
             &opt(GET)?,
             &opt(LIN)?,
-        )
-        .map(Some)
+        )?;
+        mesh.apply_mto(&opt(MTO)?);
+        Ok(Some(mesh))
+    }
+
+    /// Sets `element_surface` from `Data.MTO`, the mesh's object table. Its text rows
+    /// `<surface> 0 0 <first element> <last element> G ...` give each surface's contiguous element
+    /// range; `Data.GET` is not the surface number (on a slab it counts 1, 2, 3, ... per element).
+    pub fn apply_mto(&mut self, mto: &[u8]) {
+        let text = String::from_utf8_lossy(mto);
+        let mut ranges = Vec::new();
+        for row in text.lines() {
+            let w: Vec<&str> = row.split_whitespace().collect();
+            if w.len() < 6 || w[5] != "G" {
+                continue;
+            }
+            let num = |i: usize| w[i].parse::<u32>().ok();
+            if let (Some(surface), Some(first), Some(last)) = (num(0), num(3), num(4)) {
+                ranges.push((surface, first, last));
+            }
+        }
+        if ranges.is_empty() {
+            return;
+        }
+        self.element_surface = vec![0; self.elements.len()];
+        for (surface, first, last) in ranges {
+            for el in first.max(1)..=last.min(self.elements.len() as u32) {
+                self.element_surface[el as usize - 1] = surface;
+            }
+        }
     }
 
     pub fn parse(xyz: &[u8], e2d: &[u8], get: &[u8], lin: &[u8]) -> Result<Self, Error> {
@@ -114,14 +143,29 @@ impl FeMesh {
 fn parse_lin(bytes: &[u8]) -> Vec<(u32, Vec<u32>)> {
     let text = String::from_utf8_lossy(bytes);
     let mut out: Vec<(u32, Vec<u32>)> = Vec::new();
+    // False after a record of another kind (`PO <line> <position> <node>` rows follow the `LI`
+    // records on beam meshes): its numbers are not part of the node chain.
+    let mut in_chain = false;
     for row in text.lines() {
         let mut words = row.split_whitespace().peekable();
-        if words.peek() == Some(&"LI") {
-            words.next();
-            let Some(no) = words.next().and_then(|w| w.parse().ok()) else {
+        match words.peek() {
+            Some(&"LI") => {
+                words.next();
+                let Some(no) = words.next().and_then(|w| w.parse().ok()) else {
+                    in_chain = false;
+                    continue;
+                };
+                out.push((no, Vec::new()));
+                in_chain = true;
+            }
+            Some(w) if w.parse::<u32>().is_err() => {
+                in_chain = false;
                 continue;
-            };
-            out.push((no, Vec::new()));
+            }
+            _ => {}
+        }
+        if !in_chain {
+            continue;
         }
         if let Some((_, nodes)) = out.last_mut() {
             nodes.extend(words.filter_map(|w| w.parse::<u32>().ok()));
@@ -133,6 +177,22 @@ fn parse_lin(bytes: &[u8]) -> Vec<(u32, Vec<u32>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mto_gives_surface_element_ranges() {
+        let mut mesh = FeMesh {
+            nodes: vec![],
+            elements: vec![[1, 2, 3, 4]; 5],
+            element_surface: vec![9; 5],
+            lines: vec![],
+        };
+        let mto = b"         1         0         0         1         2         G         1
+         2         0         0         3         5         G         0
+       511         0       532        14         0         S       532
+";
+        mesh.apply_mto(mto);
+        assert_eq!(mesh.element_surface, vec![1, 1, 2, 2, 2]);
+    }
 
     #[test]
     fn parses_quad_and_lines() {
@@ -157,6 +217,10 @@ mod tests {
         assert_eq!(m.nodes.len(), 4);
         assert_eq!(m.element_surface, vec![7]);
         assert_eq!(m.lines, vec![(1, vec![1, 2, 3])]);
+        // `PO` records after the chains are not nodes of the last line.
+        let lin = b"LI       1         1         2\nPO       1   0.50000         3\n";
+        let m = FeMesh::parse(&xyz, &e2d, &get, lin).unwrap();
+        assert_eq!(m.lines, vec![(1, vec![1, 2])]);
         assert_eq!(m.edges().len(), 4);
     }
 }

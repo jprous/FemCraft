@@ -79,6 +79,38 @@ Plan and milestone status: `docs/ROADMAP.md`.
   53 = `CIRCLE_M1` circle (`mapping::parametric_shape`); dimensions `b` / `h` / `d` in
   `SectionData_parameterValues`. RFEM's UI (and the library) name them in mm: `R_M1 300/600`, `SQ_M1 400`,
   `CIRCLE_M1 400` (API I uses metres; `Library::get` accepts both). Section fields `parametrization_type`, `b`, `h`, `d` are read-only.
+- Settings / Solve menus (`app.rs`, `AppSettings`, saved with the UI state): section / material
+  database files (`femcraft_rfdb::set_db_override`, wins over the library folder search), RFEM
+  server exe + web-service port + Dlubal e-mail / licence, working directory (dialogs start there,
+  the solve scratch folder is `<working dir>\solved`; when it finishes `App::adopt_solved` copies
+  the calculated file over the model's file (old one kept as `<name>.rf6bak`), deletes the scratch
+  folder and `Document::reload`s the open tab in place, so results just appear; a model edited
+  meanwhile opens the calculated copy as a new tab instead). Solve > "Mesh with RFEM" /
+  MCP `generate_mesh` run `generate_mesh` instead of `calculate_all` (`femcraft_rfem::Job`):
+  the file gets `!solver/M/` (FE mesh) but no result folders (tested, ~69 s). Picking a load case in the Results
+  panel also sets the Display panel's load case. `crates/femcraft-rfem`: `solve()` copies the
+  model, starts `RFEM6Server.exe` when nothing answers on the port (needs `--email` /
+  `--password` / `--license`; entered in Settings > RFEM server… (dialog), password kept in the
+  Windows Credential Manager via `keyring` (env `FEMCRAFT_RFEM_PASSWORD` overrides); without login the
+  server logs "Missing login credentials" and exits), then API I over SOAP: `open_model` (app,
+  port 8081) returns the model's own URL **on another port (8083...)**; `calculate_all`
+  (result `succeeded` / `errors_and_warnings`), `save` (async: wait for the file), `close_model`
+  by the new index. MCP `calculate_all`. An RFEM window already answering on the port is used
+  instead. Tested end to end with the server (5 span beam, 66 s incl. start-up): it needs
+  `--start-soap-server <port>` (else "No valid port specified for WS server", exit 1) and keeps
+  HTTP connections open, so read by Content-Length (not to EOF).
+- Results of 1D members live in `!solver/RO_<id>_<case> - SA1/Data.RO<id>` (surfaces / solids:
+  `RN_*`). Same 601 header; the displacement block is at the byte offset in `i32[155]`: per
+  element (`Data.E1D` pairs of FE nodes) 2 ends x 6 f64 `[ux,uy,uz,φx,φy,φz]` (member local axes;
+  = global for members along X). Block at `i32[156]` (same size) looks like generalised strains
+  (N, Vz, My per end), not decoded yet. Member results are drawn as thick colour-banded member
+  lines (`scene::add_result_members`). Test: `femcraft-rfdb/tests/member_results.rs`.
+- Member / line load `load_direction` is an INTEGER column: 0 / 1 / 2 = local x / y / z, 11 / 12 /
+  13 = global X / Y / Z (13 = Z down, positive magnitude = downwards). MCP accepts the API names
+  (`LOAD_DIRECTION_GLOBAL_Z_OR_USER_DEFINED_W_TRUE` -> 13); text written into the column made RFEM
+  use the local axes.
+- Nodal support spring / restraint "rigid" is `inf` (JSON string `"inf"`; `null` writes NULL and
+  RFEM refuses to calculate).
 - `crates/femcraft-aster`, `-results` placeholders.
 - egui / eframe 0.37 (panels are `egui::Panel`, `App::ui` instead of `update`).
 - CI: `.github/workflows/ci.yml` (Windows build + test).
