@@ -458,6 +458,75 @@ pub fn is_contact(c: femcraft_rfdb::ResultComponent) -> bool {
     matches!(c, femcraft_rfdb::ResultComponent::SurfaceContactSigmaZ)
 }
 
+/// True for a surface basic internal force (m_x … n_xy) this build draws from the stored
+/// generalised-strain block (see [`femcraft_rfdb::SurfaceForces`]).
+pub fn is_surface_force(c: femcraft_rfdb::ResultComponent) -> bool {
+    use femcraft_rfdb::ResultComponent as C;
+    matches!(
+        c,
+        C::SurfaceMx
+            | C::SurfaceMy
+            | C::SurfaceMxy
+            | C::SurfaceVx
+            | C::SurfaceVy
+            | C::SurfaceNx
+            | C::SurfaceNy
+            | C::SurfaceNxy
+    )
+}
+
+/// Adds the contour of a surface internal force over the undeformed FE mesh, as discrete RFEM
+/// colour bands. `forces` holds one set per enveloped case; each FE node takes the `extremum` of
+/// its component value across the sets. Returns the value range `(min, max)` in SI, or `None`
+/// when `component` is not a surface force or no surface element carries a value. With `coloured`
+/// off, draws the plain mesh net in yellow (so the surfaces are still visible) and returns the
+/// range.
+pub fn add_force_surface(
+    s: &mut Scene,
+    mesh: &femcraft_rfdb::FeMesh,
+    forces: &[&femcraft_rfdb::SurfaceForces],
+    component: femcraft_rfdb::ResultComponent,
+    extremum: femcraft_rfdb::Extremum,
+    coloured: bool,
+) -> Option<(f32, f32)> {
+    if !is_surface_force(component) || forces.is_empty() {
+        return None;
+    }
+    let mut span = Span::default();
+    let node: Vec<Option<(Vec3, f64)>> = (1..=mesh.nodes.len() as u32)
+        .map(|no| {
+            let values: Vec<f64> = forces
+                .iter()
+                .filter_map(|f| {
+                    f.node(no)
+                        .and_then(|bf| femcraft_rfdb::surface_force_scalar(component, &bf))
+                })
+                .collect();
+            span.add(&values);
+            Some((to_world(mesh.node(no)?), extremum.reduce(values.into_iter())?))
+        })
+        .collect();
+    if !coloured {
+        for (a, b) in mesh.edges() {
+            let at = |no: u32| node.get(no as usize - 1).copied().flatten();
+            if let (Some(pa), Some(pb)) = (at(a), at(b)) {
+                s.lines
+                    .push(LineVertex::new(pa.0, RESULT_YELLOW).with_width(RESULT_NET_WIDTH));
+                s.lines
+                    .push(LineVertex::new(pb.0, RESULT_YELLOW).with_width(RESULT_NET_WIDTH));
+            }
+        }
+        return span.0.map(|(lo, hi)| (lo as f32, hi as f32));
+    }
+    let at = |no: u32| node.get((no as usize).checked_sub(1)?).copied().flatten();
+    let elems: Vec<Vec<(Vec3, f64)>> = mesh
+        .elements
+        .iter()
+        .filter_map(|e| element_corners(e).iter().map(|&no| at(no)).collect())
+        .collect();
+    band_elements(s, &elems, span.range(extremum))
+}
+
 /// Unit normal of an element (from its first three corners), oriented towards +Z (model axes,
 /// RFEM's z points down) when it is closer to vertical than horizontal.
 fn element_normal(mesh: &femcraft_rfdb::FeMesh, e: &[u32; 4]) -> Option<[f64; 3]> {

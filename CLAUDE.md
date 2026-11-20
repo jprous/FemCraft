@@ -151,7 +151,14 @@ Plan and milestone status: `docs/ROADMAP.md`.
   this model: forces are in each surface's own local axes (= global for the slab), and the walls
   (different local axes) reproduce BEST, so no element-local→global rotation is needed here. The open
   refinement is only closing the slab's last ~10 % (RFEM's exact nodal recovery); membrane n / shear
-  v and the walls' moments are already good. Principal/design (`surface_moments.rs`) apply on top. Numbering is correct (NOT a blocker): the block is indexed in
+  v and the walls' moments are already good. Principal/design (`surface_moments.rs`) apply on top.
+  **Wired into the results display**: `SurfaceForces::read` (results.rs) decodes the block to
+  per-node smoothed `BasicForces` using `RfDocument::surface_stiffness` (per-surface E/ν/d from the
+  model), `scene::add_force_surface` draws the contour over the undeformed mesh, and `document.rs`
+  routes the eight basic-force components (m_x…n_xy) through `scene::is_surface_force`. Selecting
+  one in the Surfaces > Internal Forces navigator shows the RFEM colour bands + legend. Test:
+  `femcraft-rfdb/tests/surface_forces.rs` (Chamber LC1, peak |m_x| ≈ 34 kNm/m). Not yet wired:
+  principal / design / stresses / strains (the formulas exist; only the basic 8 are rendered). Numbering is correct (NOT a blocker): the block is indexed in
   `Data.E2D` row order = the export's element numbers (0 mismatch), corner k ↔ `Data.E2D` node k,
   and `Data.GET` is a per-element tile counter (not the surface number — `mesh.rs` uses `Data.MTO`).
   RFEM API grid route was a dead end (`get_results_for_surfaces_basic_internal_forces` needs a

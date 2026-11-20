@@ -115,6 +115,9 @@ pub struct Document {
     /// Decoded nodal displacements for the selected result case (by solver id; inner `None` when
     /// the case has no displacement file, so it is not re-decoded every frame).
     result_disp: Option<(Vec<u32>, Option<Vec<femcraft_rfdb::Displacements>>)>,
+    /// Decoded surface internal forces for the selected case (by solver id; inner `None` when the
+    /// case has no surface strain block), cached like `result_disp`.
+    result_forces: Option<(Vec<u32>, Option<Vec<femcraft_rfdb::SurfaceForces>>)>,
     /// Colour-scale legend for the active result overlay, drawn over the viewport.
     result_legend: Option<ResultLegend>,
 
@@ -160,6 +163,7 @@ impl Document {
             synced_case: None,
             synced_lc: vis.load_case,
             result_disp: None,
+            result_forces: None,
             result_legend: None,
             revision: 0,
             vis,
@@ -363,7 +367,10 @@ impl Document {
             return None;
         }
         let comp = self.results_view.active?;
-        if !scene::is_displacement(comp) && !scene::is_contact(comp) {
+        if !scene::is_displacement(comp)
+            && !scene::is_contact(comp)
+            && !scene::is_surface_force(comp)
+        {
             return None;
         }
         let (kind, no) = self.results_view.selected?;
@@ -379,9 +386,27 @@ impl Document {
     /// Loads the selected case's displacements (once per case) and, when the factor is unset,
     /// picks one so the peak displacement is a visible fraction of the model.
     fn update_result_overlay(&mut self) {
-        let Some((ids, _)) = self.active_overlay() else {
+        let Some((ids, comp)) = self.active_overlay() else {
             return;
         };
+        // Surface internal forces: decode once per case from the strain block.
+        if scene::is_surface_force(comp) {
+            if self.result_forces.as_ref().map(|(s, _)| s) != Some(&ids)
+                && let Some(mesh) = &self.fe_mesh
+            {
+                let mut sets = Vec::new();
+                for &id in &ids {
+                    match self.rf.surface_forces(id, mesh) {
+                        Ok(Some(f)) => sets.push(f),
+                        Ok(None) => {}
+                        Err(e) => self.warnings.push(format!("Surface forces not read: {e}")),
+                    }
+                }
+                let decoded = (!sets.is_empty()).then_some(sets);
+                self.result_forces = Some((ids, decoded));
+            }
+            return;
+        }
         let fe_nodes = self.fe_mesh.as_ref().map_or(0, |m| m.nodes.len());
         if self.result_disp.as_ref().map(|(s, _)| s) != Some(&ids) {
             let mut sets = Vec::new();
@@ -427,6 +452,28 @@ impl Document {
         let Some((_, comp)) = self.active_overlay() else {
             return;
         };
+        // Surface internal forces: a coloured contour over the undeformed mesh.
+        if scene::is_surface_force(comp) {
+            let (Some((_, Some(sets))), Some(mesh)) = (&self.result_forces, &self.fe_mesh) else {
+                return;
+            };
+            let forces: Vec<&femcraft_rfdb::SurfaceForces> = sets.iter().collect();
+            let ext = self.results_view.extremum;
+            let coloured = self.vis.result_colours;
+            let range = scene::add_force_surface(&mut self.scene, mesh, &forces, comp, ext, coloured)
+                .filter(|_| coloured);
+            if let Some((min, max)) = range {
+                let (label, unit, factor) = comp.display();
+                self.result_legend = Some(ResultLegend {
+                    label,
+                    unit,
+                    factor,
+                    min,
+                    max,
+                });
+            }
+            return;
+        }
         let (Some((_, Some(sets))), Some(mesh)) = (&self.result_disp, &self.fe_mesh) else {
             return;
         };

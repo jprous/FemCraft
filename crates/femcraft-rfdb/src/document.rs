@@ -1513,6 +1513,51 @@ impl RfDocument {
         crate::Displacements::read(&self.archive, solver_id, fe_nodes)
     }
 
+    /// Per-surface isotropic plate stiffness from the model: each surface's thickness gives `d`
+    /// and (via the thickness) the material's `E` and `ν`. Surfaces without a thickness, material
+    /// or the needed properties are left out.
+    pub fn surface_stiffness(&self) -> std::collections::BTreeMap<u32, crate::PlateStiffness> {
+        use femcraft_model::ObjectKind as K;
+        let m = &self.model;
+        let mut out = std::collections::BTreeMap::new();
+        for (id, surf) in m.iter_kind(K::Surface) {
+            let Some(th_no) = surf.get("thickness").as_ref_no() else {
+                continue;
+            };
+            let Some(th) = m.get(ObjectId::new(K::Thickness, th_no)) else {
+                continue;
+            };
+            let Some(d) = th.get("uniform_thickness").as_f64().filter(|d| *d > 0.0) else {
+                continue;
+            };
+            let Some(mat_no) = th.get("material").as_ref_no() else {
+                continue;
+            };
+            let Some(mat) = m.get(ObjectId::new(K::Material, mat_no)) else {
+                continue;
+            };
+            let (Some(e), Some(nu)) = (
+                mat.get("elasticity_modulus").as_f64().filter(|e| *e > 0.0),
+                mat.get("poisson_ratio").as_f64(),
+            ) else {
+                continue;
+            };
+            out.insert(id.no, crate::PlateStiffness::isotropic(e, nu, d));
+        }
+        out
+    }
+
+    /// Surface internal forces for the result case with solver id `solver_id`, smoothed per
+    /// surface and aligned to `mesh`. `Ok(None)` when the case has no surface strain block.
+    pub fn surface_forces(
+        &self,
+        solver_id: u32,
+        mesh: &crate::FeMesh,
+    ) -> Result<Option<crate::SurfaceForces>, Error> {
+        let stiffness = self.surface_stiffness();
+        crate::SurfaceForces::read(&self.archive, solver_id, mesh, &stiffness)
+    }
+
     /// What RFEM expects of load cases that copying does not give them:
     /// - an imposed-load case (action category 36 / 42, or a category that has them elsewhere
     ///   in this model) has a `LoadCaseStandardDependentOptions` row; without it RFEM's server
