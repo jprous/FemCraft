@@ -12,6 +12,7 @@ pub mod library;
 pub mod mapping;
 pub mod mesh;
 pub mod results;
+pub mod surface_moments;
 
 pub use archive::{Archive, SourceFormat};
 pub use catalog::Catalog;

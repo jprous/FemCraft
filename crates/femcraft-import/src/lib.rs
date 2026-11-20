@@ -153,9 +153,26 @@ pub fn import_a03(text: &str, call: &mut Call) -> Result<Report, String> {
     import_model(a03::parse(text)?, call, &mut |_, _| {})
 }
 
+/// Text of a file: UTF-16 (byte order mark; Robot writes its own `.str` that way) or UTF-8.
+pub fn decode_text(bytes: &[u8]) -> String {
+    let utf16 = |b: &[u8], le: bool| {
+        let u: Vec<u16> = b
+            .chunks_exact(2)
+            .map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
+            .collect();
+        String::from_utf16_lossy(&u)
+    };
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, false),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
 /// Parses a file of `format` (text formats are read as UTF-8, lossily).
 fn read_model(format: Format, bytes: &[u8]) -> Result<staad::StaadModel, String> {
-    let text = || String::from_utf8_lossy(bytes).into_owned();
+    let text = || decode_text(bytes);
     match format {
         Format::Staad => staad::parse(&text()),
         Format::ProkonFrame => a03::parse(&text()),

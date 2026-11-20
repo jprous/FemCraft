@@ -1006,6 +1006,34 @@ impl Displacements {
                 "results have {count} nodes, FE mesh has {fe_nodes}"
             )));
         }
+        // Mixed 1D + 2D models (RFEM 6.16): the nodal block at `i32[48]` holds `count` records
+        // of six `f32` (u_x, u_y, u_z, φ_x, φ_y, φ_z, global axes, 24 bytes each) for every FE
+        // node, members and surfaces alike; it ends where the block at `i32[160]` starts.
+        // Checked against RFEM's API on a slab + frame model (max |u| 6.105 mm, node values
+        // match); the member element-end block below agrees in magnitude but is member-local.
+        if i32_at(6) > 0 {
+            let off = i32_at(48).max(0) as usize;
+            if off > 0 && off + count * 24 <= bytes.len() {
+                let mut nodal = Vec::with_capacity(count);
+                let mut ok = true;
+                'rd: for i in 0..count {
+                    let mut rec = [0.0f64; 6];
+                    for (k, v) in rec.iter_mut().enumerate() {
+                        let at = off + i * 24 + k * 4;
+                        let x = f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as f64;
+                        if !x.is_finite() || x.abs() > 1e6 {
+                            ok = false;
+                            break 'rd;
+                        }
+                        *v = x;
+                    }
+                    nodal.push(rec);
+                }
+                if ok {
+                    return Ok(Some(Displacements { nodal }));
+                }
+            }
+        }
         // Element connectivity: the one beside the results, else the mesh's `Data.E1D`.
         let folder = &entry[..entry.rfind('/').unwrap_or(0)];
         let e1d_name = [format!("{folder}/Data.E1D"), "!solver/M/Data.E1D".to_owned()]
@@ -1020,17 +1048,8 @@ impl Displacements {
         }
         let f64_at = |o: usize| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
         let mut nodal = vec![[0.0f64; 6]; count];
-        // Nodes of a mixed mesh that no 1D element touches (surface nodes) keep the values of
-        // the nodal block, when that block is plausible there; the element ends override.
-        let nodal_off = i32_at(48).max(0) as usize;
-        if nodal_off > 0 && nodal_off + count * 48 <= bytes.len() {
-            for (i, rec) in nodal.iter_mut().enumerate() {
-                let vals: Vec<f64> = (0..6).map(|k| f64_at(nodal_off + i * 48 + k * 8)).collect();
-                if vals.iter().all(|v| v.is_finite() && v.abs() < 1e9) {
-                    rec.copy_from_slice(&vals);
-                }
-            }
-        }
+        // Track nodes set by member element-end data so we don't overwrite them with surface data.
+        let mut member_node = vec![false; count];
         for el in 0..elements {
             for end in 0..2 {
                 let at = el * 8 + end * 4;
@@ -1046,6 +1065,7 @@ impl Displacements {
                     }
                     nodal[n as usize - 1][k] = x;
                 }
+                member_node[n as usize - 1] = true;
             }
         }
         Ok(Some(Displacements { nodal }))

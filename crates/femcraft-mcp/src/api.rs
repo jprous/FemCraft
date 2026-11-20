@@ -483,6 +483,32 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
                         )
                     })?);
                 }
+                // Likewise load distributions and action categories: RFEM calls a file with
+                // their API names in these integer columns corrupted.
+                if let Value::Text(t) = &val
+                    && let Some((codes, what)) = match spec.key {
+                        "load_distribution" => Some((LOAD_DISTRIBUTIONS, "load distribution")),
+                        "action_category" => Some((ACTION_CATEGORIES, "action category")),
+                        _ => None,
+                    }
+                {
+                    let name = t.trim().to_ascii_uppercase();
+                    val = match codes.iter().find(|(n, _)| *n == name) {
+                        Some((_, c)) => Value::Int(*c),
+                        None => match name.parse::<i64>() {
+                            Ok(c) => Value::Int(c),
+                            Err(_) => {
+                                let known: Vec<String> =
+                                    codes.iter().map(|(n, c)| format!("{n} = {c}")).collect();
+                                return Err(format!(
+                                    "{k}: '{t}' is not a known {what} name; give RFEM's integer \
+                                     code (known: {})",
+                                    known.join(", ")
+                                ));
+                            }
+                        },
+                    };
+                }
                 fields.push((spec.key, val));
             }
             // Materials and sections: `name` is an RFEM library name (as RFEM's API takes it);
@@ -547,6 +573,16 @@ fn load_direction_code(name: &str) -> Option<i64> {
         _ => return None,
     })
 }
+
+/// Load distribution names with RFEM's stored code. Only uniform is confirmed (0 on every
+/// uniform line / surface load in the verified models); others need a code.
+const LOAD_DISTRIBUTIONS: &[(&str, i64)] = &[("LOAD_DISTRIBUTION_UNIFORM", 0)];
+
+/// Action category names with RFEM's stored code (`LoadCaseImplStatic.actionCategoryId`).
+/// Only permanent G is confirmed (11 on dead / self-weight cases in the verified models);
+/// codes seen for other categories: 19 earth pressure, 36 / 42 imposed, 61 wind,
+/// 71 temperature (names not confirmed).
+const ACTION_CATEGORIES: &[(&str, i64)] = &[("ACTION_CATEGORY_PERMANENT_G", 11)];
 
 /// The library item named `wanted` (RFEM's full name or a unique designation). A parametric
 /// concrete size the library lacks (`R_M1 0.3048/0.6096`, metres or mm) is created from an

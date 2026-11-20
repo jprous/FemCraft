@@ -458,7 +458,9 @@ fn derived_value(
             ) else {
                 return Ok(None);
             };
-            if lib != "ParametricSection" || cat.table("ParametricSection_parameterValues").is_none() {
+            if lib != "ParametricSection"
+                || cat.table("ParametricSection_parameterValues").is_none()
+            {
                 return Ok(None);
             }
             let mut st = conn.prepare_cached(
@@ -472,9 +474,10 @@ fn derived_value(
         }
         Derived::SurfaceLoadParameter(order, node) => {
             let table = format!("{impl_name}_NodeAndMagnitudeParameters_loadParameters");
-            let (Some(info), Some(params)) =
-                (cat.table(&table), get(impl_row, "loadParameters_id").and_then(int))
-            else {
+            let (Some(info), Some(params)) = (
+                cat.table(&table),
+                get(impl_row, "loadParameters_id").and_then(int),
+            ) else {
                 return Ok(None);
             };
             if info.column("node_id").is_none()
@@ -544,7 +547,9 @@ fn derived_value(
             // Reverse lookup: which surfaces contain this opening?
             // SurfaceSpecificImplPart_integratedOpenings.value_id = opening impl_id
             // → SurfaceSpecificImplPart.owner_id = surface impl_id → Surface.
-            if cat.table("SurfaceSpecificImplPart_integratedOpenings").is_none()
+            if cat
+                .table("SurfaceSpecificImplPart_integratedOpenings")
+                .is_none()
                 || cat.table("SurfaceSpecificImplPart").is_none()
             {
                 return Ok(None);
@@ -1300,7 +1305,30 @@ impl RfDocument {
                         )));
                     }
                 };
-                let sql_val = self.to_sql(id.kind, field.key, field.ty, val)?;
+                let mut sql_val = self.to_sql(id.kind, field.key, field.ty, val)?;
+                // RFEM calls a file corrupted when a numeric column holds text (e.g. an API
+                // enum name where RFEM stores its integer code): numbers in text are stored as
+                // numbers, anything else is refused.
+                if let Sql::Text(t) = &sql_val
+                    && let Some(numeric) = numeric_affinity(&tx, table, col)?
+                {
+                    sql_val = match (numeric, t.trim()) {
+                        (Affinity::Integer, s) if s.parse::<i64>().is_ok() => {
+                            Sql::Integer(s.parse().unwrap_or_default())
+                        }
+                        (_, s) if s.parse::<f64>().is_ok() => {
+                            Sql::Real(s.parse().unwrap_or_default())
+                        }
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "{} {}: {key} '{t}' is a name, but RFEM stores a number here \
+                                 (column {table}.{col}); give RFEM's code",
+                                id.kind.name(),
+                                id.no
+                            )));
+                        }
+                    };
+                }
                 tx.execute(
                     &format!(
                         "UPDATE {} SET {} = ?1 WHERE {key_col} = ?2",
@@ -1314,7 +1342,39 @@ impl RfDocument {
         tx.commit()?;
         Ok(())
     }
+}
 
+#[derive(Clone, Copy)]
+enum Affinity {
+    Integer,
+    Real,
+}
+
+/// Whether `table.col` is declared numeric (INTEGER / BOOLEAN or REAL / DOUBLE / FLOAT);
+/// `None` for text or untyped columns.
+fn numeric_affinity(
+    conn: &rusqlite::Connection,
+    table: &str,
+    col: &str,
+) -> Result<Option<Affinity>, Error> {
+    let ty: Option<String> = conn
+        .query_row(
+            "SELECT type FROM pragma_table_info(?1) WHERE name = ?2 COLLATE NOCASE",
+            rusqlite::params![table, col],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let ty = ty.unwrap_or_default().to_ascii_uppercase();
+    Ok(if ty.contains("INT") || ty.contains("BOOL") {
+        Some(Affinity::Integer)
+    } else if ty.contains("REAL") || ty.contains("DOUB") || ty.contains("FLOA") {
+        Some(Affinity::Real)
+    } else {
+        None
+    })
+}
+
+impl RfDocument {
     /// Replaces the rows of an RFEM list table (`id` = owner, `container_order`, value in
     /// `reference_id` (+ `reference_table`) or `value_id`).
     #[allow(clippy::too_many_arguments)]
@@ -1453,6 +1513,95 @@ impl RfDocument {
         crate::Displacements::read(&self.archive, solver_id, fe_nodes)
     }
 
+    /// What RFEM expects of load cases that copying does not give them:
+    /// - an imposed-load case (action category 36 / 42, or a category that has them elsewhere
+    ///   in this model) has a `LoadCaseStandardDependentOptions` row; without it RFEM's server
+    ///   asserts `m_loadCaseStandardDependentOptions` and crashes opening the file;
+    /// - a new load case (copied from another one, often the self-weight case) has the
+    ///   foundation self-weight / earth covering switches only when its own self-weight is on.
+    fn complete_load_cases(&mut self, new: &[ObjectId]) -> Result<(), Error> {
+        const IMPOSED: &[i64] = &[36, 42];
+        let conn = Connection::open(self.archive.db_path())?;
+        let has = |table: &str, col: &str| -> Result<bool, Error> {
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+                    rusqlite::params![table, col],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        };
+        let impl_t = "LoadCaseImplStatic";
+        if has(impl_t, "loadCaseStandardDependentOptions_id")?
+            && has("LoadCaseStandardDependentOptions", "owner_id")?
+        {
+            let mut cats: Vec<i64> = IMPOSED.to_vec();
+            let mut q = conn.prepare(
+                "SELECT DISTINCT actionCategoryId FROM LoadCaseImplStatic \
+                 WHERE loadCaseStandardDependentOptions_id IS NOT NULL \
+                 AND typeof(actionCategoryId) = 'integer'",
+            )?;
+            for c in q.query_map([], |r| r.get::<_, i64>(0))? {
+                let c = c?;
+                if !cats.contains(&c) {
+                    cats.push(c);
+                }
+            }
+            drop(q);
+            let list = cats.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let missing: Vec<i64> = conn
+                .prepare(&format!(
+                    "SELECT id FROM LoadCaseImplStatic WHERE actionCategoryId IN ({list}) \
+                     AND loadCaseStandardDependentOptions_id IS NULL"
+                ))?
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            for impl_id in missing {
+                // RFEM's defaults (as on every imposed-load case of the verified models).
+                conn.execute(
+                    "INSERT INTO LoadCaseStandardDependentOptions (version, owner_id, \
+                     owner_table, option1, option2, option3, intValue1, intValue2, option4, \
+                     unevenSettlementsCoefficient) VALUES (0, ?1, 'LoadCaseImplStatic', 0, 0, \
+                     0, 0, 0, 0, 0.6660000085830688)",
+                    [impl_id],
+                )?;
+                conn.execute(
+                    "UPDATE LoadCaseImplStatic SET loadCaseStandardDependentOptions_id = ?1 \
+                     WHERE id = ?2",
+                    rusqlite::params![conn.last_insert_rowid(), impl_id],
+                )?;
+            }
+        }
+        let switches = ["activeSelfWeightOnFoundations", "activeEarthCoveringOnFoundations"];
+        if has(impl_t, "selfWeightActive")? {
+            for id in new {
+                let Some((_, key)) = self.db_key(*id) else {
+                    continue;
+                };
+                let impl_id: Option<i64> = conn
+                    .query_row("SELECT impl_id FROM LoadCase WHERE id = ?1", [key], |r| {
+                        r.get(0)
+                    })
+                    .optional()?
+                    .flatten();
+                let Some(impl_id) = impl_id else { continue };
+                for s in switches {
+                    if has(impl_t, s)? {
+                        conn.execute(
+                            &format!(
+                                "UPDATE LoadCaseImplStatic SET {s} = selfWeightActive \
+                                 WHERE id = ?1"
+                            ),
+                            [impl_id],
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Saves to `path`: `.rf6` sources are re-zipped with unchanged sidecars; bare databases are
     /// copied. Unchanged models give a byte-identical `model.db`.
     pub fn save(&mut self, path: &Path) -> Result<(), Error> {
@@ -1460,8 +1609,16 @@ impl RfDocument {
         if self.is_modified() && !self.archive.drop_prefixes.iter().any(|p| p == "!solver/") {
             self.archive.drop_prefixes.push("!solver/".into());
         }
+        let new_load_cases: Vec<ObjectId> = self
+            .model
+            .dirty()
+            .iter()
+            .filter(|id| id.kind == ObjectKind::LoadCase && !self.bindings.contains_key(id))
+            .copied()
+            .collect();
         self.insert_new_objects()?;
         self.apply_edits()?;
+        self.complete_load_cases(&new_load_cases)?;
         match self.archive.format {
             SourceFormat::Rf6 => self.archive.save_rf6(path)?,
             SourceFormat::SqliteFile => self.archive.save_db(path)?,

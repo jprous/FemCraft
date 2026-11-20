@@ -104,9 +104,30 @@ Plan and milestone status: `docs/ROADMAP.md`.
   `RN_` folders): `i32[5]` > 0 and `i32[155]` > 0 = element-end block of 1D elements (decoded
   as below; nodes no 1D element touches keep the plausible values of the nodal block at
   `i32[48]`); otherwise (`i32[5]` = 0, `i32[155]` = -1, surface / solid meshes) the nodal block at
-  `i32[48]`. Reading the nodal block of a frame gives garbage (1e30). Mixed 1D + 2D models: not
-  seen yet. Envelopes (design situation / result combination) of members draw the Max and / or Min
+  `i32[48]`. Reading the nodal block of a frame gives garbage (1e30). Mixed 1D + 2D models (`i32[6]` > 0): the nodal block at `i32[48]` is `count` x 6 **f32**
+  (24 bytes, global axes, members and surfaces alike), verified against RFEM's API; the
+  per-element-corner block at `i32[163]` is NOT displacement. Envelopes (design situation / result combination) of members draw the Max and / or Min
   deformed shape (Both = both in one view); surfaces keep the undeformed envelope contour.
+- **Surface internal forces are not stored**; RFEM builds them from the block at `i32[163]`.
+  That block is per 2D element (`Data.E2D` order) 4 corners x 8 f64 of **generalised strains**,
+  in the order of the basic forces: `[κx, κy, κxy, γxz, γyz, εx, εy, εxy]` (curvatures 1/m,
+  transverse shear and membrane strains). Confirmed against RFEM's xlsx result export for
+  `Chamber 4x4x6.rf6` (LC1): slot c correlates with basic force c, and fitting on one surface's
+  interior nodes recovers the plate stiffness on the diagonal (coeff of κx in m_x = D =
+  E·d³/12/(1-ν²); of κxy in m_xy = D(1-ν)/2; of εx in n_x = C = E·d/(1-ν²)). Build-up:
+  force = plate constitutive matrix · generalised strain at each corner, then **smooth per
+  surface** (average at each node over that surface's elements only; junction nodes keep a
+  separate value per surface — node 5 differs across slab + two walls). Membrane forces
+  (n_x, n_y, n_xy) and shears (v_x, v_y) reproduce from the stored strains to < 1 kN/m (C30/37,
+  E 33 GPa, ν 0.2, d 0.4 m). **Moments m_x, m_y still carry a bending–membrane coupling** (the
+  slot5/6 terms in the fitted m_x row), i.e. an offset reference plane, not yet pinned down; the
+  pure mid-plane `D·κ` law matches m_x/m_y only to ~0.2 % at single-element nodes but drifts on
+  the averaged field. Basic→principal→design formulas are in `surface_moments.rs`, all checked
+  against the LC1 export to < 2e-5 (the manual's `m_c,D+` branch for `m_x > m_y, m_y < -|m_xy|`
+  is `m_y - m_xy²/|m_y|`; `m_y,D±` / `n_y,D` are the x/y swap of the documented `m_x,D±` / `n_x,D`).
+  The 92608/27200 offsets are for this 532-node / 511-element model; always read the header
+  (`i32[163]`). Research scripts and the comparison workbooks are in the session scratchpad and
+  `testdata/private/*_check_LC1.xlsx` (git-ignored).
 - Results of 1D members live in `!solver/RO_<id>_<case> - SA1/Data.RO<id>` (surfaces / solids:
   `RN_*`). Same 601 header; the displacement block is at the byte offset in `i32[155]`: per
   element (`Data.E1D` pairs of FE nodes) 2 ends x 6 f64 `[ux,uy,uz,φx,φy,φz]` (member local axes;
@@ -121,10 +142,23 @@ Plan and milestone status: `docs/ROADMAP.md`.
   assignment fields stay in the model but are not columns); the Nodes / Lines / Members / Surfaces
   tables end in a virtual editable "Support" column (`panels::assign_support` moves the object
   between the supports' lists).
+- **RFEM calls a file corrupted when a numeric column holds text** (an API enum name where it
+  stores a code): `save` refuses it (`numeric_affinity` in `document.rs`; numbers in text are
+  stored as numbers). Load case `actionCategoryId` is an integer: 11 = permanent G (confirmed);
+  19 earth, 36 / 42 imposed, 61 wind, 71 temperature seen, names unconfirmed. Load
+  `loadDistribution` 0 = uniform. MCP converts the confirmed names (`api::ACTION_CATEGORIES`,
+  `LOAD_DISTRIBUTIONS`), refuses other names.
+- Imposed-load cases (36, 42) need a `LoadCaseStandardDependentOptions` row linked by
+  `LoadCaseImplStatic.loadCaseStandardDependentOptions_id`, or RFEM's server asserts
+  `m_loadCaseStandardDependentOptions` and crashes on opening (client sees os error 10054).
+  `RfDocument::complete_load_cases` (on save) adds it and sets a new load case's
+  `activeSelfWeightOnFoundations` / `activeEarthCoveringOnFoundations` to its own
+  `selfWeightActive` (copies of the self-weight case kept them on). Test:
+  `tests/new_objects.rs::imposed_load_cases_complete`.
 - Nodal support spring / restraint "rigid" is `inf` (JSON string `"inf"`; `null` writes NULL and
   RFEM refuses to calculate).
 - `crates/femcraft-import` (File > Import, STAAD `.std`): `staad.rs` parser (joint / element loads kept), `surfaces.rs` plate mesh -> surfaces, `lib.rs` `import_staad` + `merge_onto_surfaces`: supports on every node of a surface -> one surface support (equal spring per node or per tributary area, 5 %; bands of different stiffness stay nodal); plate pressures equal on a whole surface, and nodal forces of equal pressure per area, -> uniform surface loads; the rest lumps to nodal loads (linear / triangular surface loads cannot be written yet: `SurfaceLoad` varying fields are read-only in rfdb). Private tests: `staad_private.rs`, `staad_merge_private.rs` (mock, prints notes). Prokon Frame `.A03` (`a03.rs`, text tables, Y up, shells offset by `SHELL_BASE`) is parsed into the same `StaadModel`, so it shares `import_model` and the merging; beams and uniform full-length beam loads (node pair -> member) are imported, point / trapezoidal / partial beam loads are counted, combinations are listed in the notes (no combination kind in FemCraft yet); beam sections are not (the report's section table is empty: members get section 1); tests `a03_*` (`PKW Wall_with shells.a03`, `C:\Temp\Model1.A03` from the A03RF6STEEL skill).
-- Robot import (File > Import > Robot, `.str` or `.rtd`, picked by the compound-file signature): `robot.rs` reads the ROBOT97 text (nodes, supports, bars, plates, material / section / `TH=` groups, nodal + uniform global element loads, combinations; rigid links, offsets, varying element loads only counted) into `StaadModel` (`z_up`). `rtd.rs` (`cfb` crate) reads only panel corners (`OFDAT/OBCOR`, 12 f64 per object, 4 corners), part numbers (`ObPrtDtREC`) and the thickness table (`SSDAT` / `SSNAM`); the panel -> thickness link, nodes / FE mesh, supports and loads are not decoded (all panels 0.4 m, noted in the report). `import*`/`check` take bytes. Test: `tests/robot_private.rs` (`TSD1 3D.str`, `New Sludge Tank Rev 0.rtd` in `testdata/private`).
+- Robot import (File > Import > Robot, `.str` or `.rtd`, picked by the compound-file signature; text may be UTF-16): `robot.rs` reads the ROBOT97 text, both Tekla's export and Robot's own (`PLAte`, 2D nodes, `21to24` ranges, `BOUndaries` skipped, `SELf-weight`, quoted material names; supports labels = restrained DOFs in Robot's files, free DOFs in Tekla's (`Label - free` comment)) into `StaadModel` (`z_up`). `rtd.rs` (`cfb` crate), layout found by diffing `Punching test model.rtd` against its `.str` (documented in its header): meshed models read nodes (`NDNUM`/`NDCOR`), tri / quad elements (`ELNUM`/`ELTYP`/`ELDAT`/`ELREC`, node indices), thickness (`ELA01` -> `SSDAT`), materials (`MADAT`/`MANAM`), support nodes (`SUREC`; DOF flags NOT found, imported as UZ), load cases and loads (`LNNAM`/`LNATR`, `LOATR` -> `LOREC` bitmask -> `LDREC`/`LDTYP` values, `LVREC` per-object bitmask of applied records; nodal-load targets inferred from one model); combinations not decoded. Unmeshed models (the sludge tank) only give panel corners (`OFDAT/OBCOR`) and a default 0.4 m thickness: the panel -> thickness link is still unknown. `import*`/`check` take bytes. Tests: `tests/robot_private.rs` (`TSD1 3D.str`, `Punching test model.str/.rtd` agree, `New Sludge Tank Rev 0.rtd`; files in `testdata/private`).
 - `crates/femcraft-aster`, `-results` placeholders.
 - egui / eframe 0.37 (panels are `egui::Panel`, `App::ui` instead of `update`).
 - CI: `.github/workflows/ci.yml` (Windows build + test).

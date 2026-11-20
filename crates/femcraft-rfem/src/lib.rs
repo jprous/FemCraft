@@ -75,8 +75,12 @@ impl Default for RfemConfig {
         Self {
             server_exe: PathBuf::from(DEFAULT_SERVER),
             port: DEFAULT_PORT,
-            email: std::env::var("FEMCRAFT_RFEM_EMAIL").ok().filter(|e| !e.is_empty()),
-            license: std::env::var("FEMCRAFT_RFEM_LICENSE").ok().filter(|e| !e.is_empty()),
+            email: std::env::var("FEMCRAFT_RFEM_EMAIL")
+                .ok()
+                .filter(|e| !e.is_empty()),
+            license: std::env::var("FEMCRAFT_RFEM_LICENSE")
+                .ok()
+                .filter(|e| !e.is_empty()),
         }
     }
 }
@@ -141,7 +145,9 @@ fn dechunk(mut d: &[u8]) -> Vec<u8> {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Text of the first element called `tag` (any namespace prefix).
@@ -166,7 +172,9 @@ fn elements(xml: &str, tag: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = xml;
     while let Some(v) = element(rest, tag) {
-        let Some(i) = rest.find(&format!("{tag}>")) else { break };
+        let Some(i) = rest.find(&format!("{tag}>")) else {
+            break;
+        };
         out.push(v);
         rest = &rest[i + tag.len() + 1..];
     }
@@ -322,12 +330,17 @@ fn start_server(cfg: &RfemConfig, addr: SocketAddr) -> Result<Child, String> {
     let email = cfg.email.as_deref().filter(|e| !e.is_empty());
     let password = email.and_then(password_for);
     let (Some(email), Some(password)) = (email, password) else {
-        return Err("The RFEM server needs a Dlubal login: enter the account e-mail and \
+        return Err(
+            "The RFEM server needs a Dlubal login: enter the account e-mail and \
              password in Settings > RFEM server… (or start RFEM, which is then used instead)."
-            .to_owned());
+                .to_owned(),
+        );
     };
     let mut cmd = Command::new(&cfg.server_exe);
-    cmd.arg("--email").arg(email).arg("--password").arg(password);
+    cmd.arg("--email")
+        .arg(email)
+        .arg("--password")
+        .arg(password);
     if let Some(l) = cfg.license.as_deref().filter(|l| !l.is_empty()) {
         cmd.arg("--license").arg(l);
     }
@@ -388,13 +401,44 @@ fn run(addr: SocketAddr, file: &Path, job: Job, progress: &dyn Fn(&str)) -> Resu
             Job::Calculate => "RFEM is calculating…",
             Job::Mesh => "RFEM is generating the FE mesh…",
         });
-        let r = call(maddr, &mp, job.method(), &[("skip_warnings", "true".into())])?;
+        let r = call(
+            maddr,
+            &mp,
+            job.method(),
+            &[("skip_warnings", "true".into())],
+        )?;
         if element(&r, "succeeded").as_deref() == Some("false") {
             let what = element(&r, "messages").unwrap_or_default();
             let object = element(&r, "object").unwrap_or_default();
             let field = element(&r, "input_field").unwrap_or_default();
             let msg = element(&r, "message").unwrap_or_default();
-            return Err(format!("RFEM could not calculate: {what} {object} {field} {msg}"));
+            let mut err = format!("RFEM could not calculate: {what} {object} {field} {msg}")
+                .trim_end()
+                .to_owned();
+            // The summary only points at RFEM's error table: fetch it.
+            match call(maddr, &mp, "get_calculation_errors", &[]) {
+                Ok(list) if only_license_warnings(&list) => {
+                    // All errors are add-on-license warnings (error 20004, e.g. Concrete Design).
+                    // The structural FEM analysis completed; fall through to save.
+                }
+                Ok(list) => {
+                    let lines = calculation_messages(&list);
+                    if lines.is_empty() {
+                        err.push_str("\n\nget_calculation_errors returned no messages.");
+                    } else {
+                        err.push_str("\n\nget_calculation_errors:");
+                        for l in lines {
+                            err.push_str("\n- ");
+                            err.push_str(&l);
+                        }
+                    }
+                    return Err(err);
+                }
+                Err(e) => {
+                    err.push_str(&format!("\n\nget_calculation_errors failed: {e}"));
+                    return Err(err);
+                }
+            }
         }
         progress("Saving the model with RFEM…");
         call(maddr, &mp, "save", &[("file_path", path.clone())])?;
@@ -411,6 +455,89 @@ fn run(addr: SocketAddr, file: &Path, job: Job, progress: &dyn Fn(&str)) -> Resu
         );
     }
     outcome
+}
+
+/// The `calculation_message` items of a `get_calculation_errors` reply, one line each:
+/// `ERROR: <message> (object ..., field ..., value ...)`. Items are found by their
+/// `message_type`, so the array's wrapper element names do not matter.
+pub fn calculation_messages(xml: &str) -> Vec<String> {
+    // Opening `<message_type>` / `<ns:message_type>` tags (not closing ones).
+    let starts: Vec<usize> = xml
+        .match_indices("message_type>")
+        .filter_map(|(i, _)| {
+            let lt = xml[..i].rfind('<')?;
+            let name = &xml[lt + 1..i];
+            let ok = name.is_empty() || (name.ends_with(':') && !name.contains(['/', ' ', '>']));
+            ok.then_some(lt)
+        })
+        .collect();
+    let field = |block: &str, tag: &str| {
+        element(block, tag)
+            .filter(|v| !v.is_empty() && !v.contains('<'))
+            .map(|v| xml_unescape(&v))
+    };
+    starts
+        .iter()
+        .enumerate()
+        .map(|(n, &s)| {
+            let block = &xml[s..starts.get(n + 1).copied().unwrap_or(xml.len())];
+            let kind = field(block, "message_type").unwrap_or_else(|| "MESSAGE".into());
+            let mut line = format!(
+                "{kind}: {}",
+                field(block, "message").unwrap_or_else(|| "(no text)".into())
+            );
+            let extra: Vec<String> = [
+                ("object", "object"),
+                ("input_field", "field"),
+                ("current_value", "value"),
+            ]
+            .iter()
+            .filter_map(|(tag, label)| field(block, tag).map(|v| format!("{label} {v}")))
+            .collect();
+            if !extra.is_empty() {
+                line.push_str(&format!(" ({})", extra.join(", ")));
+            }
+            line
+        })
+        .collect()
+}
+
+/// Returns `true` if every `<error_or_warning_number>` in a `get_calculation_errors` XML
+/// response is `"20004"` (add-on license unavailable). An empty list returns `false` so
+/// an unexpected empty response does not silently suppress a real error.
+fn only_license_warnings(xml: &str) -> bool {
+    let marker = "error_or_warning_number>";
+    let mut count = 0usize;
+    let mut pos = 0;
+    while let Some(rel) = xml[pos..].find(marker) {
+        let abs = pos + rel;
+        // Skip closing tags: they are preceded by `</` within the same tag start.
+        let tag_lt = xml[..abs].rfind('<').unwrap_or(0);
+        if xml[tag_lt..abs].contains('/') {
+            pos = abs + 1;
+            continue;
+        }
+        let content_start = abs + marker.len();
+        let content_end = xml[content_start..]
+            .find('<')
+            .map(|i| content_start + i)
+            .unwrap_or(xml.len());
+        let val = xml[content_start..content_end].trim();
+        if val != "20004" {
+            return false;
+        }
+        count += 1;
+        pos = content_start;
+    }
+    count > 0
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// RFEM's `save` returns before the file is written: wait until it changed and is stable.
