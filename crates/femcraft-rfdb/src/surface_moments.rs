@@ -59,6 +59,91 @@ pub fn basic_moments(s: &FaceStresses, d: f64) -> BasicMoments {
     }
 }
 
+/// Generalised strains at one surface point, in the surface's local axes: the bending curvatures
+/// `[κx, κy, κxy]` (1/m), the transverse shear strains `[γxz, γyz]` and the membrane strains
+/// `[εx, εy, εxy]`. This is the order RFEM stores per element corner in the result block at
+/// `i32[163]` (see `results.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct GeneralisedStrains {
+    pub kappa_x: f64,
+    pub kappa_y: f64,
+    pub kappa_xy: f64,
+    pub gamma_xz: f64,
+    pub gamma_yz: f64,
+    pub epsilon_x: f64,
+    pub epsilon_y: f64,
+    pub epsilon_xy: f64,
+}
+
+/// The eight basic internal forces of a surface, in local axes (`m` in N·m/m, `v`/`n` in N/m).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BasicForces {
+    pub mx: f64,
+    pub my: f64,
+    pub mxy: f64,
+    pub vx: f64,
+    pub vy: f64,
+    pub nx: f64,
+    pub ny: f64,
+    pub nxy: f64,
+}
+
+/// Isotropic-plate stiffnesses for a surface of thickness `d` (m), elastic modulus `e` (Pa),
+/// Poisson's ratio `nu`: bending `D`, membrane `C` and transverse shear `S`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlateStiffness {
+    /// Bending stiffness `D = E·d³ / [12(1−ν²)]`.
+    pub d_bend: f64,
+    /// Membrane stiffness `C = E·d / (1−ν²)`.
+    pub c_memb: f64,
+    /// Transverse shear stiffness `S` (shear-corrected; `5/6·G·d` for a homogeneous section).
+    pub s_shear: f64,
+    pub nu: f64,
+}
+
+impl PlateStiffness {
+    /// Isotropic stiffnesses from `e` (Pa), `nu`, thickness `d` (m). The shear stiffness uses the
+    /// 5/6 shear correction factor; RFEM lets this be configured, so `s_shear` may be overridden.
+    pub fn isotropic(e: f64, nu: f64, d: f64) -> Self {
+        let g = e / (2.0 * (1.0 + nu));
+        PlateStiffness {
+            d_bend: e * d * d * d / (12.0 * (1.0 - nu * nu)),
+            c_memb: e * d / (1.0 - nu * nu),
+            s_shear: 5.0 / 6.0 * g * d,
+            nu,
+        }
+    }
+}
+
+/// Basic internal forces from the generalised strains, by the isotropic plate constitutive law.
+///
+/// Confirmed against RFEM 6 output for a C30/37 slab (`E = 33 GPa`, `ν = 0.2`, `d = 0.4 m`):
+/// deriving the basic forces from the export's own face strains reproduces `n_x`/`n_y`/`n_xy` to
+/// < 0.01 kN/m and gives `m_xy/κ_xy = D(1−ν)/2` exactly. The sign convention matches RFEM with
+/// moments negated (positive curvature → tension on the `+z` face → negative moment here).
+pub fn basic_forces(g: &GeneralisedStrains, k: &PlateStiffness) -> BasicForces {
+    let (d, c, s, nu) = (k.d_bend, k.c_memb, k.s_shear, k.nu);
+    BasicForces {
+        mx: -d * (g.kappa_x + nu * g.kappa_y),
+        my: -d * (g.kappa_y + nu * g.kappa_x),
+        mxy: -d * (1.0 - nu) / 2.0 * g.kappa_xy,
+        vx: s * g.gamma_xz,
+        vy: s * g.gamma_yz,
+        nx: c * (g.epsilon_x + nu * g.epsilon_y),
+        ny: c * (g.epsilon_y + nu * g.epsilon_x),
+        nxy: c * (1.0 - nu) / 2.0 * g.epsilon_xy,
+    }
+}
+
+/// The bending part of [`basic_forces`] as [`BasicMoments`] (feeds principal / design moments).
+pub fn moments_from_forces(f: &BasicForces) -> BasicMoments {
+    BasicMoments {
+        mx: f.mx,
+        my: f.my,
+        mxy: f.mxy,
+    }
+}
+
 /// Principal moments and the angle of axis 1 (`α_b`).
 pub fn principal_moments(m: &BasicMoments) -> PrincipalMoments {
     let r = ((m.mx - m.my).powi(2) + 4.0 * m.mxy * m.mxy).sqrt() / 2.0;
@@ -151,6 +236,21 @@ mod tests {
         close(t.m1, 2.0);
         close(t.m2, -2.0);
         close(t.alpha_b, std::f64::consts::FRAC_PI_4);
+    }
+
+    #[test]
+    fn basic_forces_from_generalised_strains_use_the_plate_law() {
+        // C30/37 slab: E = 33 GPa, nu = 0.2, d = 0.4 m (the confirmed Chamber values).
+        let k = PlateStiffness::isotropic(33.0e9, 0.2, 0.4);
+        close(k.d_bend, 33.0e9 * 0.4_f64.powi(3) / (12.0 * (1.0 - 0.04)));
+        close(k.c_memb, 33.0e9 * 0.4 / (1.0 - 0.04));
+        // Pure twist curvature: m_xy = -D(1-nu)/2 * kappa_xy, confirmed = 73333.3 * kappa_xy.
+        let g = GeneralisedStrains { kappa_xy: 1.0e-4, ..Default::default() };
+        close(basic_forces(&g, &k).mxy, -k.d_bend * 0.8 / 2.0 * 1.0e-4);
+        // Pure membrane strain: n_x = C*(eps_x + nu*eps_y).
+        let m = GeneralisedStrains { epsilon_x: 1.0e-4, epsilon_y: 0.0, ..Default::default() };
+        close(basic_forces(&m, &k).nx, k.c_memb * 1.0e-4);
+        close(basic_forces(&m, &k).ny, k.c_memb * 0.2 * 1.0e-4);
     }
 
     #[test]

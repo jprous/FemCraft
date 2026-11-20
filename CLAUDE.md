@@ -115,14 +115,39 @@ Plan and milestone status: `docs/ROADMAP.md`.
   `Chamber 4x4x6.rf6` (LC1): slot c correlates with basic force c, and fitting on one surface's
   interior nodes recovers the plate stiffness on the diagonal (coeff of κx in m_x = D =
   E·d³/12/(1-ν²); of κxy in m_xy = D(1-ν)/2; of εx in n_x = C = E·d/(1-ν²)). Build-up:
-  force = plate constitutive matrix · generalised strain at each corner, then **smooth per
+  force = isotropic plate constitutive law · generalised strain at each corner, then **smooth per
   surface** (average at each node over that surface's elements only; junction nodes keep a
-  separate value per surface — node 5 differs across slab + two walls). Membrane forces
-  (n_x, n_y, n_xy) and shears (v_x, v_y) reproduce from the stored strains to < 1 kN/m (C30/37,
-  E 33 GPa, ν 0.2, d 0.4 m). **Moments m_x, m_y still carry a bending–membrane coupling** (the
-  slot5/6 terms in the fitted m_x row), i.e. an offset reference plane, not yet pinned down; the
-  pure mid-plane `D·κ` law matches m_x/m_y only to ~0.2 % at single-element nodes but drifts on
-  the averaged field. Basic→principal→design formulas are in `surface_moments.rs`, all checked
+  separate value per surface — node 5 differs across slab + two walls). **The law is CONFIRMED**
+  (`surface_moments::basic_forces` / `PlateStiffness::isotropic`): deriving the basic forces from
+  the export's OWN face strains (`κ = (ε_top − ε_bot)/d`, membrane `= (ε_top + ε_bot)/2`, both
+  smoothed the same way so the map survives) gives, for the Chamber slab (C30/37, E 33 GPa, ν 0.2,
+  d 0.4 m), `n_x`/`n_y`/`n_xy` to < 0.01 kN/m and `m_xy/κ_xy = D(1-ν)/2 = 73333` EXACTLY. So:
+  `m_x = -D(κx + ν κy)`, `m_y = -D(κy + ν κx)`, `m_xy = -D(1-ν)/2·κxy`, `v = S·γ`,
+  `n = C(ε + ν ε)` with D=E·d³/12/(1-ν²), C=E·d/(1-ν²), S≈5/6·G·d. (An earlier note here claimed
+  a ~5.8× twist error / MITC covariant transform — that was WRONG; it came from reading the block's
+  slot2 against the export's smoothed κxy. The block's membrane slots 5/6 match true membrane strain
+  to ratio ≈1.0; the curvature slots 0/1/2 match with scatter only because the block is per-element
+  while the export κ is smoothed, and because κ = small difference of face strains amplifies the
+  export's per-mille rounding.) **Membrane n and shear v CAN be driven from the block** (slots 5/6
+  match true membrane strain to ratio ≈1.0): build `PlateStiffness` per surface and call
+  `basic_forces` — good to < 1 kN/m. **Moments from the block are still BLOCKED**: the block's
+  bending slots 0/1/2 are NOT the Cartesian corner curvatures. Decisive test (parallel diagnostic):
+  at interior FE node 10 the four adjacent elements' raw `m_x = -D(κx+ν κy)` from the block are
+  [3.6, 3.8, 11.2, 11.6] but the export is -8.265 — outside that range and wrong-signed, so no nodal
+  averaging or axis rotation recovers it; the per-corner curvature from the block is itself wrong.
+  The block's 4 bending entries behave like 2×2 Gauss-point values needing the MITC4 covariant→
+  Cartesian recovery (√3 corner extrapolation alone leaves ~23 kNm/m error). So `surface_moments::
+  basic_forces` is the correct law (it reproduces forces from the export's face strains), but the
+  input curvatures must come from the proper MITC recovery of the stored strains, not the raw block
+  slots — that recovery is the open piece. Numbering is correct (NOT a blocker): the block is indexed in
+  `Data.E2D` row order = the export's element numbers (0 mismatch), corner k ↔ `Data.E2D` node k,
+  and `Data.GET` is a per-element tile counter (not the surface number — `mesh.rs` uses `Data.MTO`).
+  RFEM API grid route was a dead end (`get_results_for_surfaces_basic_internal_forces` needs a
+  surface **result grid** the model lacks; enabling one via `set_surface` fails `finish_modification`
+  with "surface grid origin is ... defined incorrectly"). **Gotcha: `set_surface`'s `boundary_lines`
+  must be the space-separated STRING ("5 6 7 13 8"); a JSON array stores only the first line and
+  corrupts the surface (NaN centroid) — restore by re-setting the string.**
+  Basic→principal→design formulas are in `surface_moments.rs`, all checked
   against the LC1 export to < 2e-5 (the manual's `m_c,D+` branch for `m_x > m_y, m_y < -|m_xy|`
   is `m_y - m_xy²/|m_y|`; `m_y,D±` / `n_y,D` are the x/y swap of the documented `m_x,D±` / `n_x,D`).
   The 92608/27200 offsets are for this 532-node / 511-element model; always read the header
