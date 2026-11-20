@@ -475,15 +475,13 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
                 if spec.key == "load_direction"
                     && let Value::Text(t) = &val
                 {
-                    val = Value::Int(
-                        load_direction_code(t).ok_or_else(|| {
-                            format!(
-                                "{k}: unknown load direction '{t}'; use a code or \
+                    val = Value::Int(load_direction_code(t).ok_or_else(|| {
+                        format!(
+                            "{k}: unknown load direction '{t}'; use a code or \
                                  LOAD_DIRECTION_LOCAL_X/Y/Z, LOAD_DIRECTION_GLOBAL_X/Y/Z_OR_\
                                  USER_DEFINED_U/V/W_TRUE"
-                            )
-                        })?,
-                    );
+                        )
+                    })?);
                 }
                 fields.push((spec.key, val));
             }
@@ -556,8 +554,8 @@ fn load_direction_code(name: &str) -> Option<i64> {
 fn resolve_library(lib: &Library, kind: LibraryKind, wanted: &str) -> Result<LibraryItem, String> {
     let mut found = lib.get(kind, wanted).map_err(|e| e.to_string())?;
     if found.is_none() && kind == LibraryKind::Section {
-        found = femcraft_rfdb::concrete::get_or_add_concrete(lib, wanted)
-            .map_err(|e| e.to_string())?;
+        found =
+            femcraft_rfdb::concrete::get_or_add_concrete(lib, wanted).map_err(|e| e.to_string())?;
     }
     found.ok_or_else(|| {
         format!(

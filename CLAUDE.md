@@ -34,7 +34,8 @@ Plan and milestone status: `docs/ROADMAP.md`.
   enums are RFEM's stored codes. `api.rs` (methods, `Workspace` trait), `lib.rs` (JSON-RPC),
   `http.rs` (the app listens on `127.0.0.1:7980/mcp`, `FEMCRAFT_MCP_PORT`, 0 = off; requests
   are answered on the UI thread, so edits show live), `stdio.rs` + `headless.rs`
-  (`femcraft --mcp`, no window). Add a kind by adding it to `api::KINDS`. Not yet: delete.
+  (`femcraft --mcp`: each message is forwarded to the window on the HTTP port when one
+  listens, so Claude Desktop drives the open window; else handled windowless). Add a kind by adding it to `api::KINDS`. Not yet: delete.
   New objects of a kind the model lacks need a prototype file holding one (line loads: e.g.
   `Al Qou_Rev6.rf6`); supports are assigned to the template's predefined ones (Hinged, Rigid).
   `tests/build_models.rs` builds a portal frame + RC pit over JSON-RPC.
