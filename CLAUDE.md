@@ -137,9 +137,21 @@ Plan and milestone status: `docs/ROADMAP.md`.
   averaging or axis rotation recovers it; the per-corner curvature from the block is itself wrong.
   The block's 4 bending entries behave like 2×2 Gauss-point values needing the MITC4 covariant→
   Cartesian recovery (√3 corner extrapolation alone leaves ~23 kNm/m error). So `surface_moments::
-  basic_forces` is the correct law (it reproduces forces from the export's face strains), but the
-  input curvatures must come from the proper MITC recovery of the stored strains, not the raw block
-  slots — that recovery is the open piece. Numbering is correct (NOT a blocker): the block is indexed in
+  basic_forces` applies it. **The sign is `+D` (and `+C`, `+S`), NOT `-D`** — an earlier `-D` made
+  every moment look wrong (even sign-flipped) and led to a mistaken "dead end" conclusion; with
+  `+D` the law reproduces the export from its own face strains to < 5e-4 kNm/m.
+  **Moments DO reproduce from the stored block** with the correct sign: take the block's
+  `[κx, κy, κxy]` per element corner, `m = +D(κx+ν κy)` etc., average per node within each surface.
+  Checked on LC1 (mean |error|): the non-planar walls (surfaces 2-5) to 0.45-0.6 kNm/m (< 5 % of
+  their 13 peak), the base slab to ~3.4 (~10 % of its 34 peak, worse only because it carries the
+  walls and has sharp moment gradients / stress singularities at the junctions). Corner→node mapping
+  is identity (`Data.E2D` order), weighting the nodal average (arithmetic / area / inverse-area) does
+  not change it, and Gauss→corner √3 extrapolation barely helps — the slab residual is RFEM's exact
+  recovery at high-gradient nodes, not a frame or ordering error. **Local axes are not an issue** on
+  this model: forces are in each surface's own local axes (= global for the slab), and the walls
+  (different local axes) reproduce BEST, so no element-local→global rotation is needed here. The open
+  refinement is only closing the slab's last ~10 % (RFEM's exact nodal recovery); membrane n / shear
+  v and the walls' moments are already good. Principal/design (`surface_moments.rs`) apply on top. Numbering is correct (NOT a blocker): the block is indexed in
   `Data.E2D` row order = the export's element numbers (0 mismatch), corner k ↔ `Data.E2D` node k,
   and `Data.GET` is a per-element tile counter (not the surface number — `mesh.rs` uses `Data.MTO`).
   RFEM API grid route was a dead end (`get_results_for_surfaces_basic_internal_forces` needs a
