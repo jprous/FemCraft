@@ -64,7 +64,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|a| *a != "--all")
                 .cloned()
                 .collect();
-            print!("{}", Catalog::read(&conn)?.describe(&filter, !all));
+            print!("{}", Catalog::read_with_counts(&conn)?.describe(&filter, !all));
         }
         Some("--rows") => {
             let table = args.get(2).ok_or("--rows needs a table name")?;
@@ -76,7 +76,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("--kinds") => {
             let archive = Archive::open(path)?;
             let conn = Connection::open(archive.db_path())?;
-            let cat = Catalog::read(&conn)?;
+            let cat = Catalog::read_with_counts(&conn)?;
             let wanted = &args[2..];
             for &kind in ObjectKind::ALL {
                 if wanted.is_empty() || wanted.iter().any(|w| w.eq_ignore_ascii_case(kind.name())) {

@@ -269,3 +269,52 @@ fn staged_models_from_template() {
         }
     }
 }
+
+/// Imposed-load cases get RFEM's standard-dependent options row (without it RFEM's server
+/// crashes opening the file), and a new load case copied from the self-weight case does not
+/// keep its foundation self-weight switches.
+#[test]
+fn imposed_load_cases_complete() {
+    let Some(template) = private("FEMCRAFT - RFEM6 Template.rf6") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = RfDocument::open(&template).unwrap();
+    // An existing permanent case made imposed, and a new imposed case.
+    doc.model
+        .set(ObjectId::new(K::LoadCase, 2), "action_category", Value::Int(36))
+        .unwrap();
+    add(
+        &mut doc,
+        ObjectId::new(K::LoadCase, 8),
+        &[
+            ("name", Value::Text("Roof imposed".into())),
+            ("action_category", Value::Int(42)),
+        ],
+    );
+    let out = dir.path().join("imposed.rf6");
+    doc.save(&out).unwrap();
+
+    let back = RfDocument::open(&out).unwrap();
+    let conn = rusqlite::Connection::open(back.archive.db_path()).unwrap();
+    let rows: Vec<(i64, i64, Option<i64>, i64, i64)> = conn
+        .prepare(
+            "SELECT l.userID, i.actionCategoryId, o.id, i.activeSelfWeightOnFoundations, \
+             i.selfWeightActive FROM LoadCase l JOIN LoadCaseImplStatic i ON i.id = l.impl_id \
+             LEFT JOIN LoadCaseStandardDependentOptions o ON o.id = \
+             i.loadCaseStandardDependentOptions_id AND o.owner_id = i.id ORDER BY l.userID",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for (no, cat, options, foundations, self_weight) in &rows {
+        let imposed = [36, 42].contains(cat);
+        assert_eq!(options.is_some(), imposed, "load case {no} (category {cat})");
+        if *no == 8 {
+            assert_eq!(foundations, self_weight, "load case 8 foundation switch");
+        }
+    }
+    assert!(rows.iter().any(|r| r.0 == 8), "load case 8 saved");
+}

@@ -15,6 +15,8 @@ pub struct ColumnInfo {
 pub struct TableInfo {
     pub name: String,
     pub columns: Vec<ColumnInfo>,
+    /// Row count; -1 when not counted ([`Catalog::read`]; [`Catalog::read_with_counts`]
+    /// counts).
     pub rows: i64,
 }
 
@@ -42,31 +44,44 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Every table with its columns, in one query (an RFEM model has ~5,900 tables: a
+    /// `PRAGMA table_info` and a `COUNT(*)` per table took seconds on every open / reload).
+    /// Rows are not counted (`rows` = -1).
     pub fn read(conn: &Connection) -> Result<Self, Error> {
-        let names: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")?
-            .query_map([], |r| r.get(0))?
-            .collect::<Result<_, _>>()?;
-        let mut tables = Vec::with_capacity(names.len());
-        for name in names {
-            let q = quote(&name);
-            let columns = conn
-                .prepare(&format!("PRAGMA table_info({q})"))?
-                .query_map([], |r| {
-                    Ok(ColumnInfo {
-                        name: r.get(1)?,
-                        decl_type: r.get(2)?,
-                    })
-                })?
-                .collect::<Result<_, _>>()?;
-            let rows = conn.query_row(&format!("SELECT COUNT(*) FROM {q}"), [], |r| r.get(0))?;
-            tables.push(TableInfo {
-                name,
-                columns,
-                rows,
-            });
+        let mut tables: Vec<TableInfo> = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT m.name, p.name, p.type FROM sqlite_master m \
+             JOIN pragma_table_info(m.name) p WHERE m.type = 'table' ORDER BY m.name, p.cid",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let table: String = r.get(0)?;
+            let col = ColumnInfo {
+                name: r.get(1)?,
+                decl_type: r.get(2)?,
+            };
+            match tables.last_mut() {
+                Some(t) if t.name == table => t.columns.push(col),
+                _ => tables.push(TableInfo {
+                    name: table,
+                    columns: vec![col],
+                    rows: -1,
+                }),
+            }
         }
         Ok(Self { tables })
+    }
+
+    /// [`Catalog::read`] with the row count of every table (slow on a full RFEM model).
+    pub fn read_with_counts(conn: &Connection) -> Result<Self, Error> {
+        let mut cat = Self::read(conn)?;
+        for t in &mut cat.tables {
+            t.rows =
+                conn.query_row(&format!("SELECT COUNT(*) FROM {}", quote(&t.name)), [], |r| {
+                    r.get(0)
+                })?;
+        }
+        Ok(cat)
     }
 
     /// Case-insensitive table lookup.

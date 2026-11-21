@@ -212,6 +212,22 @@ pub fn methods() -> Vec<MethodInfo> {
             changes_model: false,
         },
         MethodInfo {
+            name: "set_library_items".into(),
+            description: "FemCraft extension: makes several existing materials / sections \
+                library items in one go (items: [{type: material | section, no, name}], name \
+                as in set_material / set_section). Much faster than one set_* with name per \
+                object: the model is reloaded once."
+                .into(),
+            schema: obj(
+                json!({"items": {"type": "array", "items": {"type": "object",
+                    "properties": {"type": {"type": "string", "enum": ["material", "section"]},
+                                   "no": {"type": "integer"}, "name": {"type": "string"}},
+                    "required": ["type", "no", "name"]}}}),
+                &["items"],
+            ),
+            changes_model: true,
+        },
+        MethodInfo {
             name: "get_library_item".into(),
             description: "One library material or section with all its RFEM property values \
                 (SI units; f_y / f_u per thickness range). name: RFEM's full name, or a \
@@ -350,6 +366,7 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
             return Ok(json!(list));
         }
         "get_library_items" | "get_library_item" => return library_call(name, args),
+        "set_library_items" => return set_library_items(ws, args),
         "get_mesh" => {
             let doc = ws.active().ok_or("no model is open")?;
             let Some(mesh) = doc.fe_mesh().map_err(|e| e.to_string())? else {
@@ -458,15 +475,39 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
                 if spec.key == "load_direction"
                     && let Value::Text(t) = &val
                 {
-                    val = Value::Int(
-                        load_direction_code(t).ok_or_else(|| {
-                            format!(
-                                "{k}: unknown load direction '{t}'; use a code or \
+                    val = Value::Int(load_direction_code(t).ok_or_else(|| {
+                        format!(
+                            "{k}: unknown load direction '{t}'; use a code or \
                                  LOAD_DIRECTION_LOCAL_X/Y/Z, LOAD_DIRECTION_GLOBAL_X/Y/Z_OR_\
                                  USER_DEFINED_U/V/W_TRUE"
-                            )
-                        })?,
-                    );
+                        )
+                    })?);
+                }
+                // Likewise load distributions and action categories: RFEM calls a file with
+                // their API names in these integer columns corrupted.
+                if let Value::Text(t) = &val
+                    && let Some((codes, what)) = match spec.key {
+                        "load_distribution" => Some((LOAD_DISTRIBUTIONS, "load distribution")),
+                        "action_category" => Some((ACTION_CATEGORIES, "action category")),
+                        _ => None,
+                    }
+                {
+                    let name = t.trim().to_ascii_uppercase();
+                    val = match codes.iter().find(|(n, _)| *n == name) {
+                        Some((_, c)) => Value::Int(*c),
+                        None => match name.parse::<i64>() {
+                            Ok(c) => Value::Int(c),
+                            Err(_) => {
+                                let known: Vec<String> =
+                                    codes.iter().map(|(n, c)| format!("{n} = {c}")).collect();
+                                return Err(format!(
+                                    "{k}: '{t}' is not a known {what} name; give RFEM's integer \
+                                     code (known: {})",
+                                    known.join(", ")
+                                ));
+                            }
+                        },
+                    };
                 }
                 fields.push((spec.key, val));
             }
@@ -477,23 +518,9 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Json) -> Result<Json, Str
                 && let Some(i) = fields.iter().position(|(k, _)| *k == "name")
             {
                 let (_, v) = fields.remove(i);
-                let wanted = v.as_str().unwrap_or("").to_owned();
                 let lib = Library::find(&Library::default_dirs())
                     .ok_or("no FemCraft library found (materials.db / sections.db)")?;
-                let mut found = lib.get(lib_kind, &wanted).map_err(|e| e.to_string())?;
-                // A parametric concrete size the library lacks (`R_M1 0.3048/0.6096`, metres
-                // or mm) is created from an item of the same shape.
-                if found.is_none() && lib_kind == LibraryKind::Section {
-                    found = femcraft_rfdb::concrete::get_or_add_concrete(&lib, &wanted)
-                        .map_err(|e| e.to_string())?;
-                }
-                let item = found.ok_or_else(|| {
-                        format!(
-                            "no library {} named '{wanted}'; get_library_items lists them \
-                             (RFEM's full name, or a designation only one item has)",
-                            lib_kind.name()
-                        )
-                    })?;
+                let item = resolve_library(&lib, lib_kind, v.as_str().unwrap_or(""))?;
                 library = Some((lib, item));
             }
             let doc = active(ws)?;
@@ -545,6 +572,72 @@ fn load_direction_code(name: &str) -> Option<i64> {
         "LOAD_DIRECTION_GLOBAL_Z_OR_USER_DEFINED_W_TRUE" => 13,
         _ => return None,
     })
+}
+
+/// Load distribution names with RFEM's stored code. Only uniform is confirmed (0 on every
+/// uniform line / surface load in the verified models); others need a code.
+const LOAD_DISTRIBUTIONS: &[(&str, i64)] = &[("LOAD_DISTRIBUTION_UNIFORM", 0)];
+
+/// Action category names with RFEM's stored code (`LoadCaseImplStatic.actionCategoryId`).
+/// Only permanent G is confirmed (11 on dead / self-weight cases in the verified models);
+/// codes seen for other categories: 19 earth pressure, 36 / 42 imposed, 61 wind,
+/// 71 temperature (names not confirmed).
+const ACTION_CATEGORIES: &[(&str, i64)] = &[("ACTION_CATEGORY_PERMANENT_G", 11)];
+
+/// The library item named `wanted` (RFEM's full name or a unique designation). A parametric
+/// concrete size the library lacks (`R_M1 0.3048/0.6096`, metres or mm) is created from an
+/// item of the same shape.
+fn resolve_library(lib: &Library, kind: LibraryKind, wanted: &str) -> Result<LibraryItem, String> {
+    let mut found = lib.get(kind, wanted).map_err(|e| e.to_string())?;
+    if found.is_none() && kind == LibraryKind::Section {
+        found =
+            femcraft_rfdb::concrete::get_or_add_concrete(lib, wanted).map_err(|e| e.to_string())?;
+    }
+    found.ok_or_else(|| {
+        format!(
+            "no library {} named '{wanted}'; get_library_items lists them \
+             (RFEM's full name, or a designation only one item has)",
+            kind.name()
+        )
+    })
+}
+
+/// `set_library_items`: several existing materials / sections made library items at once
+/// (one model reload instead of one per item, which costs seconds on a full template).
+fn set_library_items(ws: &mut dyn Workspace, args: &Map<String, Json>) -> Result<Json, String> {
+    let list = args
+        .get("items")
+        .and_then(Json::as_array)
+        .ok_or("set_library_items needs 'items': [{type, no, name}]")?;
+    let lib = Library::find(&Library::default_dirs())
+        .ok_or("no FemCraft library found (materials.db / sections.db)")?;
+    let mut items = Vec::new();
+    let mut out = Vec::new();
+    for it in list {
+        let ty = it.get("type").and_then(Json::as_str).unwrap_or("");
+        let kind = kind_by_type(ty).ok_or_else(|| format!("unknown type '{ty}'"))?;
+        let lib_kind =
+            library_kind(kind).ok_or_else(|| format!("{} has no library", kind.name()))?;
+        let no = it
+            .get("no")
+            .and_then(Json::as_u64)
+            .filter(|n| *n > 0)
+            .ok_or("each item needs 'no'")? as u32;
+        let name = it.get("name").and_then(Json::as_str).unwrap_or("");
+        let item = resolve_library(&lib, lib_kind, name)
+            .map_err(|e| format!("{} {no}: {e}", kind.name()))?;
+        out.push(json!({"type": ty, "no": no, "library_item": item.name,
+                        "rfem_library_id": item.rfem_library_id}));
+        items.push((ObjectId::new(kind, no), item));
+    }
+    let doc = active(ws)?;
+    if let Some((id, _)) = items.iter().find(|(id, _)| doc.model.get(*id).is_none()) {
+        return Err(format!("{} {} does not exist", id.kind.name(), id.no));
+    }
+    doc.assign_library_items(&lib, &items)
+        .map_err(|e| e.to_string())?;
+    ws.changed();
+    Ok(json!({"items": out}))
 }
 
 /// The library behind an object kind's `name` (materials, sections).

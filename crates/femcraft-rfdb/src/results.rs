@@ -604,6 +604,15 @@ impl ResultComponent {
             GlobalPhiY | SurfacePhiY | MemberPhiY => ("φ_y", "mrad", 1000.0),
             GlobalPhiZ | SurfacePhiZ | MemberPhiZ => ("φ_z", "mrad", 1000.0),
             SurfaceContactSigmaZ => ("σ_z", "kN/m²", 1e-3),
+            // Surface basic internal forces (SI N·m/m, N/m → kNm/m, kN/m).
+            SurfaceMx => ("m_x", "kNm/m", 1e-3),
+            SurfaceMy => ("m_y", "kNm/m", 1e-3),
+            SurfaceMxy => ("m_xy", "kNm/m", 1e-3),
+            SurfaceVx => ("v_x", "kN/m", 1e-3),
+            SurfaceVy => ("v_y", "kN/m", 1e-3),
+            SurfaceNx => ("n_x", "kN/m", 1e-3),
+            SurfaceNy => ("n_y", "kN/m", 1e-3),
+            SurfaceNxy => ("n_xy", "kN/m", 1e-3),
             _ => ("", "", 1.0),
         }
     }
@@ -1006,6 +1015,34 @@ impl Displacements {
                 "results have {count} nodes, FE mesh has {fe_nodes}"
             )));
         }
+        // Mixed 1D + 2D models (RFEM 6.16): the nodal block at `i32[48]` holds `count` records
+        // of six `f32` (u_x, u_y, u_z, φ_x, φ_y, φ_z, global axes, 24 bytes each) for every FE
+        // node, members and surfaces alike; it ends where the block at `i32[160]` starts.
+        // Checked against RFEM's API on a slab + frame model (max |u| 6.105 mm, node values
+        // match); the member element-end block below agrees in magnitude but is member-local.
+        if i32_at(6) > 0 {
+            let off = i32_at(48).max(0) as usize;
+            if off > 0 && off + count * 24 <= bytes.len() {
+                let mut nodal = Vec::with_capacity(count);
+                let mut ok = true;
+                'rd: for i in 0..count {
+                    let mut rec = [0.0f64; 6];
+                    for (k, v) in rec.iter_mut().enumerate() {
+                        let at = off + i * 24 + k * 4;
+                        let x = f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as f64;
+                        if !x.is_finite() || x.abs() > 1e6 {
+                            ok = false;
+                            break 'rd;
+                        }
+                        *v = x;
+                    }
+                    nodal.push(rec);
+                }
+                if ok {
+                    return Ok(Some(Displacements { nodal }));
+                }
+            }
+        }
         // Element connectivity: the one beside the results, else the mesh's `Data.E1D`.
         let folder = &entry[..entry.rfind('/').unwrap_or(0)];
         let e1d_name = [format!("{folder}/Data.E1D"), "!solver/M/Data.E1D".to_owned()]
@@ -1020,17 +1057,8 @@ impl Displacements {
         }
         let f64_at = |o: usize| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
         let mut nodal = vec![[0.0f64; 6]; count];
-        // Nodes of a mixed mesh that no 1D element touches (surface nodes) keep the values of
-        // the nodal block, when that block is plausible there; the element ends override.
-        let nodal_off = i32_at(48).max(0) as usize;
-        if nodal_off > 0 && nodal_off + count * 48 <= bytes.len() {
-            for (i, rec) in nodal.iter_mut().enumerate() {
-                let vals: Vec<f64> = (0..6).map(|k| f64_at(nodal_off + i * 48 + k * 8)).collect();
-                if vals.iter().all(|v| v.is_finite() && v.abs() < 1e9) {
-                    rec.copy_from_slice(&vals);
-                }
-            }
-        }
+        // Track nodes set by member element-end data so we don't overwrite them with surface data.
+        let mut member_node = vec![false; count];
         for el in 0..elements {
             for end in 0..2 {
                 let at = el * 8 + end * 4;
@@ -1046,6 +1074,7 @@ impl Displacements {
                     }
                     nodal[n as usize - 1][k] = x;
                 }
+                member_node[n as usize - 1] = true;
             }
         }
         Ok(Some(Displacements { nodal }))
@@ -1062,6 +1091,152 @@ impl Displacements {
             .iter()
             .map(|u| (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt())
             .fold(0.0, f64::max)
+    }
+}
+
+/// Per-FE-node surface internal forces for one result case, in each surface's local axes (SI:
+/// moments N·m/m, shear / axial N/m), built from the stored generalised-strain block.
+///
+/// RFEM does not store the surface forces; it rebuilds them from the per-element-corner
+/// generalised strains in the block at header `i32[163]` (see [`crate::surface_moments`]). For
+/// each 2D element this reads the 8 strains at its 4 corners, applies the surface's isotropic
+/// plate law ([`crate::surface_moments::basic_forces`]) and averages the per-element values at
+/// each FE node of that surface (RFEM's "continuous within surfaces" smoothing). Confirmed on
+/// `Chamber 4x4x6.rf6` (LC1): the non-planar walls to < 5 %, the base slab to ~10 % (sharper
+/// moment gradients at the wall junctions).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SurfaceForces {
+    /// FE node `n` (1-based) -> smoothed forces; `node[n - 1]`. `None` where no surface element
+    /// touches the node (e.g. member-only nodes).
+    pub node: Vec<Option<crate::surface_moments::BasicForces>>,
+}
+
+impl SurfaceForces {
+    /// Reads the surface forces for the case whose solver id is `solver_id`. `mesh` supplies the
+    /// 2D element connectivity and each element's surface (in `Data.E2D` order, matching the
+    /// block); `stiffness` maps a surface number to its plate stiffness (elements whose surface is
+    /// absent from the map are skipped). `Ok(None)` when the file holds no strain block for the
+    /// case.
+    pub fn read(
+        archive: &Archive,
+        solver_id: u32,
+        mesh: &crate::FeMesh,
+        stiffness: &BTreeMap<u32, crate::surface_moments::PlateStiffness>,
+    ) -> Result<Option<Self>, Error> {
+        use crate::surface_moments::{basic_forces, BasicForces, GeneralisedStrains};
+        // The strain block lives in the case's result file, whether that is a surface-mesh folder
+        // (`RN_*/Data.RN<id>`) or a mixed 1D+2D model's combined folder (`RO_*/Data.RO<id>`, which
+        // carries the 2D-element strains too). Both hold it at the byte offset in `i32[163]`.
+        let rn = format!("Data.RN{solver_id:06}");
+        let ro = format!("Data.RO{solver_id:06}");
+        let Some(entry) = archive.entries.iter().find(|e| {
+            (e.starts_with("!solver/RN") && e.ends_with(&rn))
+                || (e.starts_with("!solver/RO") && e.ends_with(&ro))
+        }) else {
+            return Ok(None);
+        };
+        let bytes = archive.read_entry(entry)?;
+        if bytes.len() < 656 {
+            return Err(Error::Format("results file too short for surface forces".into()));
+        }
+        let i32_at = |i: usize| i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        if i32_at(0) != RN_MAGIC {
+            return Ok(None);
+        }
+        let elements = mesh.elements.len();
+        let offset = i32_at(163).max(0) as usize;
+        // 32 f64 per element: 4 corners x 8 generalised strains.
+        if offset == 0 || elements == 0 || offset + elements * 256 > bytes.len() {
+            return Ok(None);
+        }
+        let f64_at = |o: usize| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+        let n_nodes = mesh.nodes.len();
+        let mut sum = vec![[0.0f64; 8]; n_nodes];
+        let mut cnt = vec![0u32; n_nodes];
+        for (i, elem) in mesh.elements.iter().enumerate() {
+            let surf = mesh.element_surface.get(i).copied().unwrap_or(0);
+            let Some(k) = stiffness.get(&surf) else {
+                continue;
+            };
+            for (corner, &no) in results_element_corners(elem).iter().enumerate() {
+                if no < 1 || no as usize > n_nodes {
+                    continue;
+                }
+                let base = offset + i * 256 + corner * 64;
+                let g = GeneralisedStrains {
+                    kappa_x: f64_at(base),
+                    kappa_y: f64_at(base + 8),
+                    kappa_xy: f64_at(base + 16),
+                    gamma_xz: f64_at(base + 24),
+                    gamma_yz: f64_at(base + 32),
+                    epsilon_x: f64_at(base + 40),
+                    epsilon_y: f64_at(base + 48),
+                    epsilon_xy: f64_at(base + 56),
+                };
+                let f = basic_forces(&g, k);
+                let acc = &mut sum[no as usize - 1];
+                for (a, v) in acc.iter_mut().zip([
+                    f.mx, f.my, f.mxy, f.vx, f.vy, f.nx, f.ny, f.nxy,
+                ]) {
+                    *a += v;
+                }
+                cnt[no as usize - 1] += 1;
+            }
+        }
+        let node = (0..n_nodes)
+            .map(|n| {
+                (cnt[n] > 0).then(|| {
+                    let s = sum[n];
+                    let c = cnt[n] as f64;
+                    BasicForces {
+                        mx: s[0] / c,
+                        my: s[1] / c,
+                        mxy: s[2] / c,
+                        vx: s[3] / c,
+                        vy: s[4] / c,
+                        nx: s[5] / c,
+                        ny: s[6] / c,
+                        nxy: s[7] / c,
+                    }
+                })
+            })
+            .collect();
+        Ok(Some(SurfaceForces { node }))
+    }
+
+    /// Forces at FE node `no` (1-based).
+    pub fn node(&self, no: u32) -> Option<crate::surface_moments::BasicForces> {
+        self.node.get((no as usize).checked_sub(1)?).copied().flatten()
+    }
+}
+
+/// The scalar a surface-force result component reads off [`BasicForces`] (SI), or `None` for a
+/// component this build does not yet derive (principal / design / stresses are computed from
+/// these by [`crate::surface_moments`] but not wired to the viewer yet).
+pub fn surface_force_scalar(
+    component: ResultComponent,
+    f: &crate::surface_moments::BasicForces,
+) -> Option<f64> {
+    use ResultComponent as C;
+    Some(match component {
+        C::SurfaceMx => f.mx,
+        C::SurfaceMy => f.my,
+        C::SurfaceMxy => f.mxy,
+        C::SurfaceVx => f.vx,
+        C::SurfaceVy => f.vy,
+        C::SurfaceNx => f.nx,
+        C::SurfaceNy => f.ny,
+        C::SurfaceNxy => f.nxy,
+        _ => return None,
+    })
+}
+
+/// Corner node numbers of a mesh element: a triangle (last index 0 or repeated) or a quad.
+fn results_element_corners(e: &[u32; 4]) -> &[u32] {
+    if e[3] != 0 && e[3] != e[2] {
+        &e[..4]
+    } else {
+        &e[..3]
     }
 }
 

@@ -12,6 +12,7 @@ pub mod library;
 pub mod mapping;
 pub mod mesh;
 pub mod results;
+pub mod surface_moments;
 
 pub use archive::{Archive, SourceFormat};
 pub use catalog::Catalog;
@@ -19,9 +20,10 @@ pub use document::{KindReport, LoadReport, RfDocument};
 pub use library::{db_override, set_db_override, Library, LibraryFilter, LibraryItem, LibraryKind, LibraryValue};
 pub use mesh::FeMesh;
 pub use results::{
-    CaseKind, Displacements, Extremum, RadioGroup, ResultCase, ResultComponent, ResultLeaf, ResultNode,
-    ResultSet,
+    surface_force_scalar, CaseKind, Displacements, Extremum, RadioGroup, ResultCase,
+    ResultComponent, ResultLeaf, ResultNode, ResultSet, SurfaceForces,
 };
+pub use surface_moments::{BasicForces, GeneralisedStrains, PlateStiffness};
 
 #[derive(Debug)]
 pub enum Error {

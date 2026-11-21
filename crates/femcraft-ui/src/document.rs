@@ -55,7 +55,10 @@ fn contact_supports(
 ) -> std::collections::HashMap<u32, scene::ContactSupport> {
     let mut out = std::collections::HashMap::new();
     for (_, sup) in model.iter_kind(ObjectKind::SurfaceSupport) {
-        let Some(cz) = sup.get("translation_z").as_f64().filter(|c| c.is_finite() && *c > 0.0)
+        let Some(cz) = sup
+            .get("translation_z")
+            .as_f64()
+            .filter(|c| c.is_finite() && *c > 0.0)
         else {
             continue;
         };
@@ -112,6 +115,9 @@ pub struct Document {
     /// Decoded nodal displacements for the selected result case (by solver id; inner `None` when
     /// the case has no displacement file, so it is not re-decoded every frame).
     result_disp: Option<(Vec<u32>, Option<Vec<femcraft_rfdb::Displacements>>)>,
+    /// Decoded surface internal forces for the selected case (by solver id; inner `None` when the
+    /// case has no surface strain block), cached like `result_disp`.
+    result_forces: Option<(Vec<u32>, Option<Vec<femcraft_rfdb::SurfaceForces>>)>,
     /// Colour-scale legend for the active result overlay, drawn over the viewport.
     result_legend: Option<ResultLegend>,
 
@@ -157,6 +163,7 @@ impl Document {
             synced_case: None,
             synced_lc: vis.load_case,
             result_disp: None,
+            result_forces: None,
             result_legend: None,
             revision: 0,
             vis,
@@ -197,13 +204,14 @@ impl Document {
             self.vis.load_case = vis.load_case;
         }
         self.load_cases = load_cases;
-        self.selection
-            .retain(|id| self.rf.model.get(*id).is_some());
+        self.selection.retain(|id| self.rf.model.get(*id).is_some());
         self.results_view = crate::results_panel::ResultsView::default();
         // Freshly calculated: show the first result quantity (displacements) of the first case.
         if let Some(results) = &self.results {
             let first = |nodes: &[femcraft_rfdb::ResultNode]| {
-                fn find(nodes: &[femcraft_rfdb::ResultNode]) -> Option<femcraft_rfdb::ResultComponent> {
+                fn find(
+                    nodes: &[femcraft_rfdb::ResultNode],
+                ) -> Option<femcraft_rfdb::ResultComponent> {
                     nodes.iter().find_map(|n| match n {
                         femcraft_rfdb::ResultNode::Leaf(l)
                             if l.group == femcraft_rfdb::RadioGroup::Result =>
@@ -295,9 +303,10 @@ impl Document {
             }
         } else if self.vis.load_case != self.synced_lc
             && let Some(results) = &self.results
-            && let Some(case) = results.cases.iter().find(|c| {
-                c.kind == femcraft_rfdb::CaseKind::LoadCase && c.no == self.vis.load_case
-            })
+            && let Some(case) = results
+                .cases
+                .iter()
+                .find(|c| c.kind == femcraft_rfdb::CaseKind::LoadCase && c.no == self.vis.load_case)
         {
             // The user picked another load case in the Display panel: show its results too.
             self.results_view.selected = Some((case.kind, case.no));
@@ -358,7 +367,10 @@ impl Document {
             return None;
         }
         let comp = self.results_view.active?;
-        if !scene::is_displacement(comp) && !scene::is_contact(comp) {
+        if !scene::is_displacement(comp)
+            && !scene::is_contact(comp)
+            && !scene::is_surface_force(comp)
+        {
             return None;
         }
         let (kind, no) = self.results_view.selected?;
@@ -374,9 +386,27 @@ impl Document {
     /// Loads the selected case's displacements (once per case) and, when the factor is unset,
     /// picks one so the peak displacement is a visible fraction of the model.
     fn update_result_overlay(&mut self) {
-        let Some((ids, _)) = self.active_overlay() else {
+        let Some((ids, comp)) = self.active_overlay() else {
             return;
         };
+        // Surface internal forces: decode once per case from the strain block.
+        if scene::is_surface_force(comp) {
+            if self.result_forces.as_ref().map(|(s, _)| s) != Some(&ids)
+                && let Some(mesh) = &self.fe_mesh
+            {
+                let mut sets = Vec::new();
+                for &id in &ids {
+                    match self.rf.surface_forces(id, mesh) {
+                        Ok(Some(f)) => sets.push(f),
+                        Ok(None) => {}
+                        Err(e) => self.warnings.push(format!("Surface forces not read: {e}")),
+                    }
+                }
+                let decoded = (!sets.is_empty()).then_some(sets);
+                self.result_forces = Some((ids, decoded));
+            }
+            return;
+        }
         let fe_nodes = self.fe_mesh.as_ref().map_or(0, |m| m.nodes.len());
         if self.result_disp.as_ref().map(|(s, _)| s) != Some(&ids) {
             let mut sets = Vec::new();
@@ -422,6 +452,28 @@ impl Document {
         let Some((_, comp)) = self.active_overlay() else {
             return;
         };
+        // Surface internal forces: a coloured contour over the undeformed mesh.
+        if scene::is_surface_force(comp) {
+            let (Some((_, Some(sets))), Some(mesh)) = (&self.result_forces, &self.fe_mesh) else {
+                return;
+            };
+            let forces: Vec<&femcraft_rfdb::SurfaceForces> = sets.iter().collect();
+            let ext = self.results_view.extremum;
+            let coloured = self.vis.result_colours;
+            let range = scene::add_force_surface(&mut self.scene, mesh, &forces, comp, ext, coloured)
+                .filter(|_| coloured);
+            if let Some((min, max)) = range {
+                let (label, unit, factor) = comp.display();
+                self.result_legend = Some(ResultLegend {
+                    label,
+                    unit,
+                    factor,
+                    min,
+                    max,
+                });
+            }
+            return;
+        }
         let (Some((_, Some(sets))), Some(mesh)) = (&self.result_disp, &self.fe_mesh) else {
             return;
         };

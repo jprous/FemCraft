@@ -9,7 +9,9 @@
 use eframe::egui;
 use femcraft_model::Model;
 use femcraft_rfdb::results::result_tree;
-use femcraft_rfdb::{CaseKind, Extremum, RadioGroup, ResultComponent, ResultLeaf, ResultNode, ResultSet};
+use femcraft_rfdb::{
+    CaseKind, Extremum, RadioGroup, ResultComponent, ResultLeaf, ResultNode, ResultSet,
+};
 
 /// What the user has picked in the Results panel (kept per document).
 #[derive(Debug, Clone, Default)]

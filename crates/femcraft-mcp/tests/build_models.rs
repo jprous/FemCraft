@@ -249,3 +249,51 @@ fn portal_frame_and_pit() {
         .unwrap();
     assert_eq!(ls.get("lines").as_ref_list(), &[15]);
 }
+
+/// API enum names RFEM stores as integer codes: known ones are converted, unknown ones are
+/// refused, and saving never writes text into an integer column (RFEM calls such a file
+/// corrupted).
+#[test]
+fn enum_names_become_codes() {
+    let Some(template) = private("FEMCRAFT - RFEM6 Template.rf6") else {
+        return;
+    };
+    let mut c = Client {
+        ws: Headless::new(Some(template.clone()), vec![]),
+        id: 0,
+    };
+    c.call("new_model", json!({}));
+    c.call(
+        "set_load_case",
+        json!({"value": {"no": 2, "action_category": "ACTION_CATEGORY_PERMANENT_G"}}),
+    );
+    assert_eq!(
+        c.call("get_load_case", json!({"no": 2}))["action_category"],
+        json!(11)
+    );
+    let e = c.call_err(
+        "set_load_case",
+        json!({"value": {"no": 3, "action_category": "ACTION_CATEGORY_IMPOSED_LOADS_CATEGORY_H_ROOFS_QI_H"}}),
+    );
+    assert!(e.contains("integer code"), "{e}");
+
+    // Bypassing the MCP: the save refuses the text and leaves the file unwritten.
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = RfDocument::open(&template).unwrap();
+    let lc = femcraft_model::ObjectId::new(K::LoadCase, 2);
+    doc.model
+        .set(
+            lc,
+            "action_category",
+            femcraft_model::Value::Text("ACTION_CATEGORY_PERMANENT_G".into()),
+        )
+        .unwrap();
+    let out = dir.path().join("bad.rf6");
+    let err = doc.save(&out).unwrap_err().to_string();
+    assert!(err.contains("stores a number"), "{err}");
+    // A number given as text is stored as a number.
+    doc.model
+        .set(lc, "action_category", femcraft_model::Value::Text("11".into()))
+        .unwrap();
+    doc.save(&out).unwrap();
+}
