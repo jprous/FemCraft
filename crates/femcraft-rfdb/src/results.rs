@@ -1124,12 +1124,15 @@ impl SurfaceForces {
         stiffness: &BTreeMap<u32, crate::surface_moments::PlateStiffness>,
     ) -> Result<Option<Self>, Error> {
         use crate::surface_moments::{basic_forces, BasicForces, GeneralisedStrains};
-        let suffix = format!("Data.RN{solver_id:06}");
-        let Some(entry) = archive
-            .entries
-            .iter()
-            .find(|e| e.starts_with("!solver/RN") && e.ends_with(&suffix))
-        else {
+        // The strain block lives in the case's result file, whether that is a surface-mesh folder
+        // (`RN_*/Data.RN<id>`) or a mixed 1D+2D model's combined folder (`RO_*/Data.RO<id>`, which
+        // carries the 2D-element strains too). Both hold it at the byte offset in `i32[163]`.
+        let rn = format!("Data.RN{solver_id:06}");
+        let ro = format!("Data.RO{solver_id:06}");
+        let Some(entry) = archive.entries.iter().find(|e| {
+            (e.starts_with("!solver/RN") && e.ends_with(&rn))
+                || (e.starts_with("!solver/RO") && e.ends_with(&ro))
+        }) else {
             return Ok(None);
         };
         let bytes = archive.read_entry(entry)?;
